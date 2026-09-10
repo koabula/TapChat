@@ -355,8 +355,6 @@ export interface RecoveryDiagnostics {
   phase: RecoveryPhase;
   attempt_count: number;
   identity_refresh_retry_count: number;
-  pending_record_count: number;
-  pending_record_seqs: number[];
   last_fetched_seq: number;
   last_acked_seq: number;
   mls_status?: string;

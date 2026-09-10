@@ -1888,21 +1888,6 @@ impl CoreEngine {
             })
     }
 
-    pub(super) fn conversation_has_mls_ciphertext(
-        &self,
-        conversation_id: &str,
-        ciphertext_sha256: &str,
-    ) -> bool {
-        self.state
-            .conversations
-            .get(conversation_id)
-            .is_some_and(|state| {
-                state.messages.iter().any(|message| {
-                    message.mls_ciphertext_sha256.as_deref() == Some(ciphertext_sha256)
-                })
-            })
-    }
-
     pub(super) fn store_accepted_application_message(
         &mut self,
         record: &InboxRecord,
@@ -2868,7 +2853,7 @@ impl CoreEngine {
         self.verify_device_signature(
             &envelope.sender_user_id,
             &envelope.sender_device_id,
-            payload_b64.as_bytes(),
+            &envelope_sender_proof_payload(envelope),
             &envelope.sender_proof.value,
         )?;
         let payload = STANDARD.decode(payload_b64).map_err(|error| {
@@ -2981,7 +2966,7 @@ impl CoreEngine {
         self.verify_device_signature(
             &envelope.sender_user_id,
             &envelope.sender_device_id,
-            payload_b64.as_bytes(),
+            &envelope_sender_proof_payload(envelope),
             &envelope.sender_proof.value,
         )?;
         let payload = STANDARD.decode(payload_b64).map_err(|error| {
@@ -3558,13 +3543,19 @@ impl CoreEngine {
             .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
             .classify_direct_commit(conversation_id, payload_b64)?;
         match class {
-            DirectCommitClass::MembershipOrOther | DirectCommitClass::PendingRetry => Ok(None),
-            DirectCommitClass::IgnoredReplay => Ok(Some(CoreOutput::default())),
-            DirectCommitClass::NeedsRebuild => Ok(Some(self.escalate_conversation_to_rebuild(
-                conversation_id,
-                RecoveryEscalationReason::MlsMarkedUnrecoverable,
-                "direct PCS commit could not be classified",
-            )?)),
+            // Decline: let the generic ingest path decide. It re-derives the
+            // same verdict and quarantines the record exactly once.
+            DirectCommitClass::NotSelfUpdate | DirectCommitClass::Deferred(_) => Ok(None),
+            // Handled here: acked and discarded. Note this no longer escalates
+            // to a rebuild — an unclassifiable inbound commit is attacker
+            // input, so it must not be able to tear down the session.
+            DirectCommitClass::Rejected(reason) => {
+                log::warn!(
+                    "handle_direct_mls_commit: discarding {reason:?} commit for conversation {}",
+                    redact_id("conversation", conversation_id)
+                );
+                Ok(Some(CoreOutput::default()))
+            }
             DirectCommitClass::PcsSelfUpdate {
                 commit_hash,
                 base_epoch,
@@ -3758,7 +3749,7 @@ impl CoreEngine {
             .verify_device_signature(
                 &record.envelope.sender_user_id,
                 &record.envelope.sender_device_id,
-                payload_b64.as_bytes(),
+                &envelope_sender_proof_payload(&record.envelope),
                 &record.envelope.sender_proof.value,
             )
             .is_err()

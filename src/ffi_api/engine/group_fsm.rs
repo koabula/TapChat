@@ -8,6 +8,35 @@ impl CoreEngine {
         message_type: MessageType,
         payload_b64: String,
     ) -> CoreResult<Envelope> {
+        self.build_envelope_with_storage_refs(
+            conversation_id,
+            recipient_device_id,
+            message_type,
+            payload_b64,
+            Vec::new(),
+        )
+    }
+
+    /// Build and sign an outbound envelope.
+    ///
+    /// The signature covers the canonical encoding of the whole envelope
+    /// header plus a hash of the payload (see
+    /// [`crate::model::signing::envelope_sender_proof_payload`]), not just the
+    /// payload. Signing the payload alone let a legitimately signed ciphertext
+    /// be re-appended under a different `conversation_id`, `message_id` or
+    /// `message_type` and still verify.
+    ///
+    /// Because the signature covers `storage_refs`, they must be supplied here
+    /// rather than assigned to the returned envelope: anything set after this
+    /// function returns is outside the signature.
+    pub(super) fn build_envelope_with_storage_refs(
+        &mut self,
+        conversation_id: &str,
+        recipient_device_id: &str,
+        message_type: MessageType,
+        payload_b64: String,
+        storage_refs: Vec<StorageRef>,
+    ) -> CoreResult<Envelope> {
         let identity = self
             .state
             .local_identity
@@ -16,13 +45,12 @@ impl CoreEngine {
             .clone();
         let sender_user_id = identity.user_identity.user_id.clone();
         let sender_device_id = identity.device_identity.device_id.clone();
-        let sender_proof = identity.sign_sender_proof(payload_b64.as_bytes());
         let message_nonce = self.next_message_nonce();
         let created_at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(message_nonce);
-        Ok(Envelope {
+        let mut envelope = Envelope {
             version: crate::model::CURRENT_MODEL_VERSION.to_string(),
             message_id: self.next_message_id(conversation_id, recipient_device_id, message_nonce),
             conversation_id: conversation_id.to_string(),
@@ -31,15 +59,19 @@ impl CoreEngine {
             recipient_device_id: recipient_device_id.to_string(),
             created_at,
             message_type,
-            inline_ciphertext: Some(payload_b64.clone()),
-            storage_refs: vec![],
+            inline_ciphertext: Some(payload_b64),
+            storage_refs,
             delivery_class: DeliveryClass::Normal,
             wake_hint: None,
             sender_proof: SenderProof {
                 proof_type: "device_signature".into(),
-                value: sender_proof,
+                value: String::new(),
             },
-        })
+        };
+        // Signed last, over the finished envelope.
+        envelope.sender_proof.value =
+            identity.sign_sender_proof(&envelope_sender_proof_payload(&envelope));
+        Ok(envelope)
     }
 
     pub(super) fn build_group_manifest(

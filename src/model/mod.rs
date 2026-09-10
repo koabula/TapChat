@@ -2,6 +2,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{CoreError, CoreResult};
 
+pub mod signing;
+
 #[cfg(test)]
 mod welcome_pickup_property_tests;
 

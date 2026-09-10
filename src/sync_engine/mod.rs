@@ -3,6 +3,22 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::model::{Ack, InboxRecord, SyncCheckpoint};
 use serde::{Deserialize, Serialize};
 
+/// Device-wide cap on retained retry copies.
+///
+/// Sized by write amplification rather than by protocol need: the whole
+/// `DeviceSyncState` is a single JSON blob in the `sync_checkpoints` table and
+/// is rebuilt from scratch on every persist effect, so 64 records of roughly
+/// 4 KB each is about 256 KB rewritten per persist, which is the ceiling we
+/// are willing to pay.
+pub const MAX_QUARANTINED_RECORDS: usize = 64;
+
+/// Per-conversation cap, so one conversation cannot starve the others.
+///
+/// The transport allows one epoch-changing commit at a time, so a legitimate
+/// reorder window for a single conversation is a handful of frames; 16 is
+/// generous.
+pub const MAX_QUARANTINED_RECORDS_PER_CONVERSATION: usize = 16;
+
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct SyncEngineModule;
 
@@ -85,16 +101,22 @@ impl SyncEngine {
         state.consecutive_failures = 0;
     }
 
+    /// The next range worth fetching, if any.
+    ///
+    /// This used to also fetch whenever `pending_retry` was set, which — with
+    /// the ack cursor pinned by that same pending record — meant it returned
+    /// `Some` forever and the client refetched an already-seen range on every
+    /// tick. Records are now acked regardless of whether a local retry copy
+    /// was kept (see `RecordRetention`), so `last_acked_seq` reaches
+    /// `last_head_seq` at the end of every batch and this returns `None` when
+    /// there is genuinely nothing new. Retry progress is driven by epoch
+    /// advance re-ingesting the retained copies, not by refetching.
     pub fn next_fetch(state: &DeviceSyncState) -> Option<SyncDecision> {
         let from_seq = state.checkpoint.last_acked_seq.saturating_add(1);
-        if state.pending_retry || from_seq <= state.last_head_seq {
-            Some(SyncDecision {
-                from_seq,
-                to_seq: state.last_head_seq,
-            })
-        } else {
-            None
-        }
+        (from_seq <= state.last_head_seq).then_some(SyncDecision {
+            from_seq,
+            to_seq: state.last_head_seq,
+        })
     }
 
     pub fn note_pending_retry(state: &mut DeviceSyncState, seq: u64) {
@@ -102,9 +124,54 @@ impl SyncEngine {
         state.pending_record_seqs.insert(seq);
     }
 
+    /// Retain a local copy of a record that could not be applied yet.
+    ///
+    /// Bounded on purpose. A frame that cannot be authenticated yet is
+    /// indistinguishable from a forgery — see `DeferReason` — so an adversary
+    /// can mint entries here at will by sending frames for a future epoch.
+    /// Without a cap that is unbounded RAM, an unbounded `sync_checkpoints`
+    /// row, and unbounded work per replay.
+    ///
+    /// Eviction drops the *lowest* seq: it has waited longest, so if it were
+    /// going to become authenticable it most likely already would have, and
+    /// the frames that repair an out-of-order burst arrive *after* the frame
+    /// they repair — so the newest arrival is the one worth keeping.
+    ///
+    /// Eviction needs no ack bookkeeping: every record is acked in the batch
+    /// that first sees it (see `RecordRetention`), so there is never an
+    /// unacked entry in here to settle.
     pub fn store_pending_record(state: &mut DeviceSyncState, record: &InboxRecord) {
         state.pending_records.insert(record.seq, record.clone());
         Self::note_pending_retry(state, record.seq);
+
+        let conversation_id = record.envelope.conversation_id.clone();
+        while Self::quarantined_for_conversation(state, &conversation_id)
+            > MAX_QUARANTINED_RECORDS_PER_CONVERSATION
+        {
+            let Some(oldest) = state
+                .pending_records
+                .iter()
+                .find(|(_, held)| held.envelope.conversation_id == conversation_id)
+                .map(|(seq, _)| *seq)
+            else {
+                break;
+            };
+            Self::clear_pending_retry(state, oldest);
+        }
+        while state.pending_records.len() > MAX_QUARANTINED_RECORDS {
+            let Some(oldest) = state.pending_records.keys().next().copied() else {
+                break;
+            };
+            Self::clear_pending_retry(state, oldest);
+        }
+    }
+
+    fn quarantined_for_conversation(state: &DeviceSyncState, conversation_id: &str) -> usize {
+        state
+            .pending_records
+            .values()
+            .filter(|held| held.envelope.conversation_id == conversation_id)
+            .count()
     }
 
     pub fn clear_pending_retry(state: &mut DeviceSyncState, seq: u64) {
@@ -127,7 +194,10 @@ impl SyncEngine {
 
 #[cfg(test)]
 mod tests {
-    use super::{SyncEngine, SyncEngineModule};
+    use super::{
+        SyncEngine, SyncEngineModule, MAX_QUARANTINED_RECORDS,
+        MAX_QUARANTINED_RECORDS_PER_CONVERSATION,
+    };
     use crate::model::{
         DeliveryClass, Envelope, InboxRecord, InboxRecordState, MessageType, SenderProof, WakeHint,
         CURRENT_MODEL_VERSION,
@@ -169,15 +239,70 @@ mod tests {
     }
 
     #[test]
-    fn pending_retry_keeps_fetching_from_last_acked_seq() {
+    fn pending_retry_alone_does_not_drive_a_refetch() {
+        // A retained retry copy is local state. It must not make the client
+        // refetch a range it has already consumed: the record is already
+        // acked, so refetching returns nothing new and the loop would spin on
+        // every tick. Retry progress comes from re-ingesting the local copy
+        // once the conversation's epoch advances.
         let mut state = SyncEngine::new_device_state("device:bob:phone");
         state.checkpoint.last_fetched_seq = 5;
-        state.checkpoint.last_acked_seq = 3;
+        state.checkpoint.last_acked_seq = 5;
+        state.last_head_seq = 5;
         SyncEngine::note_pending_retry(&mut state, 4);
 
-        let decision = SyncEngine::next_fetch(&state).expect("should retry");
-        assert_eq!(decision.from_seq, 4);
-        assert_eq!(decision.to_seq, 0);
+        assert!(SyncEngine::next_fetch(&state).is_none());
+
+        // A genuinely new record at the head still triggers a fetch.
+        SyncEngine::register_head(&mut state, 6);
+        let decision = SyncEngine::next_fetch(&state).expect("should fetch the new record");
+        assert_eq!(decision.from_seq, 6);
+        assert_eq!(decision.to_seq, 6);
+    }
+
+    #[test]
+    fn quarantine_is_bounded_per_device_and_per_conversation() {
+        let mut state = SyncEngine::new_device_state("device:bob:phone");
+
+        // One conversation floods the buffer, as an adversary sending
+        // future-epoch frames would.
+        for seq in 1..=(MAX_QUARANTINED_RECORDS_PER_CONVERSATION as u64 * 4) {
+            let record = sample_record(&format!("msg:{seq}"), seq);
+            SyncEngine::store_pending_record(&mut state, &record);
+        }
+        assert_eq!(
+            state.pending_records.len(),
+            MAX_QUARANTINED_RECORDS_PER_CONVERSATION
+        );
+        assert_eq!(
+            state.pending_records.len(),
+            state.pending_record_seqs.len(),
+            "the seq index must not drift from the record map"
+        );
+        // The newest arrivals are the ones kept: an out-of-order burst is
+        // repaired by frames that arrive after the frame they repair.
+        let lowest = *state.pending_records.keys().next().expect("non-empty");
+        assert_eq!(
+            lowest,
+            MAX_QUARANTINED_RECORDS_PER_CONVERSATION as u64 * 4
+                - MAX_QUARANTINED_RECORDS_PER_CONVERSATION as u64
+                + 1
+        );
+
+        // Many conversations together respect the device-wide cap.
+        let mut state = SyncEngine::new_device_state("device:bob:phone");
+        let mut seq = 0_u64;
+        for conversation in 0..40 {
+            for _ in 0..8 {
+                seq += 1;
+                let mut record = sample_record(&format!("msg:{seq}"), seq);
+                record.envelope.conversation_id = format!("conv:{conversation}");
+                SyncEngine::store_pending_record(&mut state, &record);
+            }
+        }
+        assert_eq!(state.pending_records.len(), MAX_QUARANTINED_RECORDS);
+        assert_eq!(state.pending_records.len(), state.pending_record_seqs.len());
+        assert!(state.pending_retry);
     }
 
     #[test]

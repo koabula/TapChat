@@ -5156,6 +5156,7 @@ mod tests {
         let bob_bundle = bob.local_bundle().expect("bob bundle").clone();
         let bob_device_id = bob.local_device_id().expect("bob device").to_string();
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        link_contact(&mut bob, &alice);
         let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
 
         let commit = alice
@@ -5410,22 +5411,32 @@ mod tests {
             .clone();
         accepted_envelope.sender_proof.value = "00".repeat(64);
 
-        let err = bob
-            .handle_event(CoreEvent::InboxRecordsFetched {
-                device_id: bob_device_id.clone(),
-                to_seq: 1,
-                records: vec![InboxRecord {
-                    seq: 1,
-                    recipient_device_id: bob_device_id,
-                    message_id: accepted_envelope.message_id.clone(),
-                    received_at: 1,
-                    expires_at: None,
-                    state: InboxRecordState::Available,
-                    envelope: accepted_envelope,
-                }],
-            })
-            .expect_err("invalid accepted control is rejected");
-        assert_eq!(err.code(), "invalid_input");
+        bob.handle_event(CoreEvent::InboxRecordsFetched {
+            device_id: bob_device_id.clone(),
+            to_seq: 1,
+            records: vec![InboxRecord {
+                seq: 1,
+                recipient_device_id: bob_device_id.clone(),
+                message_id: accepted_envelope.message_id.clone(),
+                received_at: 1,
+                expires_at: None,
+                state: InboxRecordState::Available,
+                envelope: accepted_envelope,
+            }],
+        })
+        .expect("a badly signed control is discarded, not an error");
+        // Acked and dropped: returning an error here would have left the
+        // record un-acked and redelivered forever, stalling every other
+        // record on the device.
+        assert_eq!(
+            bob.state
+                .sync_states
+                .get(&bob_device_id)
+                .expect("sync state")
+                .checkpoint
+                .last_acked_seq,
+            1
+        );
         assert_eq!(
             bob.state
                 .contacts
@@ -6480,7 +6491,7 @@ mod tests {
 
     #[test]
     fn fetch_response_restores_conversation_and_emits_ack_request() {
-        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let (bob_identity, bob_bundle) = sample_identity_with_bundle(BOB_MNEMONIC, "phone");
         let mut engine = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle);
         let device_id = engine
             .state
@@ -6504,16 +6515,6 @@ mod tests {
             .keys()
             .next()
             .expect("contact")
-            .clone();
-        let peer_device_id = engine
-            .state
-            .contacts
-            .values()
-            .next()
-            .expect("contact")
-            .bundle
-            .devices[0]
-            .device_id
             .clone();
         let mut conversation_users = [local_user_id.clone(), peer_user_id.clone()];
         conversation_users.sort();
@@ -6543,12 +6544,12 @@ mod tests {
                 body: Some(
                     serde_json::json!({
                         "to_seq": 1,
-                        "records": [sample_control_record(
+                        "records": [signed_control_record_from(
+                            &bob_identity,
                             &device_id,
                             1,
                             &local_user_id,
-                            &peer_user_id,
-                            &peer_device_id,
+                            MessageType::ControlDeviceMembershipChanged,
                         )],
                     })
                     .to_string(),
@@ -7685,7 +7686,7 @@ mod tests {
 
     #[test]
     fn ack_requires_explicit_accepted_result() {
-        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let (bob_identity, bob_bundle) = sample_identity_with_bundle(BOB_MNEMONIC, "phone");
         let mut engine = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle);
         let device_id = engine
             .state
@@ -7702,23 +7703,6 @@ mod tests {
             .expect("identity")
             .user_identity
             .user_id
-            .clone();
-        let peer_user_id = engine
-            .state
-            .contacts
-            .keys()
-            .next()
-            .expect("contact")
-            .clone();
-        let peer_device_id = engine
-            .state
-            .contacts
-            .values()
-            .next()
-            .expect("contact")
-            .bundle
-            .devices[0]
-            .device_id
             .clone();
 
         let sync = engine
@@ -7743,12 +7727,12 @@ mod tests {
                 body: Some(
                     serde_json::json!({
                         "to_seq": 1,
-                        "records": [sample_control_record(
+                        "records": [signed_control_record_from(
+                            &bob_identity,
                             &device_id,
                             1,
                             &local_user_id,
-                            &peer_user_id,
-                            &peer_device_id,
+                            MessageType::ControlDeviceMembershipChanged,
                         )],
                     })
                     .to_string(),
@@ -7933,7 +7917,7 @@ mod tests {
 
     #[test]
     fn inline_realtime_record_and_fetch_do_not_duplicate_ingest() {
-        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let (bob_identity, bob_bundle) = sample_identity_with_bundle(BOB_MNEMONIC, "phone");
         let mut engine = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle);
         let device_id = engine
             .state
@@ -7951,29 +7935,12 @@ mod tests {
             .user_identity
             .user_id
             .clone();
-        let peer_user_id = engine
-            .state
-            .contacts
-            .keys()
-            .next()
-            .expect("contact")
-            .clone();
-        let peer_device_id = engine
-            .state
-            .contacts
-            .values()
-            .next()
-            .expect("contact")
-            .bundle
-            .devices[0]
-            .device_id
-            .clone();
-        let record = sample_control_record(
+        let record = signed_control_record_from(
+            &bob_identity,
             &device_id,
             1,
             &local_user_id,
-            &peer_user_id,
-            &peer_device_id,
+            MessageType::ControlDeviceMembershipChanged,
         );
         let conversation_id = record.envelope.conversation_id.clone();
 
@@ -8008,7 +7975,7 @@ mod tests {
 
     #[test]
     fn stale_realtime_head_after_fetch_is_noop() {
-        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let (bob_identity, bob_bundle) = sample_identity_with_bundle(BOB_MNEMONIC, "phone");
         let mut engine = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle);
         let device_id = engine
             .state
@@ -8026,30 +7993,13 @@ mod tests {
             .user_identity
             .user_id
             .clone();
-        let peer_user_id = engine
-            .state
-            .contacts
-            .keys()
-            .next()
-            .expect("contact")
-            .clone();
-        let peer_device_id = engine
-            .state
-            .contacts
-            .values()
-            .next()
-            .expect("contact")
-            .bundle
-            .devices[0]
-            .device_id
-            .clone();
 
-        let record = sample_control_record(
+        let record = signed_control_record_from(
+            &bob_identity,
             &device_id,
             1,
             &local_user_id,
-            &peer_user_id,
-            &peer_device_id,
+            MessageType::ControlDeviceMembershipChanged,
         );
         let conversation_id = record.envelope.conversation_id.clone();
 
@@ -8094,6 +8044,7 @@ mod tests {
         let bob_bundle = bob.local_bundle().expect("bob bundle").clone();
         let bob_device_id = bob_bundle.devices[0].device_id.clone();
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        link_contact(&mut bob, &alice);
         let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
         alice
             .handle_command(CoreCommand::SendTextMessage {
@@ -8169,6 +8120,7 @@ mod tests {
         let bob_bundle = bob.local_bundle().expect("bob bundle").clone();
         let bob_device_id = bob_bundle.devices[0].device_id.clone();
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        link_contact(&mut bob, &alice);
         let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
         alice
             .handle_command(CoreCommand::SendTextMessage {
@@ -8233,12 +8185,381 @@ mod tests {
         );
     }
 
+    /// The ideal functionality has no interface through which an adversary can
+    /// supply a message, so a receiver that reacts observably to one it cannot
+    /// authenticate is distinguishable from it (§1 Remark 1(a)).
+    ///
+    /// Every vector below is something anyone holding the inbox append
+    /// capability can construct. For each, the receiver must: return `Ok`,
+    /// advance its ack cursor (withholding an ack is itself a reaction, and
+    /// pins the cursor for the whole device), and change *nothing* else — no
+    /// stored message, no epoch or status movement, no recovery context, no
+    /// retained retry copy, no view-model entry, no outbound effect beyond the
+    /// ack, and no loss of the ability to send.
     #[test]
-    fn unproven_mls_ciphertext_replay_is_retained_and_never_acked() {
+    fn invalid_ciphertext_leaves_no_trace() {
+        struct Vector {
+            name: &'static str,
+            mutate: fn(&mut Envelope),
+        }
+
+        let vectors = [
+            Vector {
+                name: "payload is not base64",
+                mutate: |envelope| {
+                    envelope.inline_ciphertext = Some("!!! not base64 !!!".into())
+                },
+            },
+            Vector {
+                name: "payload is base64 but not an MLS frame",
+                mutate: |envelope| envelope.inline_ciphertext = Some("aGVsbG8gd29ybGQ=".into()),
+            },
+            Vector {
+                name: "sender proof is forged",
+                mutate: |envelope| envelope.sender_proof.value = "00".repeat(64),
+            },
+            Vector {
+                name: "message type has no honest producer",
+                mutate: |envelope| {
+                    envelope.message_type = MessageType::ControlConversationNeedsRebuild
+                },
+            },
+            Vector {
+                name: "sender is a stranger",
+                mutate: |envelope| envelope.sender_user_id = "user:mallory".into(),
+            },
+            Vector {
+                name: "sender impersonates the recipient",
+                mutate: |envelope| envelope.sender_user_id = envelope.recipient_device_id.clone(),
+            },
+            Vector {
+                name: "declared model version is unsupported",
+                mutate: |envelope| envelope.version = "9.9".into(),
+            },
+        ];
+
+        for vector in vectors {
+            let mut chat = paired_direct_chat();
+            let conversation_id = chat.conversation_id.clone();
+            let bob_device_id = chat.bob_device_id.clone();
+
+            // A healthy, joined conversation with one delivered message.
+            chat.alice
+                .handle_command(CoreCommand::SendTextMessage {
+                    conversation_id: conversation_id.clone(),
+                    plaintext: "before".into(),
+                })
+                .expect("send before");
+            deliver_pending_outbox_to_device(&mut chat.bob, &chat.alice, &bob_device_id);
+
+            let before_summary = chat.bob.state.mls_summaries.get(&conversation_id).cloned();
+            let before_messages = chat.bob.state.conversations[&conversation_id]
+                .messages
+                .len();
+            let before_ack = chat.bob.state.sync_states[&bob_device_id]
+                .checkpoint
+                .last_acked_seq;
+
+            // Take a genuine envelope and corrupt exactly one thing about it.
+            let mut envelope = pending_application_record(&chat.alice, &bob_device_id).envelope;
+            envelope.message_id = format!("{}:{}", envelope.message_id, vector.name.len());
+            resign_envelope(&chat.alice, &mut envelope);
+            (vector.mutate)(&mut envelope);
+
+            let seq = before_ack + 1;
+            let output = chat
+                .bob
+                .handle_event(CoreEvent::InboxRecordsFetched {
+                    device_id: bob_device_id.clone(),
+                    to_seq: seq,
+                    records: vec![InboxRecord {
+                        seq,
+                        recipient_device_id: bob_device_id.clone(),
+                        message_id: envelope.message_id.clone(),
+                        received_at: seq,
+                        expires_at: None,
+                        state: InboxRecordState::Available,
+                        envelope: envelope.clone(),
+                    }],
+                })
+                .unwrap_or_else(|error| {
+                    panic!("[{}] must not error: {error:?}", vector.name)
+                });
+
+            let sync = &chat.bob.state.sync_states[&bob_device_id];
+            assert_eq!(
+                sync.checkpoint.last_acked_seq, seq,
+                "[{}] the ack cursor must advance",
+                vector.name
+            );
+            assert!(
+                sync.pending_records.is_empty() && !sync.pending_retry,
+                "[{}] nothing may be retained",
+                vector.name
+            );
+            assert_eq!(
+                chat.bob.state.mls_summaries.get(&conversation_id).cloned(),
+                before_summary,
+                "[{}] MLS state must not move",
+                vector.name
+            );
+            assert_eq!(
+                chat.bob.state.conversations[&conversation_id].messages.len(),
+                before_messages,
+                "[{}] no message row may be written",
+                vector.name
+            );
+            assert!(
+                chat.bob.state.recovery_contexts.is_empty(),
+                "[{}] no recovery context may be opened",
+                vector.name
+            );
+            assert_eq!(
+                chat.bob.state.conversations[&conversation_id].recovery_status,
+                RecoveryStatus::Healthy,
+                "[{}] the conversation must stay healthy",
+                vector.name
+            );
+            assert!(
+                output
+                    .view_model
+                    .as_ref()
+                    .map(|model| model.messages.is_empty())
+                    .unwrap_or(true),
+                "[{}] nothing may surface to the UI",
+                vector.name
+            );
+            // Still usable: the whole point is that this is not a remote
+            // off-switch for the conversation.
+            chat.bob
+                .handle_command(CoreCommand::SendTextMessage {
+                    conversation_id: conversation_id.clone(),
+                    plaintext: "after".into(),
+                })
+                .unwrap_or_else(|error| {
+                    panic!("[{}] sending must still work: {error:?}", vector.name)
+                });
+        }
+    }
+
+    /// A retained out-of-order record must be invisible.
+    ///
+    /// It is authenticated, so it is kept for a retry — but "cannot be applied
+    /// yet" is indistinguishable from "future-epoch forgery", so if holding
+    /// one degraded the conversation, an adversary who can append could switch
+    /// off a conversation at will. Only a genuinely missing Welcome is allowed
+    /// to surface.
+    #[test]
+    fn a_retained_out_of_order_record_does_not_degrade_the_conversation() {
+        let mut chat = paired_direct_chat();
+        let conversation_id = chat.conversation_id.clone();
+        let bob_device_id = chat.bob_device_id.clone();
+
+        // Alice sends two application messages but only the second is
+        // delivered, so Bob holds a frame he cannot open yet.
+        chat.alice
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "first".into(),
+            })
+            .expect("send first");
+        let first = pending_application_record(&chat.alice, &bob_device_id);
+        chat.alice
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "second".into(),
+            })
+            .expect("send second");
+        let second = chat
+            .alice
+            .state
+            .pending_outbox
+            .iter()
+            .filter(|item| {
+                item.envelope.recipient_device_id == bob_device_id
+                    && item.envelope.message_type == MessageType::MlsApplication
+                    && item.envelope.message_id != first.envelope.message_id
+            })
+            .map(|item| item.envelope.clone())
+            .next()
+            .expect("second application envelope");
+
+        let base = chat.bob.state.sync_states[&bob_device_id]
+            .checkpoint
+            .last_acked_seq;
+        let seq = base + 1;
+        chat.bob
+            .handle_event(CoreEvent::InboxRecordsFetched {
+                device_id: bob_device_id.clone(),
+                to_seq: seq,
+                records: vec![InboxRecord {
+                    seq,
+                    recipient_device_id: bob_device_id.clone(),
+                    message_id: second.message_id.clone(),
+                    received_at: seq,
+                    expires_at: None,
+                    state: InboxRecordState::Available,
+                    envelope: second,
+                }],
+            })
+            .expect("out-of-order delivery is not an error");
+
+        // Whatever the MLS layer decided, the conversation must remain usable
+        // and undegraded, and the ack cursor must have moved.
+        let sync = &chat.bob.state.sync_states[&bob_device_id];
+        assert_eq!(sync.checkpoint.last_acked_seq, seq);
+        assert_eq!(
+            chat.bob.state.conversations[&conversation_id].recovery_status,
+            RecoveryStatus::Healthy,
+            "an authenticated but unapplied record must not degrade the conversation"
+        );
+        assert!(chat.bob.state.recovery_contexts.is_empty());
+        chat.bob
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id,
+                plaintext: "still sending".into(),
+            })
+            .expect("sending must still work");
+    }
+
+    /// The gate must admit genuine traffic. Without this, every "forgery is
+    /// rejected" test could pass while the transport rejected everything.
+    #[test]
+    fn genuine_inbound_records_pass_the_authentication_gate() {
+        let mut bob = local_engine(BOB_MNEMONIC, "phone");
+        let bob_bundle = bob.local_bundle().expect("bob bundle").clone();
+        let bob_device_id = bob_bundle.devices[0].device_id.clone();
+        let bob_user_id = bob_bundle.user_id.clone();
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle);
+        link_contact(&mut bob, &alice);
+        create_direct_conversation(&mut alice, bob_user_id.clone());
+
+        let records: Vec<InboxRecord> = alice
+            .state
+            .pending_outbox
+            .iter()
+            .filter(|item| item.envelope.recipient_device_id == bob_device_id)
+            .enumerate()
+            .map(|(index, item)| InboxRecord {
+                seq: index as u64 + 1,
+                recipient_device_id: item.envelope.recipient_device_id.clone(),
+                message_id: item.envelope.message_id.clone(),
+                received_at: index as u64 + 1,
+                expires_at: None,
+                state: InboxRecordState::Available,
+                envelope: item.envelope.clone(),
+            })
+            .collect();
+        assert!(!records.is_empty(), "alice produced no records for bob");
+
+        for record in &records {
+            let verdict =
+                bob.authenticate_inbox_record(&bob_user_id, &bob_device_id, record);
+            assert!(
+                verdict.is_ok(),
+                "the gate rejected a genuine {:?} record: {:?}",
+                record.envelope.message_type,
+                verdict
+            );
+        }
+    }
+
+    /// R2: a defect inside one envelope is that envelope's problem.
+    ///
+    /// A malformed record used to abort the whole batch with `Err`, which
+    /// emitted no persist op, acked nothing, and re-failed identically on
+    /// every later fetch — so one poisoned record suppressed every other
+    /// record on the device indefinitely, across restarts, while looking like
+    /// a transient decode error. It costs the attacker one HTTP POST.
+    #[test]
+    fn one_inadmissible_record_does_not_block_the_rest_of_the_batch() {
         let mut bob = local_engine(BOB_MNEMONIC, "phone");
         let bob_bundle = bob.local_bundle().expect("bob bundle").clone();
         let bob_device_id = bob_bundle.devices[0].device_id.clone();
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        link_contact(&mut bob, &alice);
+        let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
+        deliver_pending_outbox_to_device(&mut bob, &alice, &bob_device_id);
+        alice
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "must still arrive".into(),
+            })
+            .expect("send application");
+
+        let good = pending_application_record(&alice, &bob_device_id);
+        // Base the new seqs on the ack cursor, not the fetch cursor, so the
+        // batch is contiguous with what has already been acked and the
+        // assertion below is about admission rather than about a seq gap.
+        let next_seq = bob
+            .state
+            .sync_states
+            .get(&bob_device_id)
+            .expect("sync state")
+            .checkpoint
+            .last_acked_seq;
+
+        // A record whose declared model version this build does not support.
+        // Every field it fails on is authored inside this one envelope.
+        let mut poisoned = good.clone();
+        poisoned.seq = next_seq + 1;
+        poisoned.message_id = format!("{}:poisoned", good.message_id);
+        poisoned.envelope.message_id = poisoned.message_id.clone();
+        poisoned.envelope.version = "9.9".into();
+
+        let mut good = good;
+        good.seq = next_seq + 2;
+
+        bob.handle_event(CoreEvent::InboxRecordsFetched {
+            device_id: bob_device_id.clone(),
+            records: vec![poisoned.clone(), good.clone()],
+            to_seq: good.seq,
+        })
+        .expect("a poisoned record must not abort its neighbours");
+
+        let sync = bob
+            .state
+            .sync_states
+            .get(&bob_device_id)
+            .expect("sync state");
+        assert_eq!(
+            sync.checkpoint.last_acked_seq, good.seq,
+            "both records must be acked so the cursor clears the poisoned seq"
+        );
+        // The valid neighbour was processed, not merely acked.
+        assert!(conversation_has_plaintext(
+            &bob,
+            &conversation_id,
+            "must still arrive"
+        ));
+        // The poisoned record left nothing behind.
+        assert!(!bob
+            .state
+            .conversations
+            .get(&conversation_id)
+            .expect("conversation")
+            .messages
+            .iter()
+            .any(|message| message.message_id == poisoned.message_id));
+        assert!(bob.state.recovery_contexts.is_empty());
+    }
+
+    /// R2: a ciphertext whose MLS generation has already been consumed is
+    /// terminal — forward secrecy deleted the secret, so no message arriving
+    /// later can decrypt it. This used to be retained forever and to force the
+    /// conversation into `NeedsRecovery` whenever no durable projection
+    /// "proved" the replay, which pinned the ack cursor and blocked sending on
+    /// a conversation that an attacker could target for free. Nothing was
+    /// recovered by that; the plaintext was already unrecoverable. Ack and
+    /// discard, leaving no trace.
+    #[test]
+    fn unprovable_mls_ciphertext_replay_is_acked_and_leaves_no_trace() {
+        let mut bob = local_engine(BOB_MNEMONIC, "phone");
+        let bob_bundle = bob.local_bundle().expect("bob bundle").clone();
+        let bob_device_id = bob_bundle.devices[0].device_id.clone();
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        link_contact(&mut bob, &alice);
+        link_contact(&mut bob, &alice);
         let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
         alice
             .handle_command(CoreCommand::SendTextMessage {
@@ -8270,23 +8591,37 @@ mod tests {
             records: vec![application_record],
             to_seq: replay_seq,
         })
-        .expect("unproven replay is recoverable");
+        .expect("a consumed generation is discarded, not an error");
 
         let sync = bob
             .state
             .sync_states
             .get(&bob_device_id)
             .expect("sync state");
-        assert_eq!(sync.checkpoint.last_acked_seq, last_acked);
-        assert!(sync.pending_retry);
-        assert!(sync.pending_records.contains_key(&replay_seq));
+        assert!(
+            sync.checkpoint.last_acked_seq > last_acked,
+            "the ack cursor must advance past a discarded record: {} !> {last_acked}",
+            sync.checkpoint.last_acked_seq
+        );
+        // At least the replayed seq, and possibly further: any later record
+        // that was queued behind this gap drains as soon as the gap fills.
+        // That head-of-line unblocking is the point — one undecryptable frame
+        // must not pin the whole device's ack cursor.
+        assert!(sync.checkpoint.last_acked_seq >= replay_seq);
+        assert!(!sync.pending_retry);
+        assert!(!sync.pending_records.contains_key(&replay_seq));
         assert_eq!(
             bob.state
                 .conversations
                 .get(&conversation_id)
                 .expect("conversation")
                 .recovery_status,
-            RecoveryStatus::NeedsRecovery
+            RecoveryStatus::Healthy,
+            "a discarded record must not degrade the conversation"
+        );
+        assert!(
+            !bob.state.recovery_contexts.contains_key(&conversation_id),
+            "a discarded record must not open a recovery context"
         );
     }
 
@@ -8296,6 +8631,7 @@ mod tests {
         let bob_bundle = bob.local_bundle().expect("bob bundle").clone();
         let bob_device_id = bob_bundle.devices[0].device_id.clone();
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        link_contact(&mut bob, &alice);
         let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
         alice
             .handle_command(CoreCommand::SendTextMessage {
@@ -8407,8 +8743,13 @@ mod tests {
         );
     }
 
+    /// R2: `ControlConversationNeedsRebuild` has no honest producer on the
+    /// direct inbox — nothing in the codebase builds a direct envelope with
+    /// that type — so it was pure attack surface: an unsigned, unverified
+    /// record that tore a conversation down on arrival. It is now off the
+    /// inbound allowlist and leaves no trace.
     #[test]
-    fn control_needs_rebuild_record_sets_explicit_rebuild_escalation_reason() {
+    fn injected_rebuild_control_leaves_no_trace() {
         let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle);
         let device_id = alice
@@ -8447,35 +8788,32 @@ mod tests {
             MessageType::ControlConversationNeedsRebuild,
         );
         let conversation_id = record.envelope.conversation_id.clone();
+        let seq = record.seq;
 
         alice
             .handle_event(CoreEvent::InboxRecordsFetched {
-                device_id,
+                device_id: device_id.clone(),
                 records: vec![record],
-                to_seq: 1,
+                to_seq: seq,
             })
-            .expect("ingest control rebuild");
+            .expect("an injected rebuild control is discarded, not an error");
 
+        // Nothing about the conversation moved.
+        assert!(
+            alice.state.conversations.get(&conversation_id).is_none(),
+            "an unauthenticated control must not even materialise a conversation"
+        );
+        assert!(alice.recovery_context_snapshot(&conversation_id).is_none());
+        // And it was acked, so it cannot be redelivered forever.
         assert_eq!(
             alice
                 .state
-                .conversations
-                .get(&conversation_id)
-                .expect("conversation")
-                .conversation
-                .state,
-            crate::model::ConversationState::NeedsRebuild
-        );
-        let recovery = alice
-            .recovery_context_snapshot(&conversation_id)
-            .expect("recovery context");
-        assert_eq!(
-            recovery.phase,
-            crate::ffi_api::RecoveryPhase::EscalatedToRebuild
-        );
-        assert_eq!(
-            recovery.escalation_reason,
-            Some(crate::ffi_api::RecoveryEscalationReason::ExplicitNeedsRebuildControl)
+                .sync_states
+                .get(&device_id)
+                .expect("sync state")
+                .checkpoint
+                .last_acked_seq,
+            seq
         );
     }
 
@@ -9230,6 +9568,7 @@ mod tests {
         let before = local_key_package_ref(&bob);
 
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle);
+        link_contact(&mut bob, &alice);
         create_direct_conversation(&mut alice, bob_user_id);
         let output = deliver_pending_outbox_to_device(&mut bob, &alice, &bob_device_id);
 
@@ -9318,6 +9657,7 @@ mod tests {
         });
 
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle);
+        link_contact(&mut bob, &alice);
         let output = alice
             .handle_command(CoreCommand::CreateConversation {
                 peer_user_id: bob_user_id,
@@ -9396,6 +9736,7 @@ mod tests {
             .expect("rotated share id");
 
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle);
+        link_contact(&mut bob, &alice);
         create_direct_conversation(&mut alice, bob_user_id);
         let output = deliver_pending_outbox_to_device(&mut bob, &alice, &bob_device_id);
         let rebased_publish = publish_shared_state_effects(&output)
@@ -11113,11 +11454,16 @@ mod tests {
 
         if forged_before_welcome {
             deliver_inbox_envelope(&mut chat.bob, &bob_device_id, forged.clone(), 1);
-            assert!(chat.bob.state.conversations[&conversation_id]
-                .pcs
-                .last_certified_commit_hash
-                .is_none());
-            assert!(pending_has_message(
+            // The inbound authentication gate rejects this before anything
+            // downstream runs, so the conversation shell is never even
+            // materialised — a stronger statement than "no certified hash".
+            // An unauthenticated record must leave no trace at all, and both a
+            // conversation shell and a retained retry copy are traces.
+            assert!(
+                !chat.bob.state.conversations.contains_key(&conversation_id),
+                "a forged commit must not materialise a conversation"
+            );
+            assert!(!pending_has_message(
                 &chat.bob,
                 &bob_device_id,
                 &forged.message_id
@@ -11353,6 +11699,9 @@ mod tests {
         let mut conflicting = first_commit.clone();
         conflicting.message_id = format!("{}:conflict", conflicting.message_id);
         conflicting.inline_ciphertext = Some(second.commit_b64);
+        // A genuine second commit from the real committer: the sender proof
+        // covers the message id and payload, so it has to be re-signed.
+        resign_envelope(committer_engine(&chat), &mut conflicting);
         let acceptor_device_id = acceptor_device_id(&chat).to_string();
         let acceptor = acceptor_engine_mut(&mut chat);
         acceptor
@@ -11911,7 +12260,7 @@ mod tests {
             )
             .expect("replay C")
         {
-            IngestResult::IgnoredReplay | IngestResult::PendingRetry => {}
+            IngestResult::Rejected(_) | IngestResult::Deferred(_) => {}
             IngestResult::AppliedCommit { .. } => {
                 panic!("persisted live must not re-merge certified commit C")
             }
@@ -11926,7 +12275,7 @@ mod tests {
             )
             .expect("replay consumed e+1")
         {
-            IngestResult::IgnoredReplay => {}
+            IngestResult::Rejected(_) => {}
             IngestResult::AppliedApplication(_) => {
                 panic!("consumed e+1 generation must not decrypt from persisted live + C")
             }
@@ -12944,6 +13293,27 @@ mod tests {
         }
     }
 
+    /// Give `receiver` the sender's real identity bundle.
+    ///
+    /// Required before `receiver` can ingest anything from `sender`: inbound
+    /// records carry a sender proof over the whole envelope, and the receiver
+    /// resolves the verifying key through its own contact list. It also
+    /// mirrors the real flow, where a peer's envelopes only become fetchable
+    /// after the recipient accepts the message request, which imports the
+    /// sender's bundle first.
+    ///
+    /// Note this must use the sender engine's *own* bundle. Device keys are
+    /// minted fresh per identity — `IdentityManager::create_or_recover`
+    /// ignores the device name and generates a new device key — so a bundle
+    /// rebuilt from the same mnemonic describes a different device and its
+    /// signatures will not verify.
+    fn link_contact(receiver: &mut CoreEngine, sender: &CoreEngine) {
+        let bundle = sender.local_bundle().expect("sender bundle").clone();
+        receiver
+            .handle_command(CoreCommand::ImportIdentityBundle { bundle })
+            .expect("receiver imports sender bundle");
+    }
+
     fn local_engine(mnemonic: &str, device_name: &str) -> CoreEngine {
         let mut engine = CoreEngine::new();
         engine
@@ -13607,6 +13977,75 @@ mod tests {
             .expect("blob uploaded")
     }
 
+    /// Re-sign an envelope after mutating it.
+    ///
+    /// The sender proof covers the whole envelope header, so any test that
+    /// edits a `message_id`, `conversation_id`, `recipient_device_id` or
+    /// payload after the engine produced the envelope must re-sign, or the
+    /// inbound authentication gate correctly rejects it. Exactly one place in
+    /// the test suite knows the signing domain, mirroring the single place in
+    /// production that does (`build_envelope_with_storage_refs`).
+    ///
+    /// `signer` is the engine whose local identity is the claimed sender.
+    fn resign_envelope(signer: &CoreEngine, envelope: &mut Envelope) {
+        let identity = signer
+            .state
+            .local_identity
+            .as_ref()
+            .expect("signer identity")
+            .clone();
+        envelope.sender_proof.value = identity.sign_sender_proof(
+            &crate::model::signing::envelope_sender_proof_payload(envelope),
+        );
+    }
+
+    /// One identity, plus the bundle describing it.
+    ///
+    /// Device keys are minted fresh per identity, so a fixture that needs both
+    /// a verifiable signature and an importable bundle must derive them from
+    /// the same `LocalIdentityState`.
+    fn sample_identity_with_bundle(
+        mnemonic: &str,
+        device_name: &str,
+    ) -> (crate::identity::LocalIdentityState, IdentityBundle) {
+        let identity = IdentityManager::create_or_recover(Some(mnemonic), Some(device_name))
+            .expect("identity");
+        let package = MlsAdapter::generate_key_package(&identity, test_now_ms()).expect("package");
+        let bundle = IdentityManager::export_identity_bundle(
+            &identity,
+            &sample_deployment(),
+            package.key_package_b64,
+            package.expires_at,
+        )
+        .expect("bundle");
+        (identity, bundle)
+    }
+
+    /// A control record genuinely signed by `sender_identity`.
+    ///
+    /// The receiver must hold the bundle exported from this same identity, or
+    /// the sender proof will not verify.
+    fn signed_control_record_from(
+        sender_identity: &crate::identity::LocalIdentityState,
+        device_id: &str,
+        seq: u64,
+        local_user_id: &str,
+        message_type: MessageType,
+    ) -> InboxRecord {
+        let mut record = sample_control_record_with_type(
+            device_id,
+            seq,
+            local_user_id,
+            &sender_identity.user_identity.user_id,
+            &sender_identity.device_identity.device_id,
+            message_type,
+        );
+        record.envelope.sender_proof.value = sender_identity.sign_sender_proof(
+            &crate::model::signing::envelope_sender_proof_payload(&record.envelope),
+        );
+        record
+    }
+
     fn pending_application_record(sender: &CoreEngine, device_id: &str) -> InboxRecord {
         let item = sender
             .state
@@ -13707,23 +14146,6 @@ mod tests {
             },
             preview: None,
         }
-    }
-
-    fn sample_control_record(
-        device_id: &str,
-        seq: u64,
-        local_user_id: &str,
-        sender_user_id: &str,
-        sender_device_id: &str,
-    ) -> InboxRecord {
-        sample_control_record_with_type(
-            device_id,
-            seq,
-            local_user_id,
-            sender_user_id,
-            sender_device_id,
-            MessageType::ControlIdentityStateUpdated,
-        )
     }
 
     fn sample_control_record_with_type(

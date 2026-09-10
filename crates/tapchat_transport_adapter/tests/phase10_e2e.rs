@@ -1153,8 +1153,8 @@ async fn restart_mid_recovery_preserves_context_checkpoint_and_realtime_state() 
         .context("alice realtime session after restart")?;
     assert_eq!(after_restart_context.reason, before_restart_context.reason);
     assert_eq!(
-        after_restart_checkpoint.pending_record_seqs,
-        before_restart_checkpoint.pending_record_seqs
+        after_restart_checkpoint.last_acked_seq,
+        before_restart_checkpoint.last_acked_seq
     );
     assert_eq!(
         after_restart_realtime.last_known_seq,

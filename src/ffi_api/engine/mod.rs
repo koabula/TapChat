@@ -35,9 +35,10 @@ use crate::ffi_api::types::*;
 use crate::identity::{parse_signature, parse_verifying_key, IdentityManager};
 use crate::log_sanitize::redact_id;
 use crate::mls_adapter::{
-    CreateConversationArtifacts, DecryptedApplicationMessage, DirectCommitClass, IngestResult,
-    MlsAdapter, PeerDeviceKeyPackage, RemoveMembersArtifacts,
+    CreateConversationArtifacts, DecryptedApplicationMessage, DeferReason, DirectCommitClass,
+    IngestResult, MlsAdapter, PeerDeviceKeyPackage, RejectReason, RemoveMembersArtifacts,
 };
+use crate::model::signing::envelope_sender_proof_payload;
 use crate::model::{
     Ack, CapabilityService, Conversation, ConversationKind, ConversationMember, ConversationState,
     DeliveryClass, DeviceStatusKind, Envelope, GroupCapability, GroupCursor, GroupEnvelope,
@@ -104,6 +105,45 @@ enum InboxRecordSource {
     PendingReplay,
 }
 
+/// Message types the direct inbox may deliver.
+///
+/// This is an allowlist, not a denylist, and it is shorter than
+/// `MessageType`'s variant list because four variants have no honest producer
+/// on this path: nothing ever builds a direct envelope carrying
+/// `MlsProposal`, `ControlIdentityStateUpdated`,
+/// `ControlConversationNeedsRebuild` or `ControlGroupStateEvent` — those exist
+/// only as group-outbox message types projected onto stored messages. Two of
+/// them were pure attack surface: one forced a conversation rebuild, the other
+/// triggered an outbound identity fetch.
+const INBOX_DELIVERABLE_MESSAGE_TYPES: &[MessageType] = &[
+    MessageType::MlsApplication,
+    MessageType::MlsCommit,
+    MessageType::MlsWelcome,
+    MessageType::ControlContactRemoved,
+    MessageType::ControlContactAccepted,
+    MessageType::ControlDirectCommitAccept,
+    MessageType::ControlDeviceMembershipChanged,
+    MessageType::ControlGroupWelcomePickup,
+];
+
+/// Whether the inbox loop kept a local copy of a record it could not apply.
+///
+/// This is deliberately *not* an "ack or don't ack" decision. Every record in
+/// a batch is acked regardless of its verdict, because withholding an ack is
+/// itself an observable reaction — and a self-inflicted denial of service:
+/// [`advance_contiguous_ack`] only advances across a contiguous run, so a
+/// single withheld seq pins `last_acked_seq` for the whole device
+/// indefinitely, every later record piles up behind it unacked, and the server
+/// redelivers the lot forever. Retention only decides whether the previously
+/// stored copy of this seq is released from the retry buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecordRetention {
+    /// Terminal for this record: release any stored copy of this seq.
+    Discarded,
+    /// A local copy is held for a later retry; leave it in the buffer.
+    Quarantined,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct RecoveryContextSnapshot {
     pub reason: RecoveryReason,
@@ -122,8 +162,6 @@ pub struct RecoveryContextSnapshot {
 pub struct SyncCheckpointSnapshot {
     pub last_fetched_seq: u64,
     pub last_acked_seq: u64,
-    pub pending_retry: bool,
-    pub pending_record_seqs: Vec<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -290,8 +328,6 @@ impl CoreEngine {
             .map(|state| SyncCheckpointSnapshot {
                 last_fetched_seq: state.checkpoint.last_fetched_seq,
                 last_acked_seq: state.checkpoint.last_acked_seq,
-                pending_retry: state.pending_retry,
-                pending_record_seqs: state.pending_record_seqs.iter().copied().collect(),
             })
     }
 
@@ -3351,21 +3387,6 @@ mod protected_application_message_tests {
                 },
             },
         }
-    }
-
-    #[test]
-    fn invalid_inbox_batch_does_not_commit_seen_or_checkpoint_state() {
-        let mut engine = CoreEngine::default();
-        let mut record = sample_record();
-        record.recipient_device_id = "device:mallory:phone".into();
-        record.envelope.recipient_device_id = "device:mallory:phone".into();
-
-        let error = engine
-            .handle_inbox_records("device:bob:phone".into(), vec![record], 1)
-            .expect_err("recipient mismatch must fail before registration");
-
-        assert_eq!(error.code(), "invalid_input");
-        assert!(engine.state.sync_states.is_empty());
     }
 
     #[test]

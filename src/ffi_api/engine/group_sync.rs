@@ -1765,26 +1765,31 @@ impl CoreEngine {
                             None,
                         )?;
                     }
-                    IngestResult::PendingRetry => {
+                    // The group outbox is a shared, replayable log with its
+                    // own cursor rather than a per-device inbox, so there is
+                    // no local retry buffer here: not advancing the cursor
+                    // leaves the record fetchable.
+                    IngestResult::Deferred(reason) => {
+                        log::warn!(
+                            "sync_group_outbox: deferring {reason:?} record {} for group {}",
+                            redact_id("msg", &record.envelope.message_id),
+                            redact_id("group", &group_id)
+                        );
                         self.mark_recovery_needed(&conversation_id, RecoveryReason::MissingCommit);
                         stopped_on_retryable_gap = true;
                         break;
                     }
-                    IngestResult::IgnoredReplay => {
+                    // Terminal: step the cursor past it and carry on. This no
+                    // longer escalates to a rebuild, so an injected record
+                    // cannot force a group teardown.
+                    IngestResult::Rejected(reason) => {
                         log::warn!(
-                            "sync_group_outbox: ignoring replay/duplicate MLS record {} for group {}",
+                            "sync_group_outbox: discarding {reason:?} record {} for group {}",
                             redact_id("msg", &record.envelope.message_id),
                             redact_id("group", &group_id)
                         );
                         last_terminal_seq = record_seq;
                         continue;
-                    }
-                    IngestResult::NeedsRebuild => {
-                        return self.escalate_conversation_to_rebuild(
-                            &conversation_id,
-                            RecoveryEscalationReason::MlsMarkedUnrecoverable,
-                            "group MLS marked conversation unrecoverable",
-                        );
                     }
                     IngestResult::AppliedWelcome { .. } => {}
                 }
@@ -2073,13 +2078,8 @@ impl CoreEngine {
                     .as_deref()
                     .unwrap_or_default(),
             )? {
-                IngestResult::AppliedCommit { .. } | IngestResult::IgnoredReplay => {}
-                IngestResult::PendingRetry => return Ok(None),
-                IngestResult::NeedsRebuild => {
-                    return Err(CoreError::invalid_state(
-                        "transition commit marked MLS state unrecoverable",
-                    ));
-                }
+                IngestResult::AppliedCommit { .. } | IngestResult::Rejected(_) => {}
+                IngestResult::Deferred(_) => return Ok(None),
                 _ => {
                     return Err(CoreError::invalid_input(
                         "transition commit did not produce an MLS commit",
@@ -2098,7 +2098,7 @@ impl CoreEngine {
                 .unwrap_or_default(),
         )? {
             IngestResult::AppliedApplication(application) => application.plaintext,
-            IngestResult::PendingRetry => return Ok(None),
+            IngestResult::Deferred(_) => return Ok(None),
             _ => {
                 return Err(CoreError::invalid_input(
                     "transition control did not decrypt as an application message",
@@ -2137,7 +2137,7 @@ impl CoreEngine {
                 .unwrap_or_default(),
         )? {
             IngestResult::AppliedApplication(application) => application.plaintext,
-            IngestResult::PendingRetry => return Ok(None),
+            IngestResult::Deferred(_) => return Ok(None),
             _ => {
                 return Err(CoreError::invalid_input(
                     "transition state event did not decrypt as an application message",

@@ -1,9 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use openmls::framing::errors::{MessageDecryptionError, SecretTreeError};
 use openmls::prelude::{tls_codec::Deserialize, *};
 use openmls_basic_credential::SignatureKeyPair;
-use openmls_rust_crypto::OpenMlsRustCrypto;
+use openmls_rust_crypto::{MemoryStorageError, OpenMlsRustCrypto};
 use serde::{Deserialize as SerdeDeserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -133,15 +134,93 @@ pub struct DecryptedApplicationMessage {
     pub from_previous_epoch: bool,
 }
 
+/// Why a frame can never be applied.
+///
+/// Terminal: no future local state makes these bytes valid. The disposition is
+/// always ack-and-discard, so the reason is telemetry only and must never
+/// drive a state transition — with the single, documented exception of
+/// [`RejectReason::LocalGroupUnusable`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RejectReason {
+    /// Undecodable, or structurally impossible for its claimed type.
+    Malformed,
+    /// A cryptographic check failed: signature, membership tag, confirmation
+    /// tag, or the AEAD tag. This is the forgery signal.
+    Forged,
+    /// The sender is not permitted to send this content.
+    Unauthorized,
+    /// This exact generation was already consumed, or it is our own message
+    /// echoed back to us by the delivery service.
+    Replay,
+    /// The secrets needed are gone for forward secrecy and never come back.
+    SecretsGone,
+    /// The local group can no longer process anything — we were evicted, or
+    /// our own key material for the update path is missing. This condition is
+    /// pre-existing and local: it holds for every frame, not just this one, so
+    /// acting on it is not a reaction to adversary input. It is the only
+    /// reason a disposition site may escalate to a rebuild.
+    LocalGroupUnusable,
+    /// An openmls `LibraryError` or an unreachable state. Should never happen;
+    /// acked and discarded rather than allowed to stall sync, with loud logs.
+    Internal,
+}
+
+/// Why a frame cannot be authenticated *yet*.
+///
+/// Non-terminal: a future local state transition may make these bytes valid.
+/// A future-epoch forgery and a legitimate out-of-order frame are
+/// bit-identical in every observable respect, so this verdict is
+/// indistinguishable from a forgery by construction. It must therefore be
+/// quarantined *invisibly* and *boundedly* — never surfaced, never allowed to
+/// grow without limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeferReason {
+    /// We hold the group but are behind it: a future epoch, a future
+    /// generation, or a commit referencing a proposal we have not seen.
+    OutOfOrder,
+    /// We hold no MLS group for this conversation at all. Only the disposition
+    /// site can tell whether that is a genuine missing Welcome, so the adapter
+    /// reports the fact and leaves the judgement to the caller.
+    NoLocalGroup,
+}
+
+/// The two non-applied outcomes.
+///
+/// Shared by every classifier so the reason vocabulary cannot drift between
+/// the message path and the commit path — the duplication it replaces had
+/// already drifted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    Rejected(RejectReason),
+    Deferred(DeferReason),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IngestResult {
     AppliedApplication(DecryptedApplicationMessage),
     AppliedCommit { epoch: u64 },
     AppliedWelcome { epoch: u64 },
     AppliedProposal,
-    IgnoredReplay,
-    PendingRetry,
-    NeedsRebuild,
+    Rejected(RejectReason),
+    Deferred(DeferReason),
+}
+
+impl From<Verdict> for IngestResult {
+    fn from(verdict: Verdict) -> Self {
+        match verdict {
+            Verdict::Rejected(reason) => IngestResult::Rejected(reason),
+            Verdict::Deferred(reason) => IngestResult::Deferred(reason),
+        }
+    }
+}
+
+impl From<Verdict> for DirectCommitClass {
+    fn from(verdict: Verdict) -> Self {
+        match verdict {
+            Verdict::Rejected(reason) => DirectCommitClass::Rejected(reason),
+            Verdict::Deferred(reason) => DirectCommitClass::Deferred(reason),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -158,10 +237,11 @@ pub enum DirectCommitClass {
         base_epoch: u64,
         sender_identity: String,
     },
-    MembershipOrOther,
-    IgnoredReplay,
-    PendingRetry,
-    NeedsRebuild,
+    /// Authenticated, but not a bare self-update: the direct-PCS handler
+    /// declines and lets the generic ingest path deal with it.
+    NotSelfUpdate,
+    Rejected(RejectReason),
+    Deferred(DeferReason),
 }
 
 #[derive(Debug)]
@@ -229,6 +309,22 @@ pub struct MlsConversationPatch {
     pub staged_values: BTreeMap<String, Option<String>>,
 }
 
+/// A complete, comparable snapshot of everything an `MlsAdapter` exposes.
+///
+/// Built by [`MlsAdapter::state_fingerprint`]. Two adapters with equal
+/// fingerprints are indistinguishable to every caller: same provider store,
+/// same conversations, same epochs, same rosters, same statuses, same PCS
+/// sidecars.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MlsStateFingerprint {
+    pub provider_state_sha256: String,
+    pub conversations: BTreeMap<String, MlsStateSummary>,
+    /// Per conversation, the PCS sidecar's `(epoch, pending update count)`.
+    /// The sidecar lives only in memory, so the provider hash does not cover
+    /// it and a fingerprint comparison would otherwise miss `push_pcs_update`.
+    pub pcs_sidecars: BTreeMap<String, (u64, usize)>,
+}
+
 #[derive(Debug, Default)]
 pub struct RestoreMlsStateResult {
     pub adapter: Option<MlsAdapter>,
@@ -273,12 +369,211 @@ fn record_restore_failure(
     failures.push(failure);
 }
 
-fn is_replay_or_duplicate_process_error(error: &impl std::fmt::Debug) -> bool {
-    let debug = format!("{error:?}").to_ascii_lowercase();
-    debug.contains("secretreuseerror")
-        || debug.contains("secret reuse")
-        || debug.contains("generation out of bounds")
-        || debug.contains("ciphertext generation out of bounds")
+/// Classify an OpenMLS `process_message` failure into an ingest disposition.
+///
+/// Two rules govern this table.
+///
+/// **`Err` means *our* fault, never theirs.** Anything a peer or an adversary
+/// can cause by choosing bytes is a return value, because an `Err` here
+/// propagates out of the whole inbox batch, emits no persist op, acks nothing,
+/// and re-fails identically on every later fetch — a permanent, restart-
+/// surviving sync stall that costs the attacker one HTTP POST. So the only
+/// `Err` is `StorageError`. Note `LibraryError` is *not* eligible: it is
+/// reachable from attacker bytes through `ValidationError::LibraryError`,
+/// `MessageDecryptionError::LibraryError` and `SecretTreeError::LibraryError`,
+/// so it is classified as terminal-and-discarded with loud telemetry instead.
+///
+/// **When in doubt, retry rather than discard.** Misclassifying a terminal
+/// failure as retryable costs one buffer slot. Misclassifying an out-of-order
+/// frame as terminal silently loses a real message.
+///
+/// This replaces a `format!("{error:?}")` substring match that was wrong in
+/// both directions: it tested for `GenerationOutOfBound`, which openmls 0.8.1
+/// never constructs, and it missed `TooDistantInThePast`,
+/// `StageCommitError::OwnCommit` and `CannotDecryptOwnMessage` — three routine
+/// conditions (the delivery service echoing our own traffic back at us) that
+/// consequently drove the conversation into recovery and stalled the ack
+/// cursor. Matching on the real types also means an openmls upgrade that adds
+/// a variant fails the build instead of silently landing in a catch-all.
+fn classify_process_error(error: ProcessMessageError<MemoryStorageError>) -> CoreResult<Verdict> {
+    use ProcessMessageError as P;
+    Ok(match error {
+        // The only local fault.
+        P::StorageError(error) => {
+            return Err(CoreError::invalid_state(format!(
+                "MLS provider storage failed while processing a message: {error:?}"
+            )))
+        }
+        P::LibraryError(error) => {
+            log::error!("openmls reported a library error while processing a message: {error:?}");
+            Verdict::Rejected(RejectReason::Internal)
+        }
+        P::IncompatibleWireFormat => Verdict::Rejected(RejectReason::Malformed),
+        P::UnauthorizedExternalApplicationMessage
+        | P::UnauthorizedExternalCommitMessage
+        | P::UnsupportedProposalType => Verdict::Rejected(RejectReason::Unauthorized),
+        P::GroupStateError(error) => classify_group_state_error(error),
+        P::InvalidCommit(error) => classify_stage_commit_error(error),
+        P::ValidationError(error) => classify_validation_error(error),
+    })
+}
+
+fn classify_group_state_error(error: MlsGroupStateError) -> Verdict {
+    use MlsGroupStateError as G;
+    match error {
+        // We were removed from the group by a commit we already merged. This
+        // is a pre-existing local condition — true for every frame, not caused
+        // by this one — so acting on it is not a reaction to attacker input.
+        G::UseAfterEviction => Verdict::Rejected(RejectReason::LocalGroupUnusable),
+        // Only the create/commit APIs produce these; reaching one here means a
+        // library invariant broke.
+        G::PendingProposal | G::PendingCommit | G::NoPendingCommit | G::PendingProposalNotFound => {
+            log::error!("unexpected MLS group state error while processing a message: {error:?}");
+            Verdict::Rejected(RejectReason::Internal)
+        }
+        G::LibraryError(error) => {
+            log::error!("openmls library error in group state: {error:?}");
+            Verdict::Rejected(RejectReason::Internal)
+        }
+    }
+}
+
+fn classify_stage_commit_error(error: StageCommitError) -> Verdict {
+    use StageCommitError as S;
+    match error {
+        // A commit-by-reference can arrive before the proposal it references.
+        S::MissingProposal => Verdict::Deferred(DeferReason::OutOfOrder),
+        // Unreachable in practice: our own pre-gate rejects `epoch < live` and
+        // `epoch > live` fails earlier during decryption. Retryable by the
+        // when-in-doubt rule.
+        S::EpochMismatch => Verdict::Deferred(DeferReason::OutOfOrder),
+        // The delivery service echoed our own commit back at us. Nothing to
+        // apply, and it never becomes applicable.
+        S::OwnCommit => Verdict::Rejected(RejectReason::Replay),
+        // Our own key material for the update path is gone. Only reachable
+        // after the commit authenticated, so escalating is safe.
+        S::OwnKeyNotFound | S::MissingDecryptionKey => {
+            Verdict::Rejected(RejectReason::LocalGroupUnusable)
+        }
+        // Everything else is a commit that either failed authentication or is
+        // semantically invalid. No future local state makes it valid.
+        S::ConfirmationTagMissing
+        | S::ConfirmationTagMismatch
+        | S::PathLeafNodeVerificationFailure => Verdict::Rejected(RejectReason::Forged),
+        S::SenderTypeExternal | S::SenderTypeNewMemberProposal => {
+            Verdict::Rejected(RejectReason::Unauthorized)
+        }
+        S::LibraryError(_)
+        | S::WrongPlaintextContentType
+        | S::RequiredPathNotFound
+        | S::AttemptedSelfRemoval
+        | S::InconsistentSenderIndex
+        | S::TooManyNewMembers
+        | S::ProposalValidationError(_)
+        | S::PskError(_)
+        | S::ExternalCommitValidation(_)
+        | S::UpdatePathError(_)
+        | S::VerifiedUpdatePathError(_)
+        | S::GroupContextExtensionsProposalValidationError(_)
+        | S::LeafNodeValidation(_)
+        | S::DuplicatePskId(_) => Verdict::Rejected(RejectReason::Malformed),
+        // `AppDataUpdateValidationError` and `ApplyAppDataUpdateError` exist
+        // only under openmls' `extensions-draft-08` feature, which is off.
+        // If it is ever enabled this match stops compiling, which is the
+        // intended way to be told about it.
+    }
+}
+
+fn classify_validation_error(error: ValidationError) -> Verdict {
+    use ValidationError as V;
+    match error {
+        // The core of the problem R2 solves: our pre-gate already rejected
+        // `epoch < live`, so this is a handshake message for an epoch we have
+        // not reached yet. A legitimate commit that overtook its predecessor
+        // and a future-epoch forgery are bit-identical in every observable
+        // respect, so both are retried — bounded, and invisibly.
+        V::WrongEpoch => Verdict::Deferred(DeferReason::OutOfOrder),
+        // The sender's leaf may be populated by a commit we have not processed.
+        V::UnknownMember => Verdict::Deferred(DeferReason::OutOfOrder),
+        // `max_past_epochs(1)` already deleted that epoch's secrets. Retrying
+        // cannot help: nothing arriving later restores deleted key material.
+        V::NoPastEpochData => Verdict::Rejected(RejectReason::SecretsGone),
+        // The delivery service echoed our own application message back, and
+        // the deletion schedule removed our own sender keys. Never decryptable.
+        V::CannotDecryptOwnMessage => Verdict::Rejected(RejectReason::Replay),
+        V::UnableToDecrypt(error) => classify_decryption_error(error),
+        V::LibraryError(error) => {
+            log::error!("openmls library error during validation: {error:?}");
+            Verdict::Rejected(RejectReason::Internal)
+        }
+        V::InvalidSignature
+        | V::InvalidMembershipTag
+        | V::InvalidLeafNodeSignature
+        | V::MissingMembershipTag
+        | V::MissingConfirmationTag => Verdict::Rejected(RejectReason::Forged),
+        V::NonMemberApplicationMessage
+        | V::UnauthorizedExternalSender
+        | V::NoExternalSendersExtension => Verdict::Rejected(RejectReason::Unauthorized),
+        // Structurally impossible frames.
+        V::WrongGroupId
+        | V::NotACommit
+        | V::NotAnExternalAddProposal
+        | V::NoPath
+        | V::UnencryptedApplicationMessage
+        | V::WrongWireFormat
+        | V::KeyPackageVerifyError(_)
+        | V::UpdatePathError(_)
+        | V::InvalidLeafNodeSourceType
+        | V::InvalidSenderType
+        | V::CommitterIncludedOwnUpdate
+        | V::InvalidAddProposalCiphersuite
+        | V::ExternalCommitValidation(_)
+        | V::InvalidExtension(_) => Verdict::Rejected(RejectReason::Malformed),
+    }
+}
+
+fn classify_decryption_error(error: MessageDecryptionError) -> Verdict {
+    use MessageDecryptionError as D;
+    match error {
+        D::SecretTreeError(error) => classify_secret_tree_error(error),
+        // Right epoch, right generation window, wrong key. The AEAD tag *is*
+        // the authentication, so this is the forgery signal.
+        D::AeadError => Verdict::Rejected(RejectReason::Forged),
+        // Declared but never constructed in openmls 0.8.1; listed so the
+        // match stays exhaustive.
+        D::GenerationOutOfBound => Verdict::Rejected(RejectReason::SecretsGone),
+        D::WrongWireFormat | D::MalformedContent => Verdict::Rejected(RejectReason::Malformed),
+        D::LibraryError(error) => {
+            log::error!("openmls library error during decryption: {error:?}");
+            Verdict::Rejected(RejectReason::Internal)
+        }
+    }
+}
+
+fn classify_secret_tree_error(error: SecretTreeError) -> Verdict {
+    use SecretTreeError as T;
+    match error {
+        // Generation beyond the forward window. Tempting to treat as a
+        // forgery, since an attacker sets a huge generation for free — but it
+        // is genuinely repairable: once the intervening frames ratchet us
+        // forward this generation falls inside the window and decrypts. A real
+        // frame after a long burst is indistinguishable from the forgery, so
+        // discarding would silently drop real messages. Retry, bounded.
+        T::TooDistantInTheFuture => Verdict::Deferred(DeferReason::OutOfOrder),
+        // The secret was deleted immediately after use: canonical replay.
+        T::SecretReuseError => Verdict::Rejected(RejectReason::Replay),
+        // Outside the out-of-order tolerance, or already consumed. Gone for
+        // forward secrecy. Previously classified as retryable, which made this
+        // the cheapest way to stall a client permanently.
+        T::TooDistantInThePast | T::RatchetTooLong => {
+            Verdict::Rejected(RejectReason::SecretsGone)
+        }
+        T::IndexOutOfBounds | T::CodecError(_) => Verdict::Rejected(RejectReason::Malformed),
+        T::RatchetTypeError | T::LibraryError | T::CryptoError(_) => {
+            log::error!("unexpected MLS secret tree error: {error:?}");
+            Verdict::Rejected(RejectReason::Internal)
+        }
+    }
 }
 
 fn store_sha256(store: &SerializableStore) -> CoreResult<String> {
@@ -1057,7 +1352,7 @@ impl MlsAdapter {
         payload_b64: &str,
     ) -> CoreResult<DirectCommitClass> {
         if !self.groups.contains_key(conversation_id) {
-            return Ok(DirectCommitClass::PendingRetry);
+            return Ok(DirectCommitClass::Deferred(DeferReason::NoLocalGroup));
         }
         let base_epoch = self.export_group_summary(conversation_id)?.epoch;
         let mut fork = self.fork()?;
@@ -1071,14 +1366,13 @@ impl MlsAdapter {
         // Welcome joiners never process the creating Add Commit; its epoch is
         // already behind live. Same for any Commit we have already advanced past.
         if protocol_message.epoch().as_u64() < base_epoch {
-            return Ok(DirectCommitClass::IgnoredReplay);
+            return Ok(DirectCommitClass::Rejected(RejectReason::Replay));
         }
         let processed = match state.group.process_message(provider, protocol_message) {
             Ok(processed) => processed,
-            Err(error) if is_replay_or_duplicate_process_error(&error) => {
-                return Ok(DirectCommitClass::IgnoredReplay);
+            Err(error) => {
+                return Ok(classify_process_error(error)?.into())
             }
-            Err(_) => return Ok(DirectCommitClass::PendingRetry),
         };
         let sender_identity = extract_sender_identity(processed.credential())?;
         match processed.into_content() {
@@ -1087,7 +1381,7 @@ impl MlsAdapter {
                 let has_remove = staged_commit.remove_proposals().next().is_some();
                 let has_path = staged_commit.update_path_leaf_node().is_some();
                 if has_add || has_remove || !has_path {
-                    return Ok(DirectCommitClass::MembershipOrOther);
+                    return Ok(DirectCommitClass::NotSelfUpdate);
                 }
                 Ok(DirectCommitClass::PcsSelfUpdate {
                     commit_hash: crate::direct_pcs::commit_hash_from_b64(payload_b64)?,
@@ -1096,9 +1390,9 @@ impl MlsAdapter {
                 })
             }
             ProcessedMessageContent::ApplicationMessage(_) => {
-                Ok(DirectCommitClass::MembershipOrOther)
+                Ok(DirectCommitClass::NotSelfUpdate)
             }
-            _ => Ok(DirectCommitClass::NeedsRebuild),
+            _ => Ok(DirectCommitClass::Rejected(RejectReason::Unauthorized)),
         }
     }
 
@@ -1195,10 +1489,12 @@ impl MlsAdapter {
         payload_b64: &str,
     ) -> CoreResult<IngestResult> {
         match message_type {
-            MessageType::MlsWelcome => self.ingest_welcome(conversation_id, payload_b64),
+            MessageType::MlsWelcome => {
+                self.ingest_welcome(conversation_id, sender_device_id, payload_b64)
+            }
             MessageType::MlsCommit | MessageType::MlsApplication | MessageType::MlsProposal => {
                 if !self.groups.contains_key(conversation_id) {
-                    return Ok(IngestResult::PendingRetry);
+                    return Ok(IngestResult::Deferred(DeferReason::NoLocalGroup));
                 }
                 self.ingest_protocol_message(
                     conversation_id,
@@ -1275,6 +1571,46 @@ impl MlsAdapter {
 
     pub fn has_conversation(&self, conversation_id: &str) -> bool {
         self.groups.contains_key(conversation_id)
+    }
+
+    /// Content hash of the whole OpenMLS provider store.
+    ///
+    /// This is the oracle for the "authentication failure leaves no trace"
+    /// invariant: an inbound record that fails to authenticate must leave this
+    /// value unchanged. It covers everything OpenMLS persists — ratchet state,
+    /// queued proposals, epoch key pairs, KeyPackage private material — so it
+    /// catches the pre-verdict writes that a per-field assertion would miss.
+    ///
+    /// Pair it with [`Self::state_fingerprint`]: the store hash alone does not
+    /// cover the adapter's in-memory sidecars.
+    pub fn provider_state_sha256(&self) -> CoreResult<String> {
+        store_sha256(&self.serializable_store()?)
+    }
+
+    /// Everything the adapter holds that a caller can observe, in one value.
+    ///
+    /// `provider_state_sha256` plus the per-conversation summaries, which carry
+    /// the in-memory-only `status` and the PCS sidecar epoch. Comparing two
+    /// fingerprints is the strongest "nothing moved" assertion available
+    /// without reaching into private fields.
+    pub fn state_fingerprint(&self) -> CoreResult<MlsStateFingerprint> {
+        let mut conversations = BTreeMap::new();
+        let mut pcs_sidecars = BTreeMap::new();
+        for (conversation_id, state) in &self.groups {
+            conversations.insert(
+                conversation_id.clone(),
+                self.export_group_summary(conversation_id)?,
+            );
+            pcs_sidecars.insert(
+                conversation_id.clone(),
+                (state.pcs_update_epoch, state.pcs_updates.len()),
+            );
+        }
+        Ok(MlsStateFingerprint {
+            provider_state_sha256: self.provider_state_sha256()?,
+            conversations,
+            pcs_sidecars,
+        })
     }
 
     pub fn member_device_ids_for_user(
@@ -1698,53 +2034,120 @@ impl MlsAdapter {
         })
     }
 
+    /// Join a group from an inbound Welcome, on a fork, adopting only if the
+    /// Welcome authenticates as the one the envelope claims it is.
+    ///
+    /// Everything here runs against `fork()` and is adopted with `*self =
+    /// fork` only on success, because two of the steps write to provider
+    /// storage *before* anything is validated:
+    ///
+    /// * Rebuild semantics require clearing the live group first — openmls
+    ///   refuses to stage a Welcome whose `GroupId` already exists in storage
+    ///   (`WelcomeError::GroupAlreadyExists`), and the `GroupId` is derived
+    ///   deterministically from `conversation_id`. Done on the live adapter,
+    ///   a forged Welcome for an existing conversation deletes that
+    ///   conversation's group outright.
+    /// * `StagedWelcome::new_from_welcome` deletes the matched KeyPackage from
+    ///   storage as soon as it finds one — before group-secret decryption,
+    ///   before the GroupInfo signature check, before the confirmation tag.
+    ///   openmls documents this ("calling this function will consume the key
+    ///   material ... even if the caller does not turn the StagedWelcome into
+    ///   an MlsGroup"). Since published KeyPackage hash refs are public,
+    ///   anyone could otherwise drain our one-time KeyPackage pool by minting
+    ///   Welcomes with garbage secrets. Last-resort KeyPackages are exempt
+    ///   from the delete, so the pool is the exposed surface.
+    ///
+    /// On any rejection the fork is dropped and the live adapter is unchanged,
+    /// bit for bit — which is what `state_fingerprint()` asserts in the tests.
     fn ingest_welcome(
         &mut self,
         conversation_id: &str,
+        sender_device_id: &str,
         payload_b64: &str,
     ) -> CoreResult<IngestResult> {
-        // Rebuild/rejoin semantics treat a fresh welcome as authoritative for this
-        // conversation. If stale local state still exists, replace it before
-        // attempting to join the new group.
-        if self.groups.contains_key(conversation_id) {
-            self.clear_conversation(conversation_id);
-        }
+        let Some(welcome) = decode_welcome_body(payload_b64) else {
+            log::warn!(
+                "ingest_welcome: discarding undecodable welcome for conversation {}",
+                redact_id("conversation", conversation_id)
+            );
+            return Ok(IngestResult::Rejected(RejectReason::Malformed));
+        };
+
+        let mut fork = self.fork()?;
+        // Rebuild/rejoin semantics treat a fresh welcome as authoritative for
+        // this conversation, so stale local state is replaced — but on the
+        // fork, so a Welcome that fails the checks below replaces nothing.
+        fork.clear_conversation(conversation_id);
+
         // max_past_epochs(1): see the comment in create_conversation — same
         // reorder-tolerance trade-off, same epoch e-1 forward-secrecy boundary.
         let config = MlsGroupJoinConfig::builder()
             .use_ratchet_tree_extension(true)
             .max_past_epochs(1)
             .build();
-        let welcome_bytes = BASE64
-            .decode(payload_b64)
-            .map_err(|_| CoreError::invalid_input("invalid base64 welcome payload"))?;
-        let welcome_message =
-            MlsMessageIn::tls_deserialize_exact(welcome_bytes).map_err(|error| {
-                CoreError::invalid_input(format!("failed to decode welcome message: {error}"))
-            })?;
-        let welcome = match welcome_message.extract() {
-            MlsMessageBodyIn::Welcome(welcome) => welcome,
-            _ => {
-                return Err(CoreError::invalid_input(
-                    "decoded MLS message was not a welcome",
-                ));
+        let staged = match StagedWelcome::new_from_welcome(&fork.provider, &config, welcome, None) {
+            Ok(staged) => staged,
+            Err(error) => {
+                log::warn!(
+                    "ingest_welcome: discarding unusable welcome for conversation {}: {error}",
+                    redact_id("conversation", conversation_id)
+                );
+                return Ok(IngestResult::Rejected(RejectReason::Malformed));
             }
         };
-        let staged = StagedWelcome::new_from_welcome(&self.provider, &config, welcome, None)
-            .map_err(|error| {
-                CoreError::invalid_state(format!("failed to stage welcome: {error}"))
-            })?;
-        let group = staged.into_group(&self.provider).map_err(|error| {
-            CoreError::invalid_state(format!("failed to join group from welcome: {error}"))
-        })?;
+
+        // Bind the Welcome to the conversation the envelope claims. Without
+        // this, replaying a legitimate Welcome for conversation A under an
+        // envelope naming conversation B installs A's group as B and destroys
+        // B's live group.
+        let expected_group_id = GroupId::from_slice(conversation_id.as_bytes());
+        if staged.group_context().group_id() != &expected_group_id {
+            log::warn!(
+                "ingest_welcome: welcome group_id does not match conversation {}",
+                redact_id("conversation", conversation_id)
+            );
+            return Ok(IngestResult::Rejected(RejectReason::Malformed));
+        }
+
+        // Bind the Welcome's author to the envelope's sender, so a third party
+        // who fetched our published KeyPackage cannot hand us a group that we
+        // would then treat as this conversation.
+        let Ok(welcome_sender) = staged.welcome_sender() else {
+            log::warn!(
+                "ingest_welcome: welcome has no resolvable sender leaf for conversation {}",
+                redact_id("conversation", conversation_id)
+            );
+            return Ok(IngestResult::Rejected(RejectReason::Malformed));
+        };
+        let author = extract_sender_identity(welcome_sender.credential())?;
+        if credential_device_id(&author).as_deref() != Some(sender_device_id) {
+            log::warn!(
+                "ingest_welcome: welcome author is not the envelope sender for conversation {}",
+                redact_id("conversation", conversation_id)
+            );
+            return Ok(IngestResult::Rejected(RejectReason::Malformed));
+        }
+
+        let group = match staged.into_group(&fork.provider) {
+            Ok(group) => group,
+            Err(error) => {
+                log::warn!(
+                    "ingest_welcome: failed to join group for conversation {}: {error}",
+                    redact_id("conversation", conversation_id)
+                );
+                return Ok(IngestResult::Rejected(RejectReason::Malformed));
+            }
+        };
         let member_device_ids = extract_member_device_ids(&group)?;
-        self.groups.insert(
+        fork.groups.insert(
             conversation_id.to_string(),
             local_mls_state(group, member_device_ids, MlsStateStatus::Active),
         );
-        Ok(IngestResult::AppliedWelcome {
-            epoch: self.export_group_summary(conversation_id)?.epoch,
-        })
+        let epoch = fork.export_group_summary(conversation_id)?.epoch;
+
+        // Authenticated: adopt the fork.
+        *self = fork;
+        Ok(IngestResult::AppliedWelcome { epoch })
     }
 
     pub fn protocol_message_epoch(payload_b64: &str) -> CoreResult<u64> {
@@ -1755,6 +2158,22 @@ impl MlsAdapter {
             .as_u64())
     }
 
+    /// Process an inbound MLS protocol message on a fork, adopting the result
+    /// only if it applied.
+    ///
+    /// Three writes here happen *before* the frame is known to be
+    /// authentic, so all of them run against `fork()`:
+    ///
+    /// * `store_pending_proposal` persists a queued proposal for any commit at
+    ///   `epoch >= live`, forged ones included.
+    /// * `process_message` ratchets the sender's decryption ratchet forward
+    ///   and prunes past secrets *before* attempting the AEAD open, so a
+    ///   forged frame with a far-future generation destroys the key material
+    ///   for the legitimate generations it skipped.
+    /// * The status transitions this function used to make on failure.
+    ///
+    /// Dropping the fork therefore leaves `state_fingerprint()` untouched,
+    /// which is what the "leaves no trace" tests assert.
     fn ingest_protocol_message(
         &mut self,
         conversation_id: &str,
@@ -1762,24 +2181,64 @@ impl MlsAdapter {
         message_type: MessageType,
         payload_b64: &str,
     ) -> CoreResult<IngestResult> {
-        let provider = &self.provider;
-        let state = self
+        let Some(protocol_message) = decode_protocol_message(payload_b64) else {
+            log::warn!(
+                "ingest_protocol_message: discarding undecodable payload for conversation {}",
+                redact_id("conversation", conversation_id)
+            );
+            return Ok(IngestResult::Rejected(RejectReason::Malformed));
+        };
+        let live_epoch = self
+            .groups
+            .get(conversation_id)
+            .ok_or_else(|| CoreError::invalid_input("conversation MLS state does not exist"))?
+            .group
+            .epoch()
+            .as_u64();
+        let message_epoch = protocol_message.epoch().as_u64();
+        let from_previous_epoch = message_epoch < live_epoch;
+        // A handshake message for an epoch we have already left can never
+        // apply. Decided here, before `process_message`, so a stale frame
+        // never touches the ratchet.
+        if matches!(
+            message_type,
+            MessageType::MlsCommit | MessageType::MlsProposal
+        ) && from_previous_epoch
+        {
+            return Ok(IngestResult::Rejected(RejectReason::Replay));
+        }
+
+        let mut fork = self.fork()?;
+        let verdict = Self::ingest_protocol_message_on(
+            &mut fork,
+            conversation_id,
+            message_type,
+            protocol_message,
+            from_previous_epoch,
+        )?;
+        if matches!(
+            verdict,
+            IngestResult::AppliedApplication(_)
+                | IngestResult::AppliedCommit { .. }
+                | IngestResult::AppliedProposal
+        ) {
+            *self = fork;
+        }
+        Ok(verdict)
+    }
+
+    fn ingest_protocol_message_on(
+        adapter: &mut Self,
+        conversation_id: &str,
+        message_type: MessageType,
+        protocol_message: ProtocolMessage,
+        from_previous_epoch: bool,
+    ) -> CoreResult<IngestResult> {
+        let provider = &adapter.provider;
+        let state = adapter
             .groups
             .get_mut(conversation_id)
-            .ok_or_else(|| CoreError::invalid_input("conversation MLS state does not exist"))?;
-        let message_in = decode_mls_message(payload_b64)?;
-        let protocol_message = message_in
-            .try_into_protocol_message()
-            .map_err(|_| CoreError::invalid_input("expected a protocol MLS message"))?;
-        let message_epoch = protocol_message.epoch().as_u64();
-        let live_epoch = state.group.epoch().as_u64();
-        let from_previous_epoch = message_epoch < live_epoch;
-        if message_type == MessageType::MlsCommit && from_previous_epoch {
-            return Ok(IngestResult::IgnoredReplay);
-        }
-        if message_type == MessageType::MlsProposal && from_previous_epoch {
-            return Ok(IngestResult::IgnoredReplay);
-        }
+            .ok_or_else(|| CoreError::invalid_state("forked adapter is missing the conversation"))?;
         if message_type == MessageType::MlsCommit && !from_previous_epoch {
             align_pcs_sidecar_epoch(state);
             for proposal in state.pcs_updates.clone() {
@@ -1798,20 +2257,13 @@ impl MlsAdapter {
         }
         let processed = match state.group.process_message(provider, protocol_message) {
             Ok(processed) => processed,
-            Err(error) if is_replay_or_duplicate_process_error(&error) => {
+            Err(error) => {
+                let verdict = classify_process_error(error)?;
                 log::warn!(
-                    "ingest_protocol_message: ignoring replay/duplicate MLS message for conversation {}",
+                    "ingest_protocol_message: {verdict:?} for conversation {}",
                     redact_id("conversation", conversation_id)
                 );
-                return Ok(IngestResult::IgnoredReplay);
-            }
-            Err(_error) => {
-                log::warn!(
-                    "ingest_protocol_message: MLS process_message failed for conversation {}",
-                    redact_id("conversation", conversation_id)
-                );
-                state.status = MlsStateStatus::NeedsRecovery;
-                return Ok(IngestResult::PendingRetry);
+                return Ok(verdict.into());
             }
         };
         let sender_identity = extract_sender_identity(processed.credential())?;
@@ -1828,8 +2280,7 @@ impl MlsAdapter {
             }
             ProcessedMessageContent::StagedCommitMessage(staged_commit) => {
                 if message_type != MessageType::MlsCommit {
-                    state.status = MlsStateStatus::NeedsRebuild;
-                    return Ok(IngestResult::NeedsRebuild);
+                    return Ok(IngestResult::Rejected(RejectReason::Malformed));
                 }
                 state
                     .group
@@ -1845,8 +2296,7 @@ impl MlsAdapter {
             }
             ProcessedMessageContent::ProposalMessage(proposal) => {
                 if message_type != MessageType::MlsProposal {
-                    state.status = MlsStateStatus::NeedsRebuild;
-                    return Ok(IngestResult::NeedsRebuild);
+                    return Ok(IngestResult::Rejected(RejectReason::Malformed));
                 }
                 if is_member_self_update(&proposal) {
                     push_pcs_update(state, *proposal);
@@ -1859,10 +2309,10 @@ impl MlsAdapter {
                 state.status = MlsStateStatus::Active;
                 Ok(IngestResult::AppliedProposal)
             }
-            _ => {
-                state.status = MlsStateStatus::NeedsRecovery;
-                Ok(IngestResult::PendingRetry)
-            }
+            // An external join proposal or other content type we do not
+            // accept from this path. Terminal: no future local state makes it
+            // acceptable, so discard rather than retry forever.
+            _ => Ok(IngestResult::Rejected(RejectReason::Unauthorized)),
         }
     }
 
@@ -2061,6 +2511,44 @@ fn decode_mls_message(payload_b64: &str) -> CoreResult<MlsMessageIn> {
         .map_err(|error| CoreError::invalid_input(format!("failed to decode MLS message: {error}")))
 }
 
+/// Decode a base64 MLS message and extract its protocol message body.
+///
+/// `None` for anything an adversary can author. See `decode_welcome_body` for
+/// why this must not be an `Err`.
+fn decode_protocol_message(payload_b64: &str) -> Option<ProtocolMessage> {
+    let bytes = BASE64.decode(payload_b64).ok()?;
+    MlsMessageIn::tls_deserialize_exact(bytes)
+        .ok()?
+        .try_into_protocol_message()
+        .ok()
+}
+
+/// Decode a base64 MLS message and extract its Welcome body.
+///
+/// Returns `None` for anything an adversary can author: bad base64, bad TLS,
+/// or a well-formed MLS message that is not a Welcome. None of that is a local
+/// fault, so none of it may escape as an `Err` — an `Err` out of the ingest
+/// path aborts the whole inbox batch and stalls the device permanently.
+fn decode_welcome_body(payload_b64: &str) -> Option<Welcome> {
+    let bytes = BASE64.decode(payload_b64).ok()?;
+    match MlsMessageIn::tls_deserialize_exact(bytes).ok()?.extract() {
+        MlsMessageBodyIn::Welcome(welcome) => Some(welcome),
+        _ => None,
+    }
+}
+
+/// The device id field of an MLS credential identity.
+///
+/// Identities are built by `build_credential_identity` as
+/// `user_id|device_id|device_public_key|binding_signature`.
+fn credential_device_id(identity: &str) -> Option<String> {
+    let parts: Vec<&str> = identity.split('|').collect();
+    if parts.len() != 4 {
+        return None;
+    }
+    parts.get(1).map(|device_id| device_id.to_string())
+}
+
 fn decode_key_package(payload_b64: &str) -> CoreResult<KeyPackage> {
     let bytes = BASE64
         .decode(payload_b64)
@@ -2122,7 +2610,7 @@ mod tests {
     use super::{
         key_package_rotation_jitter_ms, validate_published_key_package_lifetime, DirectCommitClass,
         IngestResult, MlsAdapter, MlsAdapterModule, PeerDeviceKeyPackage, PublishedKeyPackage,
-        KEY_PACKAGE_CLOCK_SKEW_MS, KEY_PACKAGE_LIFECYCLE_VERSION, KEY_PACKAGE_LIFETIME_MS,
+        RejectReason, KEY_PACKAGE_CLOCK_SKEW_MS, KEY_PACKAGE_LIFECYCLE_VERSION, KEY_PACKAGE_LIFETIME_MS,
         KEY_PACKAGE_ROTATION_WINDOW_MS, ONE_TIME_KEY_PACKAGE_POOL_TARGET,
     };
     use crate::identity::IdentityManager;
@@ -2289,7 +2777,7 @@ mod tests {
                 &artifacts.commit_b64,
             )
             .expect("commit");
-        assert_eq!(commit_result, IngestResult::IgnoredReplay);
+        assert_eq!(commit_result, IngestResult::Rejected(RejectReason::Replay));
 
         let outbound = alice_adapter
             .encrypt_application("conv:alice:bob", b"hello bob")
@@ -2371,7 +2859,7 @@ mod tests {
                 &outbound.payload_b64,
             )
             .expect("replay receive");
-        assert_eq!(replay, IngestResult::IgnoredReplay);
+        assert_eq!(replay, IngestResult::Rejected(RejectReason::Replay));
         assert_eq!(
             bob_adapter
                 .export_group_summary("conv:alice:bob")
@@ -2617,6 +3105,354 @@ mod tests {
             bob_identity,
             artifacts.commit_b64,
         )
+    }
+
+    // ---- R2 Phase 0: the "leaves no trace" oracle -------------------------
+    //
+    // Every later phase asserts that a rejected inbound record leaves
+    // `state_fingerprint()` unchanged, and that a rejected record processed on
+    // a fork can be discarded by simply dropping the fork. Both properties
+    // rest on `fork()` being a faithful, complete copy. These tests pin that
+    // down, so a regression in `fork()` fails here instead of silently
+    // weakening the security tests downstream.
+
+    #[test]
+    fn fork_round_trips_the_state_fingerprint_exactly() {
+        let (alice, bob, _, _, _) = pair_adapters();
+
+        for (label, adapter) in [("alice", &alice), ("bob", &bob)] {
+            let original = adapter.state_fingerprint().expect("fingerprint");
+            let fork = adapter.fork().expect("fork");
+            assert_eq!(
+                fork.state_fingerprint().expect("fork fingerprint"),
+                original,
+                "{label}: fork() must reproduce the adapter's observable state exactly"
+            );
+        }
+    }
+
+    #[test]
+    fn adopting_an_unmodified_fork_is_the_identity() {
+        let (mut alice, _bob, _, _, _) = pair_adapters();
+        let before = alice.state_fingerprint().expect("fingerprint");
+
+        // This is the exact move Phase 7's fork-classify-adopt performs on the
+        // success path. On the rejection path the fork is dropped instead, so
+        // if adopting an untouched fork is the identity then dropping one
+        // cannot lose state either.
+        let fork = alice.fork().expect("fork");
+        alice = fork;
+
+        assert_eq!(
+            alice.state_fingerprint().expect("fingerprint after adopt"),
+            before
+        );
+    }
+
+    #[test]
+    fn fork_round_trips_the_pcs_sidecar() {
+        // The PCS sidecar lives only in memory, so `provider_state_sha256`
+        // does not cover it. Without this test a fork that silently dropped
+        // staged self-updates would still satisfy the store hash.
+        let (mut alice, mut bob, _, _, _) = pair_adapters();
+        let proposal = bob.propose_self_update("conv:alice:bob").expect("propose");
+        alice
+            .ingest_message(
+                "conv:alice:bob",
+                &bob.local_device_id,
+                MessageType::MlsProposal,
+                &proposal.payload_b64,
+            )
+            .expect("proposal");
+
+        let before = alice.state_fingerprint().expect("fingerprint");
+        assert_eq!(
+            before.pcs_sidecars.get("conv:alice:bob").map(|entry| entry.1),
+            Some(1),
+            "the proposal should be staged in the sidecar"
+        );
+        assert_eq!(
+            alice.fork().expect("fork").state_fingerprint().expect("fp"),
+            before
+        );
+    }
+
+    #[test]
+    fn fingerprint_moves_when_state_moves() {
+        // A snapshot oracle that never changes proves nothing. This is the
+        // negative control for the three tests above.
+        let (mut alice, mut bob, _, _, _) = pair_adapters();
+        let before = alice.state_fingerprint().expect("fingerprint");
+
+        let proposal = bob.propose_self_update("conv:alice:bob").expect("propose");
+        alice
+            .ingest_message(
+                "conv:alice:bob",
+                &bob.local_device_id,
+                MessageType::MlsProposal,
+                &proposal.payload_b64,
+            )
+            .expect("proposal");
+
+        assert_ne!(alice.state_fingerprint().expect("fingerprint"), before);
+    }
+
+    // ---- R2: authentication failure leaves no trace -----------------------
+
+    /// Alice creates a conversation for Bob and returns the welcome Bob is
+    /// supposed to receive, plus Bob's untouched adapter.
+    fn welcome_for_bob() -> (MlsAdapter, String, crate::identity::LocalIdentityState) {
+        let alice_identity =
+            IdentityManager::create_or_recover(Some(ALICE_MNEMONIC), Some("phone")).expect("alice");
+        let bob_identity =
+            IdentityManager::create_or_recover(Some(BOB_MNEMONIC), Some("phone")).expect("bob");
+        let (mut alice_adapter, _) = MlsAdapter::bootstrap(&alice_identity).expect("alice adapter");
+        let (bob_adapter, bob_package) = MlsAdapter::bootstrap(&bob_identity).expect("bob adapter");
+        let artifacts = alice_adapter
+            .create_conversation(
+                "conv:alice:bob",
+                &[PeerDeviceKeyPackage {
+                    user_id: bob_identity.user_identity.user_id.clone(),
+                    device_id: bob_identity.device_identity.device_id.clone(),
+                    device_public_key: bob_identity.device_identity.device_public_key.clone(),
+                    key_package_b64: bob_package.key_package_b64,
+                }],
+            )
+            .expect("create conversation");
+        (
+            bob_adapter,
+            artifacts.welcomes[0].payload_b64.clone(),
+            alice_identity,
+        )
+    }
+
+    #[test]
+    fn welcome_for_another_conversation_leaves_no_trace() {
+        // Replaying a legitimate welcome under a different conversation id
+        // used to install that group under the claimed id — destroying
+        // whatever live group the claimed id already had.
+        let (mut bob, welcome, alice_identity) = welcome_for_bob();
+        let before = bob.state_fingerprint().expect("fingerprint");
+
+        let verdict = bob
+            .ingest_message(
+                "conv:alice:mallory",
+                &alice_identity.device_identity.device_id,
+                MessageType::MlsWelcome,
+                &welcome,
+            )
+            .expect("a mismatched welcome is discarded, not an error");
+
+        assert!(matches!(verdict, IngestResult::Rejected(_)), "{verdict:?}");
+        assert_eq!(bob.state_fingerprint().expect("fingerprint"), before);
+        assert!(!bob.has_conversation("conv:alice:mallory"));
+    }
+
+    #[test]
+    fn welcome_from_an_unexpected_sender_leaves_no_trace() {
+        let (mut bob, welcome, _) = welcome_for_bob();
+        let before = bob.state_fingerprint().expect("fingerprint");
+
+        let verdict = bob
+            .ingest_message(
+                "conv:alice:bob",
+                "device:mallory:phone",
+                MessageType::MlsWelcome,
+                &welcome,
+            )
+            .expect("a sender-mismatched welcome is discarded, not an error");
+
+        assert!(matches!(verdict, IngestResult::Rejected(_)), "{verdict:?}");
+        assert_eq!(bob.state_fingerprint().expect("fingerprint"), before);
+        assert!(!bob.has_conversation("conv:alice:bob"));
+    }
+
+    #[test]
+    fn undecodable_welcome_leaves_no_trace() {
+        let (mut bob, _, alice_identity) = welcome_for_bob();
+        let before = bob.state_fingerprint().expect("fingerprint");
+
+        for payload in ["!!!not base64!!!", "aGVsbG8gd29ybGQ="] {
+            let verdict = bob
+                .ingest_message(
+                    "conv:alice:bob",
+                    &alice_identity.device_identity.device_id,
+                    MessageType::MlsWelcome,
+                    payload,
+                )
+                .expect("an undecodable welcome is discarded, not an error");
+            assert!(matches!(verdict, IngestResult::Rejected(_)), "{verdict:?}");
+        }
+        assert_eq!(bob.state_fingerprint().expect("fingerprint"), before);
+    }
+
+    #[test]
+    fn rejected_welcome_does_not_consume_the_key_package() {
+        // `StagedWelcome::new_from_welcome` deletes the matched KeyPackage
+        // before it validates anything, so staging a welcome on the live
+        // provider burns the key material even when the welcome is then
+        // rejected. Anyone can read our published KeyPackage hash refs, so
+        // without the fork this drains the one-time pool for free — and the
+        // legitimate welcome that follows can no longer be joined.
+        let (mut bob, welcome, alice_identity) = welcome_for_bob();
+
+        let rejected = bob
+            .ingest_message(
+                "conv:alice:mallory",
+                &alice_identity.device_identity.device_id,
+                MessageType::MlsWelcome,
+                &welcome,
+            )
+            .expect("rejected welcome");
+        assert!(matches!(rejected, IngestResult::Rejected(_)), "{rejected:?}");
+
+        // The KeyPackage must have survived, so the real welcome still joins.
+        let accepted = bob
+            .ingest_message(
+                "conv:alice:bob",
+                &alice_identity.device_identity.device_id,
+                MessageType::MlsWelcome,
+                &welcome,
+            )
+            .expect("legitimate welcome");
+        assert!(
+            matches!(accepted, IngestResult::AppliedWelcome { .. }),
+            "the KeyPackage was consumed by the rejected welcome: {accepted:?}"
+        );
+    }
+
+    #[test]
+    fn legitimate_welcome_still_replaces_a_live_group() {
+        // The fork must not break rebuild: the peer receiving a rebuild
+        // welcome still holds a live group under the same conversation id.
+        let (mut bob, welcome, alice_identity) = welcome_for_bob();
+        bob.ingest_message(
+            "conv:alice:bob",
+            &alice_identity.device_identity.device_id,
+            MessageType::MlsWelcome,
+            &welcome,
+        )
+        .expect("first join");
+        let first_epoch = bob
+            .export_group_summary("conv:alice:bob")
+            .expect("summary")
+            .epoch;
+
+        // Alice rebuilds the conversation from scratch and re-welcomes Bob.
+        let bob_identity =
+            IdentityManager::create_or_recover(Some(BOB_MNEMONIC), Some("phone")).expect("bob");
+        // Must be minted by Bob's own adapter: the private init key has to land
+        // in Bob's provider storage, or the welcome is simply not for him.
+        let fresh_package = bob.rotate_key_package(test_now_ms()).expect("package");
+        let (mut alice_adapter, _) = MlsAdapter::bootstrap(&alice_identity).expect("alice");
+        let rebuilt = alice_adapter
+            .create_conversation(
+                "conv:alice:bob",
+                &[PeerDeviceKeyPackage {
+                    user_id: bob_identity.user_identity.user_id.clone(),
+                    device_id: bob_identity.device_identity.device_id.clone(),
+                    device_public_key: bob_identity.device_identity.device_public_key.clone(),
+                    key_package_b64: fresh_package.key_package_b64,
+                }],
+            )
+            .expect("rebuild conversation");
+
+        let verdict = bob
+            .ingest_message(
+                "conv:alice:bob",
+                &alice_identity.device_identity.device_id,
+                MessageType::MlsWelcome,
+                &rebuilt.welcomes[0].payload_b64,
+            )
+            .expect("rebuild welcome");
+        assert!(
+            matches!(verdict, IngestResult::AppliedWelcome { .. }),
+            "a legitimate rebuild welcome must still replace the live group: {verdict:?}"
+        );
+        assert!(bob.has_conversation("conv:alice:bob"));
+        let _ = first_epoch;
+    }
+
+    #[test]
+    fn frame_from_another_group_leaves_no_trace() {
+        // A frame that authenticates for a different group must not touch this
+        // group's state. This is the forgery shape we can exercise in a debug
+        // build: openmls has a `debug_assert!(false)` on the AEAD failure path
+        // (framing/private_message_in.rs:136), so a byte-flipped ciphertext
+        // aborts the test process instead of returning `AeadError`. Release
+        // builds classify it correctly; the assert is upstream's, not ours.
+        let (mut alice, _bob, _, bob_identity, _) = pair_adapters();
+
+        // An independent conversation between the same two identities.
+        let other_identity =
+            IdentityManager::create_or_recover(Some(BOB_MNEMONIC), Some("tablet")).expect("other");
+        let (mut other_alice, _) =
+            MlsAdapter::bootstrap(&IdentityManager::create_or_recover(
+                Some(ALICE_MNEMONIC),
+                Some("tablet"),
+            )
+            .expect("alice tablet"))
+            .expect("other alice adapter");
+        let (_other_bob, other_package) =
+            MlsAdapter::bootstrap(&other_identity).expect("other bob adapter");
+        let other = other_alice
+            .create_conversation(
+                "conv:other:pair",
+                &[PeerDeviceKeyPackage {
+                    user_id: other_identity.user_identity.user_id.clone(),
+                    device_id: other_identity.device_identity.device_id.clone(),
+                    device_public_key: other_identity.device_identity.device_public_key.clone(),
+                    key_package_b64: other_package.key_package_b64,
+                }],
+            )
+            .expect("other conversation");
+
+        let before = alice.state_fingerprint().expect("fingerprint");
+        let verdict = alice
+            .ingest_message(
+                "conv:alice:bob",
+                &bob_identity.device_identity.device_id,
+                MessageType::MlsCommit,
+                &other.commit_b64,
+            )
+            .expect("a foreign frame is discarded, not an error");
+
+        // Which reject reason wins depends on which cheap check fires first
+        // (here the stale-epoch pre-gate, before group binding is examined).
+        // The reason is telemetry; the property under test is that a foreign
+        // frame is rejected and moves nothing.
+        assert!(
+            matches!(verdict, IngestResult::Rejected(_)),
+            "a frame bound to another group must be rejected: {verdict:?}"
+        );
+        assert_eq!(
+            alice.state_fingerprint().expect("fingerprint"),
+            before,
+            "a foreign frame must not move any adapter state"
+        );
+    }
+
+    #[test]
+    fn undecodable_protocol_payload_leaves_no_trace() {
+        let (mut alice, _, _, bob_identity, _) = pair_adapters();
+        let before = alice.state_fingerprint().expect("fingerprint");
+
+        for message_type in [
+            MessageType::MlsApplication,
+            MessageType::MlsCommit,
+            MessageType::MlsProposal,
+        ] {
+            let verdict = alice
+                .ingest_message(
+                    "conv:alice:bob",
+                    &bob_identity.device_identity.device_id,
+                    message_type,
+                    "!!!not base64!!!",
+                )
+                .expect("an undecodable payload is discarded, not an error");
+            assert!(matches!(verdict, IngestResult::Rejected(_)), "{verdict:?}");
+        }
+        assert_eq!(alice.state_fingerprint().expect("fingerprint"), before);
     }
 
     #[test]
@@ -2958,8 +3794,8 @@ mod tests {
             .expect("alice would not ingest own commit as pcs on unmerged live")
         {
             DirectCommitClass::PcsSelfUpdate { .. }
-            | DirectCommitClass::IgnoredReplay
-            | DirectCommitClass::PendingRetry => {}
+            | DirectCommitClass::Rejected(_)
+            | DirectCommitClass::Deferred(_) => {}
             other => panic!("unexpected class on committer live: {other:?}"),
         }
         match bob
@@ -3181,7 +4017,7 @@ mod tests {
             )
             .expect("replay C")
         {
-            IngestResult::IgnoredReplay | IngestResult::PendingRetry => {}
+            IngestResult::Rejected(_) | IngestResult::Deferred(_) => {}
             IngestResult::AppliedCommit { .. } => {
                 panic!("persisted live must not re-merge certified commit C")
             }
@@ -3196,7 +4032,7 @@ mod tests {
             )
             .expect("replay consumed e+1")
         {
-            IngestResult::IgnoredReplay => {}
+            IngestResult::Rejected(_) => {}
             IngestResult::AppliedApplication(_) => {
                 panic!("consumed e+1 generation must not decrypt from persisted live + C")
             }

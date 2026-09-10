@@ -96,8 +96,6 @@ describe("conversation store snapshot merging", () => {
             phase: "waiting_for_sync",
             attempt_count: 1,
             identity_refresh_retry_count: 0,
-            pending_record_count: 1,
-            pending_record_seqs: [1],
             last_fetched_seq: 1,
             last_acked_seq: 0,
           },

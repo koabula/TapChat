@@ -1534,8 +1534,12 @@ pub struct RecoveryDiagnostics {
     pub phase: RecoveryPhase,
     pub attempt_count: u8,
     pub identity_refresh_retry_count: u8,
-    pub pending_record_count: usize,
-    pub pending_record_seqs: Vec<u64>,
+    // The retry buffer is deliberately not reported here. A record can sit in
+    // it because it is a legitimate out-of-order frame or because it is a
+    // future-epoch forgery, and those two are indistinguishable — so exposing
+    // the buffer's size or contents to the UI would hand an adversary a
+    // reaction to observe. What the user needs to know is the recovery phase,
+    // which is driven only by local state and authenticated input.
     pub last_fetched_seq: u64,
     pub last_acked_seq: u64,
     pub mls_status: Option<MlsStateStatus>,

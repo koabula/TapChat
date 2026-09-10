@@ -156,7 +156,7 @@ impl CoreEngine {
             let still_pending = device_id
                 .as_deref()
                 .map(|device_id| {
-                    self.has_pending_records_for_conversation(device_id, &conversation_id)
+                    self.awaits_welcome_for_conversation(device_id, &conversation_id)
                 })
                 .unwrap_or(false);
             if still_pending {
@@ -676,12 +676,6 @@ impl CoreEngine {
             identity_refresh_retry_count: context
                 .map(|value| value.identity_refresh_retry_count)
                 .unwrap_or(0),
-            pending_record_count: sync_state
-                .map(|value| value.pending_records.len())
-                .unwrap_or(0),
-            pending_record_seqs: sync_state
-                .map(|value| value.pending_record_seqs.iter().copied().collect())
-                .unwrap_or_default(),
             last_fetched_seq: sync_state
                 .map(|value| value.checkpoint.last_fetched_seq)
                 .unwrap_or(0),
@@ -788,6 +782,33 @@ impl CoreEngine {
             });
     }
 
+    /// Whether a retained record is waiting on something that only a Welcome
+    /// can supply.
+    ///
+    /// This is the *health* question, and it is deliberately narrower than
+    /// "is anything retained". A record held merely because it arrived out of
+    /// order is indistinguishable from a future-epoch forgery, so letting it
+    /// pin the recovery context — and through it `recovery_status`, the UI
+    /// banner and the send gate — would hand an adversary a lever on the
+    /// conversation. Only a genuinely absent MLS group is a local deficit
+    /// worth surfacing, and that is read from live state rather than from a
+    /// stored label that could go stale.
+    ///
+    /// Progress is driven separately, by the retained copies being re-ingested;
+    /// see `has_pending_records_for_conversation`.
+    pub(super) fn awaits_welcome_for_conversation(
+        &self,
+        device_id: &str,
+        conversation_id: &str,
+    ) -> bool {
+        let has_group = self
+            .state
+            .mls_adapter
+            .as_ref()
+            .is_some_and(|adapter| adapter.has_conversation(conversation_id));
+        !has_group && self.has_pending_records_for_conversation(device_id, conversation_id)
+    }
+
     pub(super) fn has_pending_records_for_conversation(
         &self,
         device_id: &str,
@@ -812,8 +833,12 @@ impl CoreEngine {
         pending_recovery_conversations: &mut BTreeSet<String>,
     ) {
         if self.has_pending_records_for_conversation(device_id, conversation_id) {
+            // Keep driving re-ingest either way...
             pending_recovery_conversations.insert(conversation_id.to_string());
-            return;
+            // ...but only a missing Welcome keeps the conversation unhealthy.
+            if self.awaits_welcome_for_conversation(device_id, conversation_id) {
+                return;
+            }
         }
         self.clear_recovery_context_as_healthy(conversation_id);
     }

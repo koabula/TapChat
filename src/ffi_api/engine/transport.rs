@@ -2410,14 +2410,15 @@ impl CoreEngine {
             let recipients = self.recipient_device_ids(&task.conversation_id)?;
             let mut envelopes = Vec::new();
             for recipient in recipients {
-                let mut envelope = self.build_envelope(
+                // storage_refs must go in before signing: the sender proof
+                // covers them, so anything assigned afterwards is unsigned.
+                envelopes.push(self.build_envelope_with_storage_refs(
                     &task.conversation_id,
                     &recipient,
                     MessageType::MlsApplication,
                     metadata_ciphertext.clone(),
-                )?;
-                envelope.storage_refs = storage_refs.clone();
-                envelopes.push(envelope);
+                    storage_refs.clone(),
+                )?);
             }
             self.enqueue_envelopes_with_plaintext(
                 peer_user_id.clone(),
@@ -2834,6 +2835,157 @@ impl CoreEngine {
         ))
     }
 
+    /// The single authentication gate for inbound inbox records.
+    ///
+    /// Positioned as the first statement of the record loop so that nothing
+    /// downstream is reachable with an unauthenticated record — not
+    /// conversation creation, not `record_incoming_envelope`, not MLS ingest,
+    /// and none of the control handlers. Before this existed, a forged
+    /// `ControlConversationNeedsRebuild` tore a conversation down and a forged
+    /// `ControlIdentityStateUpdated` triggered an outbound identity fetch,
+    /// both with no signature check anywhere on the path.
+    ///
+    /// Everything checked here is authored inside one envelope, so a failure
+    /// implicates only that record: ack it, drop it, carry on. The reason is a
+    /// static string, so no attacker-controlled data reaches the log line, and
+    /// the three distinct signature failures collapse into one reason so the
+    /// log does not distinguish "unknown signer" from "bad signature".
+    pub(crate) fn authenticate_inbox_record(
+        &self,
+        local_user_id: &str,
+        device_id: &str,
+        record: &InboxRecord,
+    ) -> Result<(), &'static str> {
+        record.validate().map_err(|_| "malformed record")?;
+        if record.recipient_device_id != device_id {
+            return Err("record is addressed to a different device");
+        }
+        if !INBOX_DELIVERABLE_MESSAGE_TYPES.contains(&record.envelope.message_type) {
+            return Err("message type is not deliverable over the direct inbox");
+        }
+        // Direct envelopes are never addressed to our own devices
+        // (`recipient_device_ids` filters the local user out), so a record
+        // claiming to be from us is a forgery by construction.
+        if record.envelope.sender_user_id == local_user_id {
+            return Err("record claims to come from the local user");
+        }
+        // `verify_device_signature` resolves non-local signers only through
+        // `state.contacts`, so this is also what makes the signature check
+        // meaningful: an unknown sender has no key to check against.
+        if !self.state.contacts.contains_key(&record.envelope.sender_user_id) {
+            return Err("sender is not an established contact");
+        }
+        self.verify_device_signature(
+            &record.envelope.sender_user_id,
+            &record.envelope.sender_device_id,
+            &envelope_sender_proof_payload(&record.envelope),
+            &record.envelope.sender_proof.value,
+        )
+        .map_err(|_| "sender proof is not valid")
+    }
+
+    /// Disposition for every inbound MLS verdict that did not apply.
+    ///
+    /// `handle_inbox_records_internal` used to carry two near-identical 300
+    /// line matches over `IngestResult` — one for the `MlsApplication` fast
+    /// path, one for the general path. The duplication is what let
+    /// `IgnoredReplay` drift into acking on one path and withholding the ack
+    /// on the other; that asymmetry is the exact bug class R2 is about, so the
+    /// non-applied arms live here once.
+    ///
+    /// Returns whether a local copy was retained, plus any output to merge.
+    fn dispose_unapplied_mls_ingest(
+        &mut self,
+        record: &InboxRecord,
+        conversation_id: &str,
+        device_id: &str,
+        verdict: &IngestResult,
+        touched_recovery_context_ids: &mut BTreeSet<String>,
+        pending_recovery_conversations: &mut BTreeSet<String>,
+    ) -> CoreResult<(RecordRetention, CoreOutput)> {
+        match verdict {
+            // A pre-existing local defect, not a reaction to this frame: we
+            // were evicted from the group, or our own update-path key is gone.
+            // The condition holds for every frame, so surfacing it hands the
+            // adversary nothing. This is the ONLY reject reason permitted to
+            // move local state.
+            IngestResult::Rejected(RejectReason::LocalGroupUnusable) => {
+                log::warn!(
+                    "handle_inbox_records: local MLS group is unusable for conversation {}",
+                    redact_id("conversation", conversation_id)
+                );
+                let output = self.escalate_conversation_to_rebuild(
+                    conversation_id,
+                    RecoveryEscalationReason::MlsMarkedUnrecoverable,
+                    "local MLS group can no longer process messages",
+                )?;
+                touched_recovery_context_ids.insert(conversation_id.to_string());
+                Ok((RecordRetention::Discarded, output))
+            }
+            // Terminal. Ack, discard, change nothing. The reason is telemetry
+            // only: if it moved local state, an adversary who can choose which
+            // reason we hit could choose our reaction.
+            IngestResult::Rejected(reason) => {
+                log::warn!(
+                    "handle_inbox_records: discarding {reason:?} record message={} conversation={}",
+                    redact_id("msg", &record.message_id),
+                    redact_id("conversation", conversation_id)
+                );
+                Ok((RecordRetention::Discarded, CoreOutput::default()))
+            }
+            // Cannot be authenticated *yet*. Keep a bounded local copy and
+            // stay completely silent — no recovery context, no status change,
+            // no view-model entry, and therefore no send block. A future-epoch
+            // forgery is bit-identical to a real out-of-order frame, so any
+            // observable reaction here is a distinguisher the ideal
+            // functionality does not permit, and a remote off-switch for the
+            // conversation.
+            IngestResult::Deferred(DeferReason::OutOfOrder) => {
+                {
+                    let sync_state = self
+                        .state
+                        .sync_states
+                        .entry(device_id.to_string())
+                        .or_insert_with(|| SyncEngine::new_device_state(device_id));
+                    SyncEngine::store_pending_record(sync_state, record);
+                }
+                // Queued for re-ingest once this conversation's epoch moves,
+                // but deliberately without marking the conversation unhealthy.
+                pending_recovery_conversations.insert(conversation_id.to_string());
+                Ok((RecordRetention::Quarantined, CoreOutput::default()))
+            }
+            // We hold no MLS group for this conversation at all. Unlike
+            // `OutOfOrder`, this is a real local deficit that only a Welcome
+            // can repair, so the recovery path stays wired up.
+            IngestResult::Deferred(DeferReason::NoLocalGroup) => {
+                log::warn!(
+                    "handle_inbox_records: no local MLS group for conversation {}",
+                    redact_id("conversation", conversation_id)
+                );
+                let reason = self.recovery_reason_for_record(conversation_id);
+                {
+                    let sync_state = self
+                        .state
+                        .sync_states
+                        .entry(device_id.to_string())
+                        .or_insert_with(|| SyncEngine::new_device_state(device_id));
+                    SyncEngine::store_pending_record(sync_state, record);
+                }
+                self.mark_recovery_needed(conversation_id, reason);
+                self.transition_recovery_phase(
+                    conversation_id,
+                    RecoveryPhase::WaitingForPendingReplay,
+                );
+                touched_recovery_context_ids.insert(conversation_id.to_string());
+                pending_recovery_conversations.insert(conversation_id.to_string());
+                Ok((RecordRetention::Quarantined, CoreOutput::default()))
+            }
+            other => Err(CoreError::invalid_state(format!(
+                "dispose_unapplied_mls_ingest called with an applied verdict: {other:?}"
+            ))),
+        }
+    }
+
     pub(super) fn handle_inbox_records(
         &mut self,
         device_id: String,
@@ -2857,18 +3009,28 @@ impl CoreEngine {
         allow_pending_replay: bool,
         source: InboxRecordSource,
     ) -> CoreResult<CoreOutput> {
-        // Validate the complete transport batch before touching conversation,
-        // MLS, seen-message, or checkpoint state. A malformed batch must be
-        // safely retryable and must never consume a delivery.
+        // Validate the shape of the transport *frame* before touching
+        // conversation, MLS, seen-message, or checkpoint state. A malformed
+        // frame must be safely retryable and must never consume a delivery.
+        //
+        // Only frame-level properties belong here — the seq numbering and the
+        // batch-wide message_id uniqueness. Those values are ones the inbox
+        // *assigns*, not ones a sender authors, and if the numbering is
+        // incoherent we cannot compute a safe ack watermark for any record in
+        // the frame, so refusing the whole thing is the only sound answer. A
+        // hostile inbox loses nothing by it either: returning an empty
+        // response denies service just as well, and availability against a
+        // malicious inbox is not in this threat model.
+        //
+        // Properties of a single *envelope* must NOT be checked here. One
+        // poisoned field inside one record used to abort the entire batch,
+        // which emitted no PersistOp, acked nothing, and re-failed identically
+        // on every later fetch — an indefinite, restart-surviving suppression
+        // of unrelated valid records, disguised as a transient decode error.
+        // Those checks are per-record dispositions inside the loop below.
         let mut previous_seq = None;
         let mut batch_message_ids = BTreeSet::new();
         for record in &records {
-            record.validate()?;
-            if record.recipient_device_id != device_id {
-                return Err(CoreError::invalid_input(
-                    "fetched inbox record recipient_device_id does not match target device",
-                ));
-            }
             if previous_seq.is_some_and(|seq| record.seq <= seq) {
                 return Err(CoreError::invalid_input(
                     "fetched inbox records must have strictly increasing seq values",
@@ -2926,6 +3088,29 @@ impl CoreEngine {
             .unwrap_or(0);
         let mut deferred_ackable_seqs = BTreeSet::new();
         for record in fresh_records {
+            // Per-record admission. Anything wrong with this one envelope is
+            // this one envelope's problem: ack it, drop it, leave no trace,
+            // and carry on with the rest of the batch.
+            if let Err(reason) =
+                self.authenticate_inbox_record(&local_user_id, &device_id, &record)
+            {
+                log::warn!(
+                    "handle_inbox_records: discarding unauthenticated record seq={} reason={}",
+                    record.seq,
+                    reason
+                );
+                {
+                    let sync_state = self
+                        .state
+                        .sync_states
+                        .entry(device_id.clone())
+                        .or_insert_with(|| SyncEngine::new_device_state(&device_id));
+                    SyncEngine::clear_pending_retry(sync_state, record.seq);
+                }
+                advance_contiguous_ack(&mut contiguous_ack, &mut deferred_ackable_seqs, record.seq);
+                processed_records.push(record);
+                continue;
+            }
             if record.envelope.message_type == MessageType::ControlContactRemoved {
                 if self.should_ignore_idempotent_contact_removed_record(&local_user_id, &record) {
                     log::info!(
@@ -3038,7 +3223,7 @@ impl CoreEngine {
                             .iter()
                             .any(|message| message.message_id == record.message_id)
                     });
-                let mut ackable = duplicate_delivery;
+                let mut retention = RecordRetention::Discarded;
                 if !duplicate_delivery {
                     match self
                         .state
@@ -3140,7 +3325,6 @@ impl CoreEngine {
                             );
                             touched_mls_conversation_ids.insert(conversation_id.clone());
                             touched_recovery_context_ids.insert(conversation_id.clone());
-                            ackable = true;
                         }
                         IngestResult::AppliedCommit { epoch } => {
                             log::info!(
@@ -3169,10 +3353,8 @@ impl CoreEngine {
                             );
                             touched_mls_conversation_ids.insert(conversation_id.clone());
                             touched_recovery_context_ids.insert(conversation_id.clone());
-                            ackable = true;
                         }
                         IngestResult::AppliedProposal => {
-                            ackable = true;
                         }
                         IngestResult::AppliedWelcome { epoch } => {
                             self.initialize_direct_pcs_from_mls(&conversation_id)?;
@@ -3213,109 +3395,31 @@ impl CoreEngine {
                                 self.rotate_local_key_package_after_welcome(inline_ciphertext)?,
                             );
                             output.state_update.contacts_changed = true;
-                            ackable = true;
                         }
-                        IngestResult::IgnoredReplay => {
-                            if self.conversation_has_mls_ciphertext(
+                        unapplied @ (IngestResult::Rejected(_) | IngestResult::Deferred(_)) => {
+                            let (record_retention, extra) = self.dispose_unapplied_mls_ingest(
+                                &record,
                                 &conversation_id,
-                                &ciphertext_sha256,
-                            ) {
-                                log::info!(
-                                    "handle_inbox_records: acknowledging proven MLS replay message={} conversation={} ciphertext={}",
-                                    redact_id("msg", &record.message_id),
-                                    redact_id("conversation", &conversation_id),
-                                    redact_id("ciphertext", &ciphertext_sha256)
-                                );
-                                ackable = true;
-                            } else {
-                                // OpenMLS has consumed this generation, but no
-                                // durable application projection proves that it
-                                // was committed. Never ACK an unproven replay:
-                                // retain the exact record and enter recovery.
-                                log::warn!(
-                                    "handle_inbox_records: deferring unproven MLS replay message={} conversation={} ciphertext={}",
-                                    redact_id("msg", &record.message_id),
-                                    redact_id("conversation", &conversation_id),
-                                    redact_id("ciphertext", &ciphertext_sha256)
-                                );
-                                let reason = self.recovery_reason_for_record(&conversation_id);
-                                {
-                                    let sync_state = self
-                                        .state
-                                        .sync_states
-                                        .entry(device_id.clone())
-                                        .or_insert_with(|| {
-                                            SyncEngine::new_device_state(&device_id)
-                                        });
-                                    SyncEngine::store_pending_record(sync_state, &record);
-                                }
-                                self.mark_recovery_needed(&conversation_id, reason);
-                                self.transition_recovery_phase(
-                                    &conversation_id,
-                                    RecoveryPhase::WaitingForPendingReplay,
-                                );
-                                touched_recovery_context_ids.insert(conversation_id.clone());
-                                pending_recovery_conversations.insert(conversation_id.clone());
-                                ackable = false;
-                            }
-                        }
-                        IngestResult::PendingRetry => {
-                            log::warn!(
-                                "handle_inbox_records: PendingRetry for message {} in conversation {}",
-                                redact_id("msg", &record.message_id),
-                                redact_id("conversation", &conversation_id)
-                            );
-                            let reason = self.recovery_reason_for_record(&conversation_id);
-                            {
-                                let sync_state = self
-                                    .state
-                                    .sync_states
-                                    .entry(device_id.clone())
-                                    .or_insert_with(|| SyncEngine::new_device_state(&device_id));
-                                SyncEngine::store_pending_record(sync_state, &record);
-                            }
-                            self.mark_recovery_needed(&conversation_id, reason);
-                            self.transition_recovery_phase(
-                                &conversation_id,
-                                RecoveryPhase::WaitingForPendingReplay,
-                            );
-                            touched_recovery_context_ids.insert(conversation_id.clone());
-                            pending_recovery_conversations.insert(conversation_id.clone());
-                            ackable = false;
-                        }
-                        IngestResult::NeedsRebuild => {
-                            log::warn!(
-                                "handle_inbox_records: NeedsRebuild for message {} in conversation {}",
-                                redact_id("msg", &record.message_id),
-                                redact_id("conversation", &conversation_id)
-                            );
-                            output = merge_outputs(
-                                output,
-                                self.escalate_conversation_to_rebuild(
-                                    &conversation_id,
-                                    RecoveryEscalationReason::MlsMarkedUnrecoverable,
-                                    "MLS marked conversation unrecoverable",
-                                )?,
-                            );
-                            touched_recovery_context_ids.insert(conversation_id.clone());
+                                &device_id,
+                                &unapplied,
+                                &mut touched_recovery_context_ids,
+                                &mut pending_recovery_conversations,
+                            )?;
+                            output = merge_outputs(output, extra);
+                            retention = record_retention;
                         }
                     }
                 }
-                if ackable {
-                    {
-                        let sync_state = self
-                            .state
-                            .sync_states
-                            .entry(device_id.clone())
-                            .or_insert_with(|| SyncEngine::new_device_state(&device_id));
-                        SyncEngine::clear_pending_retry(sync_state, record.seq);
-                    }
-                    advance_contiguous_ack(
-                        &mut contiguous_ack,
-                        &mut deferred_ackable_seqs,
-                        record.seq,
-                    );
+                if retention == RecordRetention::Discarded {
+                    let sync_state = self
+                        .state
+                        .sync_states
+                        .entry(device_id.clone())
+                        .or_insert_with(|| SyncEngine::new_device_state(&device_id));
+                    SyncEngine::clear_pending_retry(sync_state, record.seq);
                 }
+                // Ack-always: see `RecordRetention`.
+                advance_contiguous_ack(&mut contiguous_ack, &mut deferred_ackable_seqs, record.seq);
                 processed_records.push(record);
                 continue;
             }
@@ -3340,7 +3444,7 @@ impl CoreEngine {
                     message_type: record.envelope.message_type,
                 });
 
-            let mut ackable = apply_effect.duplicate_message;
+            let mut retention = RecordRetention::Discarded;
             if !apply_effect.duplicate_message
                 || matches!(
                     record.envelope.message_type,
@@ -3364,8 +3468,7 @@ impl CoreEngine {
                                 );
                                 touched_mls_conversation_ids.insert(conversation_id.clone());
                                 touched_recovery_context_ids.insert(conversation_id.clone());
-                                ackable = true;
-                                handled_direct_pcs = true;
+                                    handled_direct_pcs = true;
                             }
                         }
                         if handled_direct_pcs {
@@ -3395,7 +3498,7 @@ impl CoreEngine {
                             );
                             touched_recovery_context_ids.insert(conversation_id.clone());
                             pending_recovery_conversations.insert(conversation_id.clone());
-                            ackable = false;
+                            retention = RecordRetention::Quarantined;
                         } else {
                             match self
                                 .state
@@ -3482,8 +3585,7 @@ impl CoreEngine {
                                             )?,
                                         );
                                     }
-                                    ackable = true;
-                                }
+                                        }
                                 IngestResult::AppliedCommit { epoch } => {
                                     log::info!(
                                         "handle_inbox_records: AppliedCommit for message {} in conversation {}, epoch={}",
@@ -3525,11 +3627,9 @@ impl CoreEngine {
                                             )?,
                                         );
                                     }
-                                    ackable = true;
-                                }
+                                        }
                                 IngestResult::AppliedProposal => {
-                                    ackable = true;
-                                }
+                                        }
                                 IngestResult::AppliedWelcome { epoch } => {
                                     self.initialize_direct_pcs_from_mls(&conversation_id)?;
                                     log::info!(
@@ -3589,63 +3689,25 @@ impl CoreEngine {
                                             )?,
                                         );
                                     }
-                                    ackable = true;
-                                }
-                                IngestResult::IgnoredReplay => {
-                                    log::warn!(
-                                        "handle_inbox_records: IgnoredReplay for message {} in conversation {}",
-                                        redact_id("msg", &record.message_id),
-                                        redact_id("conversation", &conversation_id)
-                                    );
-                                    ackable = true;
-                                }
-                                IngestResult::PendingRetry => {
-                                    log::warn!(
-                                        "handle_inbox_records: PendingRetry for message {} in conversation {}",
-                                        redact_id("msg", &record.message_id),
-                                        redact_id("conversation", &conversation_id)
-                                    );
-                                    let reason = self.recovery_reason_for_record(&conversation_id);
-                                    {
-                                        let sync_state = self
-                                            .state
-                                            .sync_states
-                                            .entry(device_id.clone())
-                                            .or_insert_with(|| {
-                                                SyncEngine::new_device_state(&device_id)
-                                            });
-                                        SyncEngine::store_pending_record(sync_state, &record);
-                                    }
-                                    self.mark_recovery_needed(&conversation_id, reason);
-                                    self.transition_recovery_phase(
-                                        &conversation_id,
-                                        RecoveryPhase::WaitingForPendingReplay,
-                                    );
-                                    touched_recovery_context_ids.insert(conversation_id.clone());
-                                    pending_recovery_conversations.insert(conversation_id.clone());
-                                    ackable = false;
-                                }
-                                IngestResult::NeedsRebuild => {
-                                    log::warn!(
-                                        "handle_inbox_records: NeedsRebuild for message {} in conversation {}",
-                                        redact_id("msg", &record.message_id),
-                                        redact_id("conversation", &conversation_id)
-                                    );
-                                    output = merge_outputs(
-                                        output,
-                                        self.escalate_conversation_to_rebuild(
+                                        }
+                                unapplied @ (IngestResult::Rejected(_)
+                                | IngestResult::Deferred(_)) => {
+                                    let (record_retention, extra) = self
+                                        .dispose_unapplied_mls_ingest(
+                                            &record,
                                             &conversation_id,
-                                            RecoveryEscalationReason::MlsMarkedUnrecoverable,
-                                            "MLS marked conversation unrecoverable",
-                                        )?,
-                                    );
-                                    touched_recovery_context_ids.insert(conversation_id.clone());
+                                            &device_id,
+                                            &unapplied,
+                                            &mut touched_recovery_context_ids,
+                                            &mut pending_recovery_conversations,
+                                        )?;
+                                    output = merge_outputs(output, extra);
+                                    retention = record_retention;
                                 }
                             }
                         }
                     }
                     _ => {
-                        ackable = true;
                         if record.envelope.message_type == MessageType::ControlGroupWelcomePickup {
                             log::info!(
                                 "handle_inbox_records: received group welcome control message_id={} conversation_id={}",
@@ -3735,17 +3797,16 @@ impl CoreEngine {
                 }
             }
 
-            if ackable {
-                {
-                    let sync_state = self
-                        .state
-                        .sync_states
-                        .entry(device_id.clone())
-                        .or_insert_with(|| SyncEngine::new_device_state(&device_id));
-                    SyncEngine::clear_pending_retry(sync_state, record.seq);
-                }
-                advance_contiguous_ack(&mut contiguous_ack, &mut deferred_ackable_seqs, record.seq);
+            if retention == RecordRetention::Discarded {
+                let sync_state = self
+                    .state
+                    .sync_states
+                    .entry(device_id.clone())
+                    .or_insert_with(|| SyncEngine::new_device_state(&device_id));
+                SyncEngine::clear_pending_retry(sync_state, record.seq);
             }
+            // Ack-always: see `RecordRetention`.
+            advance_contiguous_ack(&mut contiguous_ack, &mut deferred_ackable_seqs, record.seq);
             processed_records.push(record);
         }
 
@@ -3789,7 +3850,7 @@ impl CoreEngine {
             )?,
         );
         for conversation_id in pending_recovery_conversations_for_persist {
-            if !self.has_pending_records_for_conversation(&device_id, &conversation_id) {
+            if !self.awaits_welcome_for_conversation(&device_id, &conversation_id) {
                 self.clear_recovery_context_as_healthy(&conversation_id);
             }
             touched_conversation_ids.insert(conversation_id.clone());
