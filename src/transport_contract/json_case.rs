@@ -77,8 +77,7 @@ mod tests {
         let original = json!({
             "device_id": "device:alice:phone",
             "storage_refs": [{ "mime_type": "text/plain", "size_bytes": 4, "ref": "blob:1" }],
-            "sender_proof": { "type": "signature", "value": "proof" },
-            "wake_hint": { "latest_seq_hint": 2 }
+            "sender_proof": { "type": "signature", "value": "proof" }
         });
         let camel = snake_to_camel_value(original.clone());
         assert_eq!(camel["deviceId"], "device:alice:phone");

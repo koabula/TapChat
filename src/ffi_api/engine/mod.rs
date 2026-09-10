@@ -3390,7 +3390,6 @@ mod protected_application_message_tests {
                 inline_ciphertext: Some("cipher".into()),
                 storage_refs: Vec::new(),
                 delivery_class: DeliveryClass::Normal,
-                wake_hint: None,
                 sender_proof: SenderProof {
                     proof_type: "signature".into(),
                     value: "proof".into(),

@@ -32,9 +32,13 @@ impl SyncEngineModule {
 pub struct DeviceSyncState {
     pub checkpoint: SyncCheckpoint,
     pub seen_message_ids: BTreeSet<String>,
-    pub pending_records: BTreeMap<u64, InboxRecord>,
-    pub pending_record_seqs: BTreeSet<u64>,
-    pub pending_retry: bool,
+    /// Records that could not be applied yet, keyed by seq.
+    ///
+    /// One map, not a map plus a key set plus a flag: the other two were
+    /// derivations that could disagree with it. Ask `has_quarantine` rather
+    /// than carrying a separate boolean.
+    #[serde(default)]
+    pub quarantine: BTreeMap<u64, InboxRecord>,
     pub last_head_seq: u64,
     #[serde(default)]
     pub consecutive_failures: u32,
@@ -59,9 +63,7 @@ impl SyncEngine {
                 updated_at: 0,
             },
             seen_message_ids: BTreeSet::new(),
-            pending_records: BTreeMap::new(),
-            pending_record_seqs: BTreeSet::new(),
-            pending_retry: false,
+            quarantine: BTreeMap::new(),
             last_head_seq: 0,
             consecutive_failures: 0,
         }
@@ -119,9 +121,9 @@ impl SyncEngine {
         })
     }
 
-    pub fn note_pending_retry(state: &mut DeviceSyncState, seq: u64) {
-        state.pending_retry = true;
-        state.pending_record_seqs.insert(seq);
+    /// Whether anything is waiting in the retry buffer.
+    pub fn has_quarantine(state: &DeviceSyncState) -> bool {
+        !state.quarantine.is_empty()
     }
 
     /// Retain a local copy of a record that could not be applied yet.
@@ -140,44 +142,41 @@ impl SyncEngine {
     /// Eviction needs no ack bookkeeping: every record is acked in the batch
     /// that first sees it (see `RecordRetention`), so there is never an
     /// unacked entry in here to settle.
-    pub fn store_pending_record(state: &mut DeviceSyncState, record: &InboxRecord) {
-        state.pending_records.insert(record.seq, record.clone());
-        Self::note_pending_retry(state, record.seq);
+    pub fn quarantine_record(state: &mut DeviceSyncState, record: &InboxRecord) {
+        state.quarantine.insert(record.seq, record.clone());
 
         let conversation_id = record.envelope.conversation_id.clone();
         while Self::quarantined_for_conversation(state, &conversation_id)
             > MAX_QUARANTINED_RECORDS_PER_CONVERSATION
         {
             let Some(oldest) = state
-                .pending_records
+                .quarantine
                 .iter()
                 .find(|(_, held)| held.envelope.conversation_id == conversation_id)
                 .map(|(seq, _)| *seq)
             else {
                 break;
             };
-            Self::clear_pending_retry(state, oldest);
+            state.quarantine.remove(&oldest);
         }
-        while state.pending_records.len() > MAX_QUARANTINED_RECORDS {
-            let Some(oldest) = state.pending_records.keys().next().copied() else {
+        while state.quarantine.len() > MAX_QUARANTINED_RECORDS {
+            let Some(oldest) = state.quarantine.keys().next().copied() else {
                 break;
             };
-            Self::clear_pending_retry(state, oldest);
+            state.quarantine.remove(&oldest);
         }
     }
 
     fn quarantined_for_conversation(state: &DeviceSyncState, conversation_id: &str) -> usize {
         state
-            .pending_records
+            .quarantine
             .values()
             .filter(|held| held.envelope.conversation_id == conversation_id)
             .count()
     }
 
-    pub fn clear_pending_retry(state: &mut DeviceSyncState, seq: u64) {
-        state.pending_record_seqs.remove(&seq);
-        state.pending_records.remove(&seq);
-        state.pending_retry = !state.pending_record_seqs.is_empty();
+    pub fn release_quarantined(state: &mut DeviceSyncState, seq: u64) {
+        state.quarantine.remove(&seq);
     }
 
     pub fn ack_up_to(state: &mut DeviceSyncState, ack_seq: u64) -> Ack {
@@ -199,7 +198,7 @@ mod tests {
         MAX_QUARANTINED_RECORDS_PER_CONVERSATION,
     };
     use crate::model::{
-        DeliveryClass, Envelope, InboxRecord, InboxRecordState, MessageType, SenderProof, WakeHint,
+        DeliveryClass, Envelope, InboxRecord, InboxRecordState, MessageType, SenderProof,
         CURRENT_MODEL_VERSION,
     };
 
@@ -239,7 +238,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_retry_alone_does_not_drive_a_refetch() {
+    fn a_quarantined_record_alone_does_not_drive_a_refetch() {
         // A retained retry copy is local state. It must not make the client
         // refetch a range it has already consumed: the record is already
         // acked, so refetching returns nothing new and the loop would spin on
@@ -249,7 +248,7 @@ mod tests {
         state.checkpoint.last_fetched_seq = 5;
         state.checkpoint.last_acked_seq = 5;
         state.last_head_seq = 5;
-        SyncEngine::note_pending_retry(&mut state, 4);
+        SyncEngine::quarantine_record(&mut state, &sample_record("msg:4", 4));
 
         assert!(SyncEngine::next_fetch(&state).is_none());
 
@@ -268,20 +267,15 @@ mod tests {
         // future-epoch frames would.
         for seq in 1..=(MAX_QUARANTINED_RECORDS_PER_CONVERSATION as u64 * 4) {
             let record = sample_record(&format!("msg:{seq}"), seq);
-            SyncEngine::store_pending_record(&mut state, &record);
+            SyncEngine::quarantine_record(&mut state, &record);
         }
         assert_eq!(
-            state.pending_records.len(),
+            state.quarantine.len(),
             MAX_QUARANTINED_RECORDS_PER_CONVERSATION
-        );
-        assert_eq!(
-            state.pending_records.len(),
-            state.pending_record_seqs.len(),
-            "the seq index must not drift from the record map"
         );
         // The newest arrivals are the ones kept: an out-of-order burst is
         // repaired by frames that arrive after the frame they repair.
-        let lowest = *state.pending_records.keys().next().expect("non-empty");
+        let lowest = *state.quarantine.keys().next().expect("non-empty");
         assert_eq!(
             lowest,
             MAX_QUARANTINED_RECORDS_PER_CONVERSATION as u64 * 4
@@ -297,25 +291,24 @@ mod tests {
                 seq += 1;
                 let mut record = sample_record(&format!("msg:{seq}"), seq);
                 record.envelope.conversation_id = format!("conv:{conversation}");
-                SyncEngine::store_pending_record(&mut state, &record);
+                SyncEngine::quarantine_record(&mut state, &record);
             }
         }
-        assert_eq!(state.pending_records.len(), MAX_QUARANTINED_RECORDS);
-        assert_eq!(state.pending_records.len(), state.pending_record_seqs.len());
-        assert!(state.pending_retry);
+        assert_eq!(state.quarantine.len(), MAX_QUARANTINED_RECORDS);
+        assert!(SyncEngine::has_quarantine(&state));
     }
 
     #[test]
-    fn clear_pending_retry_resets_retry_flag() {
+    fn releasing_the_last_record_empties_the_quarantine() {
         let mut state = SyncEngine::new_device_state("device:bob:phone");
         let record = sample_record("msg:1", 1);
-        SyncEngine::store_pending_record(&mut state, &record);
-        assert!(state.pending_retry);
+        SyncEngine::quarantine_record(&mut state, &record);
+        assert!(SyncEngine::has_quarantine(&state));
 
-        SyncEngine::clear_pending_retry(&mut state, 1);
+        SyncEngine::release_quarantined(&mut state, 1);
 
-        assert!(!state.pending_retry);
-        assert!(state.pending_records.is_empty());
+        assert!(!SyncEngine::has_quarantine(&state));
+        assert!(state.quarantine.is_empty());
     }
 
     #[test]
@@ -326,7 +319,7 @@ mod tests {
         let fresh = SyncEngine::select_fresh(&state, std::slice::from_ref(&record));
         assert_eq!(fresh.len(), 1);
         SyncEngine::commit_fetched_record(&mut state, &record);
-        SyncEngine::store_pending_record(&mut state, &record);
+        SyncEngine::quarantine_record(&mut state, &record);
         let ack = SyncEngine::ack_up_to(&mut state, 4);
         assert_eq!(ack.ack_seq, 4);
 
@@ -335,7 +328,7 @@ mod tests {
         assert_eq!(state.checkpoint.last_fetched_seq, 4);
         assert_eq!(state.checkpoint.last_acked_seq, 4);
 
-        SyncEngine::clear_pending_retry(&mut state, 4);
+        SyncEngine::release_quarantined(&mut state, 4);
         assert_eq!(state.checkpoint.last_acked_seq, 4);
         assert_eq!(state.checkpoint.last_fetched_seq, 4);
     }
@@ -360,9 +353,6 @@ mod tests {
                 inline_ciphertext: Some("cipher".into()),
                 storage_refs: vec![],
                 delivery_class: DeliveryClass::Normal,
-                wake_hint: Some(WakeHint {
-                    latest_seq_hint: Some(seq),
-                }),
                 sender_proof: SenderProof {
                     proof_type: "signature".into(),
                     value: "proof".into(),

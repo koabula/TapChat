@@ -565,9 +565,7 @@ fn classify_secret_tree_error(error: SecretTreeError) -> Verdict {
         // Outside the out-of-order tolerance, or already consumed. Gone for
         // forward secrecy. Previously classified as retryable, which made this
         // the cheapest way to stall a client permanently.
-        T::TooDistantInThePast | T::RatchetTooLong => {
-            Verdict::Rejected(RejectReason::SecretsGone)
-        }
+        T::TooDistantInThePast | T::RatchetTooLong => Verdict::Rejected(RejectReason::SecretsGone),
         T::IndexOutOfBounds | T::CodecError(_) => Verdict::Rejected(RejectReason::Malformed),
         T::RatchetTypeError | T::LibraryError | T::CryptoError(_) => {
             log::error!("unexpected MLS secret tree error: {error:?}");
@@ -1370,9 +1368,7 @@ impl MlsAdapter {
         }
         let processed = match state.group.process_message(provider, protocol_message) {
             Ok(processed) => processed,
-            Err(error) => {
-                return Ok(classify_process_error(error)?.into())
-            }
+            Err(error) => return Ok(classify_process_error(error)?.into()),
         };
         let sender_identity = extract_sender_identity(processed.credential())?;
         match processed.into_content() {
@@ -1389,9 +1385,7 @@ impl MlsAdapter {
                     sender_identity,
                 })
             }
-            ProcessedMessageContent::ApplicationMessage(_) => {
-                Ok(DirectCommitClass::NotSelfUpdate)
-            }
+            ProcessedMessageContent::ApplicationMessage(_) => Ok(DirectCommitClass::NotSelfUpdate),
             _ => Ok(DirectCommitClass::Rejected(RejectReason::Unauthorized)),
         }
     }
@@ -2235,10 +2229,9 @@ impl MlsAdapter {
         from_previous_epoch: bool,
     ) -> CoreResult<IngestResult> {
         let provider = &adapter.provider;
-        let state = adapter
-            .groups
-            .get_mut(conversation_id)
-            .ok_or_else(|| CoreError::invalid_state("forked adapter is missing the conversation"))?;
+        let state = adapter.groups.get_mut(conversation_id).ok_or_else(|| {
+            CoreError::invalid_state("forked adapter is missing the conversation")
+        })?;
         if message_type == MessageType::MlsCommit && !from_previous_epoch {
             align_pcs_sidecar_epoch(state);
             for proposal in state.pcs_updates.clone() {
@@ -2610,8 +2603,8 @@ mod tests {
     use super::{
         key_package_rotation_jitter_ms, validate_published_key_package_lifetime, DirectCommitClass,
         IngestResult, MlsAdapter, MlsAdapterModule, PeerDeviceKeyPackage, PublishedKeyPackage,
-        RejectReason, KEY_PACKAGE_CLOCK_SKEW_MS, KEY_PACKAGE_LIFECYCLE_VERSION, KEY_PACKAGE_LIFETIME_MS,
-        KEY_PACKAGE_ROTATION_WINDOW_MS, ONE_TIME_KEY_PACKAGE_POOL_TARGET,
+        RejectReason, KEY_PACKAGE_CLOCK_SKEW_MS, KEY_PACKAGE_LIFECYCLE_VERSION,
+        KEY_PACKAGE_LIFETIME_MS, KEY_PACKAGE_ROTATION_WINDOW_MS, ONE_TIME_KEY_PACKAGE_POOL_TARGET,
     };
     use crate::identity::IdentityManager;
     use crate::model::{MessageType, MlsStateStatus};
@@ -3167,7 +3160,10 @@ mod tests {
 
         let before = alice.state_fingerprint().expect("fingerprint");
         assert_eq!(
-            before.pcs_sidecars.get("conv:alice:bob").map(|entry| entry.1),
+            before
+                .pcs_sidecars
+                .get("conv:alice:bob")
+                .map(|entry| entry.1),
             Some(1),
             "the proposal should be staged in the sidecar"
         );
@@ -3304,7 +3300,10 @@ mod tests {
                 &welcome,
             )
             .expect("rejected welcome");
-        assert!(matches!(rejected, IngestResult::Rejected(_)), "{rejected:?}");
+        assert!(
+            matches!(rejected, IngestResult::Rejected(_)),
+            "{rejected:?}"
+        );
 
         // The KeyPackage must have survived, so the real welcome still joins.
         let accepted = bob
@@ -3386,13 +3385,11 @@ mod tests {
         // An independent conversation between the same two identities.
         let other_identity =
             IdentityManager::create_or_recover(Some(BOB_MNEMONIC), Some("tablet")).expect("other");
-        let (mut other_alice, _) =
-            MlsAdapter::bootstrap(&IdentityManager::create_or_recover(
-                Some(ALICE_MNEMONIC),
-                Some("tablet"),
-            )
-            .expect("alice tablet"))
-            .expect("other alice adapter");
+        let (mut other_alice, _) = MlsAdapter::bootstrap(
+            &IdentityManager::create_or_recover(Some(ALICE_MNEMONIC), Some("tablet"))
+                .expect("alice tablet"),
+        )
+        .expect("other alice adapter");
         let (_other_bob, other_package) =
             MlsAdapter::bootstrap(&other_identity).expect("other bob adapter");
         let other = other_alice

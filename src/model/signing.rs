@@ -202,7 +202,6 @@ mod tests {
             inline_ciphertext: Some("Y2lwaGVy".into()),
             storage_refs: Vec::new(),
             delivery_class: DeliveryClass::Normal,
-            wake_hint: None,
             sender_proof: SenderProof {
                 proof_type: "device_signature".into(),
                 value: "unsigned".into(),
@@ -218,8 +217,14 @@ mod tests {
         let base = envelope_sender_proof_payload(&envelope());
 
         let mutations: Vec<Mutation> = vec![
-            ("version", Box::new(|e: &mut Envelope| e.version = "0.2".into())),
-            ("message_id", Box::new(|e: &mut Envelope| e.message_id = "msg:2".into())),
+            (
+                "version",
+                Box::new(|e: &mut Envelope| e.version = "0.2".into()),
+            ),
+            (
+                "message_id",
+                Box::new(|e: &mut Envelope| e.message_id = "msg:2".into()),
+            ),
             (
                 "conversation_id",
                 Box::new(|e: &mut Envelope| e.conversation_id = "conv:alice:mallory".into()),

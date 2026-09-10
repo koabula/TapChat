@@ -347,9 +347,7 @@ mod tests {
         ConversationManager, ConversationModule, LocalConversationState, ReconcileMembershipInput,
         RecoveryStatus,
     };
-    use crate::model::{
-        ConversationState, DeliveryClass, Envelope, MessageType, SenderProof, WakeHint,
-    };
+    use crate::model::{ConversationState, DeliveryClass, Envelope, MessageType, SenderProof};
 
     #[test]
     fn module_name_is_stable() {
@@ -459,9 +457,6 @@ mod tests {
                 inline_ciphertext: Some("cipher".into()),
                 storage_refs: vec![],
                 delivery_class: DeliveryClass::Normal,
-                wake_hint: Some(WakeHint {
-                    latest_seq_hint: Some(1),
-                }),
                 sender_proof: SenderProof {
                     proof_type: "signature".into(),
                     value: "proof".into(),
@@ -500,9 +495,6 @@ mod tests {
                 inline_ciphertext: Some("cipher".into()),
                 storage_refs: vec![],
                 delivery_class: DeliveryClass::Normal,
-                wake_hint: Some(WakeHint {
-                    latest_seq_hint: Some(2),
-                }),
                 sender_proof: SenderProof {
                     proof_type: "signature".into(),
                     value: "proof".into(),
@@ -538,7 +530,6 @@ mod tests {
             inline_ciphertext: Some("cipher".into()),
             storage_refs: vec![],
             delivery_class: DeliveryClass::Normal,
-            wake_hint: None,
             sender_proof: SenderProof {
                 proof_type: "signature".into(),
                 value: "proof".into(),

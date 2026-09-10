@@ -14,10 +14,6 @@ export interface StorageRef {
   expiresAt?: number;
 }
 
-export interface WakeHint {
-  latestSeqHint?: number;
-}
-
 export interface CapabilityConstraints {
   maxBytes?: number;
   maxOpsPerMinute?: number;
@@ -50,7 +46,6 @@ export interface Envelope {
   inlineCiphertext?: string;
   storageRefs?: StorageRef[];
   deliveryClass: "normal";
-  wakeHint?: WakeHint;
   senderProof: SenderProof;
 }
 

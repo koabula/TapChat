@@ -155,9 +155,7 @@ impl CoreEngine {
             }
             let still_pending = device_id
                 .as_deref()
-                .map(|device_id| {
-                    self.awaits_welcome_for_conversation(device_id, &conversation_id)
-                })
+                .map(|device_id| self.awaits_welcome_for_conversation(device_id, &conversation_id))
                 .unwrap_or(false);
             if still_pending {
                 self.transition_recovery_phase(&conversation_id, RecoveryPhase::WaitingForSync);
@@ -713,18 +711,18 @@ impl CoreEngine {
             return Ok(CoreOutput::default());
         }
 
-        let pending_retry = self
+        let has_quarantine = self
             .state
             .sync_states
             .get(device_id)
-            .map(|state| state.pending_retry)
+            .map(SyncEngine::has_quarantine)
             .unwrap_or(false);
 
-        if pending_retry && allow_pending_replay {
+        if has_quarantine && allow_pending_replay {
             return self.replay_pending_records_for_device(device_id.to_string());
         }
 
-        let next_phase = if pending_retry {
+        let next_phase = if has_quarantine {
             RecoveryPhase::WaitingForPendingReplay
         } else {
             RecoveryPhase::WaitingForIdentityRefresh
@@ -819,7 +817,7 @@ impl CoreEngine {
             .get(device_id)
             .map(|sync_state| {
                 sync_state
-                    .pending_records
+                    .quarantine
                     .values()
                     .any(|record| record.envelope.conversation_id == conversation_id)
             })
@@ -843,47 +841,42 @@ impl CoreEngine {
         self.clear_recovery_context_as_healthy(conversation_id);
     }
 
-    pub(super) fn ack_pending_commits_behind_epoch(
+    /// Reclaim quarantine slots holding commits the epoch has moved past.
+    ///
+    /// Commits only. An application message below the live epoch is *not*
+    /// necessarily dead: `max_past_epochs(1)` keeps the previous epoch's
+    /// secrets, so a frame at `live_epoch - 1` still decrypts. Sweeping by
+    /// epoch alone would discard deliverable messages.
+    ///
+    /// No ack bookkeeping. Every record is acked in the batch that first sees
+    /// it (see `RecordRetention`), so a quarantined seq is always at or below
+    /// the ack cursor by the time this runs — this is pure reclamation of a
+    /// bounded resource an adversary can otherwise keep full.
+    pub(super) fn drop_superseded_commits(
         &mut self,
         device_id: &str,
         conversation_id: &str,
         live_epoch: u64,
-        contiguous_ack: &mut u64,
-        deferred_ackable_seqs: &mut BTreeSet<u64>,
     ) {
-        let Some(sync_state) = self.state.sync_states.get(device_id) else {
+        let Some(sync_state) = self.state.sync_states.get_mut(device_id) else {
             return;
         };
-        let obsolete: Vec<u64> = sync_state
-            .pending_records
-            .iter()
-            .filter_map(|(seq, record)| {
-                if record.envelope.conversation_id != conversation_id
-                    || record.envelope.message_type != MessageType::MlsCommit
-                {
-                    return None;
-                }
-                let payload = record
-                    .envelope
-                    .inline_ciphertext
-                    .as_deref()
-                    .unwrap_or_default();
-                let epoch = MlsAdapter::protocol_message_epoch(payload).ok()?;
-                if epoch >= live_epoch {
-                    return None;
-                }
-                Some(*seq)
-            })
-            .collect();
-        if obsolete.is_empty() {
-            return;
-        }
-        if let Some(sync_state) = self.state.sync_states.get_mut(device_id) {
-            for seq in obsolete {
-                SyncEngine::clear_pending_retry(sync_state, seq);
-                super::advance_contiguous_ack(contiguous_ack, deferred_ackable_seqs, seq);
+        sync_state.quarantine.retain(|_, record| {
+            if record.envelope.conversation_id != conversation_id
+                || record.envelope.message_type != MessageType::MlsCommit
+            {
+                return true;
             }
-        }
+            let payload = record
+                .envelope
+                .inline_ciphertext
+                .as_deref()
+                .unwrap_or_default();
+            match MlsAdapter::protocol_message_epoch(payload) {
+                Ok(epoch) => epoch >= live_epoch,
+                Err(_) => true,
+            }
+        });
     }
 
     pub(super) fn recovery_reason_for_record(&self, conversation_id: &str) -> RecoveryReason {

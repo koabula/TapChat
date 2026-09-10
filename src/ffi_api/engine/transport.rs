@@ -2770,12 +2770,8 @@ impl CoreEngine {
             sync_state.checkpoint.last_fetched_seq = history_floor_seq;
             sync_state.last_head_seq = sync_state.last_head_seq.max(history_floor_seq);
             sync_state
-                .pending_records
+                .quarantine
                 .retain(|seq, _| *seq > history_floor_seq);
-            sync_state
-                .pending_record_seqs
-                .retain(|seq| *seq > history_floor_seq);
-            sync_state.pending_retry = !sync_state.pending_record_seqs.is_empty();
             SyncEngine::ack_up_to(sync_state, history_floor_seq)
         };
         self.state.pending_acks.insert(
@@ -2872,7 +2868,11 @@ impl CoreEngine {
         // `verify_device_signature` resolves non-local signers only through
         // `state.contacts`, so this is also what makes the signature check
         // meaningful: an unknown sender has no key to check against.
-        if !self.state.contacts.contains_key(&record.envelope.sender_user_id) {
+        if !self
+            .state
+            .contacts
+            .contains_key(&record.envelope.sender_user_id)
+        {
             return Err("sender is not an established contact");
         }
         self.verify_device_signature(
@@ -2947,7 +2947,7 @@ impl CoreEngine {
                         .sync_states
                         .entry(device_id.to_string())
                         .or_insert_with(|| SyncEngine::new_device_state(device_id));
-                    SyncEngine::store_pending_record(sync_state, record);
+                    SyncEngine::quarantine_record(sync_state, record);
                 }
                 // Queued for re-ingest once this conversation's epoch moves,
                 // but deliberately without marking the conversation unhealthy.
@@ -2969,7 +2969,7 @@ impl CoreEngine {
                         .sync_states
                         .entry(device_id.to_string())
                         .or_insert_with(|| SyncEngine::new_device_state(device_id));
-                    SyncEngine::store_pending_record(sync_state, record);
+                    SyncEngine::quarantine_record(sync_state, record);
                 }
                 self.mark_recovery_needed(conversation_id, reason);
                 self.transition_recovery_phase(
@@ -3091,8 +3091,7 @@ impl CoreEngine {
             // Per-record admission. Anything wrong with this one envelope is
             // this one envelope's problem: ack it, drop it, leave no trace,
             // and carry on with the rest of the batch.
-            if let Err(reason) =
-                self.authenticate_inbox_record(&local_user_id, &device_id, &record)
+            if let Err(reason) = self.authenticate_inbox_record(&local_user_id, &device_id, &record)
             {
                 log::warn!(
                     "handle_inbox_records: discarding unauthenticated record seq={} reason={}",
@@ -3105,7 +3104,7 @@ impl CoreEngine {
                         .sync_states
                         .entry(device_id.clone())
                         .or_insert_with(|| SyncEngine::new_device_state(&device_id));
-                    SyncEngine::clear_pending_retry(sync_state, record.seq);
+                    SyncEngine::release_quarantined(sync_state, record.seq);
                 }
                 advance_contiguous_ack(&mut contiguous_ack, &mut deferred_ackable_seqs, record.seq);
                 processed_records.push(record);
@@ -3125,7 +3124,7 @@ impl CoreEngine {
                             .sync_states
                             .entry(device_id.clone())
                             .or_insert_with(|| SyncEngine::new_device_state(&device_id));
-                        SyncEngine::clear_pending_retry(sync_state, record.seq);
+                        SyncEngine::release_quarantined(sync_state, record.seq);
                     }
                     advance_contiguous_ack(
                         &mut contiguous_ack,
@@ -3145,7 +3144,7 @@ impl CoreEngine {
                         .sync_states
                         .entry(device_id.clone())
                         .or_insert_with(|| SyncEngine::new_device_state(&device_id));
-                    SyncEngine::clear_pending_retry(sync_state, record.seq);
+                    SyncEngine::release_quarantined(sync_state, record.seq);
                 }
                 advance_contiguous_ack(&mut contiguous_ack, &mut deferred_ackable_seqs, record.seq);
                 processed_records.push(record);
@@ -3162,7 +3161,7 @@ impl CoreEngine {
                         .sync_states
                         .entry(device_id.clone())
                         .or_insert_with(|| SyncEngine::new_device_state(&device_id));
-                    SyncEngine::clear_pending_retry(sync_state, record.seq);
+                    SyncEngine::release_quarantined(sync_state, record.seq);
                 }
                 advance_contiguous_ack(&mut contiguous_ack, &mut deferred_ackable_seqs, record.seq);
                 processed_records.push(record);
@@ -3176,7 +3175,7 @@ impl CoreEngine {
                         .sync_states
                         .entry(device_id.clone())
                         .or_insert_with(|| SyncEngine::new_device_state(&device_id));
-                    SyncEngine::clear_pending_retry(sync_state, record.seq);
+                    SyncEngine::release_quarantined(sync_state, record.seq);
                 }
                 advance_contiguous_ack(&mut contiguous_ack, &mut deferred_ackable_seqs, record.seq);
                 processed_records.push(record);
@@ -3196,7 +3195,7 @@ impl CoreEngine {
                         .sync_states
                         .entry(device_id.clone())
                         .or_insert_with(|| SyncEngine::new_device_state(&device_id));
-                    SyncEngine::clear_pending_retry(sync_state, record.seq);
+                    SyncEngine::release_quarantined(sync_state, record.seq);
                 }
                 advance_contiguous_ack(&mut contiguous_ack, &mut deferred_ackable_seqs, record.seq);
                 processed_records.push(record);
@@ -3354,8 +3353,7 @@ impl CoreEngine {
                             touched_mls_conversation_ids.insert(conversation_id.clone());
                             touched_recovery_context_ids.insert(conversation_id.clone());
                         }
-                        IngestResult::AppliedProposal => {
-                        }
+                        IngestResult::AppliedProposal => {}
                         IngestResult::AppliedWelcome { epoch } => {
                             self.initialize_direct_pcs_from_mls(&conversation_id)?;
                             log::info!(
@@ -3377,13 +3375,7 @@ impl CoreEngine {
                                     .mls_summaries
                                     .insert(conversation_id.clone(), summary);
                             }
-                            self.ack_pending_commits_behind_epoch(
-                                &device_id,
-                                &conversation_id,
-                                epoch,
-                                &mut contiguous_ack,
-                                &mut deferred_ackable_seqs,
-                            );
+                            self.drop_superseded_commits(&device_id, &conversation_id, epoch);
                             self.finish_mls_apply_pending(
                                 &device_id,
                                 &conversation_id,
@@ -3416,7 +3408,7 @@ impl CoreEngine {
                         .sync_states
                         .entry(device_id.clone())
                         .or_insert_with(|| SyncEngine::new_device_state(&device_id));
-                    SyncEngine::clear_pending_retry(sync_state, record.seq);
+                    SyncEngine::release_quarantined(sync_state, record.seq);
                 }
                 // Ack-always: see `RecordRetention`.
                 advance_contiguous_ack(&mut contiguous_ack, &mut deferred_ackable_seqs, record.seq);
@@ -3468,7 +3460,7 @@ impl CoreEngine {
                                 );
                                 touched_mls_conversation_ids.insert(conversation_id.clone());
                                 touched_recovery_context_ids.insert(conversation_id.clone());
-                                    handled_direct_pcs = true;
+                                handled_direct_pcs = true;
                             }
                         }
                         if handled_direct_pcs {
@@ -3489,7 +3481,7 @@ impl CoreEngine {
                                     .sync_states
                                     .entry(device_id.clone())
                                     .or_insert_with(|| SyncEngine::new_device_state(&device_id));
-                                SyncEngine::store_pending_record(sync_state, &record);
+                                SyncEngine::quarantine_record(sync_state, &record);
                             }
                             self.mark_recovery_needed(&conversation_id, reason);
                             self.transition_recovery_phase(
@@ -3585,7 +3577,7 @@ impl CoreEngine {
                                             )?,
                                         );
                                     }
-                                        }
+                                }
                                 IngestResult::AppliedCommit { epoch } => {
                                     log::info!(
                                         "handle_inbox_records: AppliedCommit for message {} in conversation {}, epoch={}",
@@ -3627,9 +3619,8 @@ impl CoreEngine {
                                             )?,
                                         );
                                     }
-                                        }
-                                IngestResult::AppliedProposal => {
-                                        }
+                                }
+                                IngestResult::AppliedProposal => {}
                                 IngestResult::AppliedWelcome { epoch } => {
                                     self.initialize_direct_pcs_from_mls(&conversation_id)?;
                                     log::info!(
@@ -3653,12 +3644,10 @@ impl CoreEngine {
                                             .mls_summaries
                                             .insert(conversation_id.clone(), summary);
                                     }
-                                    self.ack_pending_commits_behind_epoch(
+                                    self.drop_superseded_commits(
                                         &device_id,
                                         &conversation_id,
                                         epoch,
-                                        &mut contiguous_ack,
-                                        &mut deferred_ackable_seqs,
                                     );
                                     self.finish_mls_apply_pending(
                                         &device_id,
@@ -3689,7 +3678,7 @@ impl CoreEngine {
                                             )?,
                                         );
                                     }
-                                        }
+                                }
                                 unapplied @ (IngestResult::Rejected(_)
                                 | IngestResult::Deferred(_)) => {
                                     let (record_retention, extra) = self
@@ -3803,7 +3792,7 @@ impl CoreEngine {
                     .sync_states
                     .entry(device_id.clone())
                     .or_insert_with(|| SyncEngine::new_device_state(&device_id));
-                SyncEngine::clear_pending_retry(sync_state, record.seq);
+                SyncEngine::release_quarantined(sync_state, record.seq);
             }
             // Ack-always: see `RecordRetention`.
             advance_contiguous_ack(&mut contiguous_ack, &mut deferred_ackable_seqs, record.seq);

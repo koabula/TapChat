@@ -1016,7 +1016,7 @@ mod tests {
     use crate::identity::IdentityManager;
     use crate::model::{
         ConversationState, DeliveryClass, DeviceStatusKind, Envelope, MessageType, SenderProof,
-        WakeHint, CURRENT_MODEL_VERSION,
+        CURRENT_MODEL_VERSION,
     };
     use base64::Engine as _;
 
@@ -1078,9 +1078,7 @@ mod tests {
                         updated_at: 1,
                     },
                     seen_message_ids: Default::default(),
-                    pending_records: BTreeMap::new(),
-                    pending_record_seqs: Default::default(),
-                    pending_retry: false,
+                    quarantine: BTreeMap::new(),
                     last_head_seq: 1,
                     consecutive_failures: 0,
                 },
@@ -1099,9 +1097,6 @@ mod tests {
                     inline_ciphertext: Some("cipher".into()),
                     storage_refs: vec![],
                     delivery_class: DeliveryClass::Normal,
-                    wake_hint: Some(WakeHint {
-                        latest_seq_hint: Some(1),
-                    }),
                     sender_proof: SenderProof {
                         proof_type: "signature".into(),
                         value: "proof".into(),

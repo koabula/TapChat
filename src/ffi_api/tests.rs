@@ -24,8 +24,8 @@ mod tests {
         GroupEnvelopeVisibility, GroupInviteDocument, GroupJoinRequest, GroupJoinRequestStatus,
         GroupManifest, GroupMemberStatus, GroupMembershipProof, GroupMessageType,
         GroupOutboxRecord, GroupOutboxRecordState, GroupRole, IdentityBundle, InboxRecord,
-        InboxRecordState, MessageType, SenderProof, StorageBaseInfo, WakeHint,
-        WelcomePickupDescriptor, CURRENT_MODEL_VERSION,
+        InboxRecordState, MessageType, SenderProof, StorageBaseInfo, WelcomePickupDescriptor,
+        CURRENT_MODEL_VERSION,
     };
     use crate::persistence::{
         ContactRelationshipStatus, CorePersistenceSnapshot, PersistOp,
@@ -3903,7 +3903,7 @@ mod tests {
             .get(&bob_device_id)
             .expect("sync state");
         assert_eq!(sync_state.checkpoint.last_acked_seq, 2);
-        assert!(!sync_state.pending_retry);
+        assert!(sync_state.quarantine.is_empty());
     }
 
     #[test]
@@ -5151,7 +5151,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_retry_clears_after_later_welcome_applies() {
+    fn quarantine_clears_after_later_welcome_applies() {
         let mut bob = local_engine(BOB_MNEMONIC, "phone");
         let bob_bundle = bob.local_bundle().expect("bob bundle").clone();
         let bob_device_id = bob.local_device_id().expect("bob device").to_string();
@@ -5208,7 +5208,7 @@ mod tests {
             .sync_states
             .get_mut(&bob_device_id)
             .expect("sync state")
-            .pending_records
+            .quarantine
             .insert(
                 1,
                 InboxRecord {
@@ -5227,15 +5227,14 @@ mod tests {
                 .sync_states
                 .get_mut(&bob_device_id)
                 .expect("sync state");
-            sync_state.pending_record_seqs.insert(1);
-            sync_state.pending_retry = true;
+            assert!(sync_state.quarantine.contains_key(&1));
         }
         assert!(bob
             .state
             .sync_states
             .get(&bob_device_id)
             .expect("sync state")
-            .pending_records
+            .quarantine
             .contains_key(&1));
 
         bob.handle_event(CoreEvent::InboxRecordsFetched {
@@ -5267,9 +5266,7 @@ mod tests {
             .sync_states
             .get(&bob_device_id)
             .expect("sync state");
-        assert!(!sync_state.pending_records.contains_key(&1));
-        assert!(!sync_state.pending_record_seqs.contains(&1));
-        assert!(!sync_state.pending_retry);
+        assert!(!sync_state.quarantine.contains_key(&1));
     }
 
     #[test]
@@ -5645,7 +5642,7 @@ mod tests {
             .get(&bob_device_id)
             .expect("sync state");
         assert_eq!(sync_state.checkpoint.last_acked_seq, 2);
-        assert!(!sync_state.pending_retry);
+        assert!(sync_state.quarantine.is_empty());
     }
 
     #[test]
@@ -8171,7 +8168,7 @@ mod tests {
             .get(&bob_device_id)
             .expect("sync state");
         assert_eq!(sync.checkpoint.last_acked_seq, replay_seq);
-        assert!(!sync.pending_record_seqs.contains(&replay_seq));
+        assert!(!sync.quarantine.contains_key(&replay_seq));
         assert_eq!(
             bob.state
                 .conversations
@@ -8206,9 +8203,7 @@ mod tests {
         let vectors = [
             Vector {
                 name: "payload is not base64",
-                mutate: |envelope| {
-                    envelope.inline_ciphertext = Some("!!! not base64 !!!".into())
-                },
+                mutate: |envelope| envelope.inline_ciphertext = Some("!!! not base64 !!!".into()),
             },
             Vector {
                 name: "payload is base64 but not an MLS frame",
@@ -8282,9 +8277,7 @@ mod tests {
                         envelope: envelope.clone(),
                     }],
                 })
-                .unwrap_or_else(|error| {
-                    panic!("[{}] must not error: {error:?}", vector.name)
-                });
+                .unwrap_or_else(|error| panic!("[{}] must not error: {error:?}", vector.name));
 
             let sync = &chat.bob.state.sync_states[&bob_device_id];
             assert_eq!(
@@ -8293,7 +8286,7 @@ mod tests {
                 vector.name
             );
             assert!(
-                sync.pending_records.is_empty() && !sync.pending_retry,
+                sync.quarantine.is_empty(),
                 "[{}] nothing may be retained",
                 vector.name
             );
@@ -8304,7 +8297,9 @@ mod tests {
                 vector.name
             );
             assert_eq!(
-                chat.bob.state.conversations[&conversation_id].messages.len(),
+                chat.bob.state.conversations[&conversation_id]
+                    .messages
+                    .len(),
                 before_messages,
                 "[{}] no message row may be written",
                 vector.name
@@ -8453,8 +8448,7 @@ mod tests {
         assert!(!records.is_empty(), "alice produced no records for bob");
 
         for record in &records {
-            let verdict =
-                bob.authenticate_inbox_record(&bob_user_id, &bob_device_id, record);
+            let verdict = bob.authenticate_inbox_record(&bob_user_id, &bob_device_id, record);
             assert!(
                 verdict.is_ok(),
                 "the gate rejected a genuine {:?} record: {:?}",
@@ -8608,8 +8602,8 @@ mod tests {
         // That head-of-line unblocking is the point — one undecryptable frame
         // must not pin the whole device's ack cursor.
         assert!(sync.checkpoint.last_acked_seq >= replay_seq);
-        assert!(!sync.pending_retry);
-        assert!(!sync.pending_records.contains_key(&replay_seq));
+        assert!(sync.quarantine.is_empty());
+        assert!(!sync.quarantine.contains_key(&replay_seq));
         assert_eq!(
             bob.state
                 .conversations
@@ -12409,7 +12403,7 @@ mod tests {
             .sync_states
             .get(&acceptor_device)
             .is_some_and(|sync| sync
-                .pending_records
+                .quarantine
                 .values()
                 .any(|record| record.envelope.message_id == membership.message_id)));
         let restored_acceptor = CoreEngine::try_from_restored_state(acceptor.refresh_snapshot())
@@ -12428,7 +12422,7 @@ mod tests {
             .state
             .sync_states
             .get(&acceptor_device)
-            .is_some_and(|sync| !sync.pending_records.is_empty()));
+            .is_some_and(|sync| !sync.quarantine.is_empty()));
         deliver_inbox_envelope(
             if alice_was_committer {
                 &mut chat.bob
@@ -13061,7 +13055,6 @@ mod tests {
             inline_ciphertext: Some(payload_b64),
             storage_refs: vec![],
             delivery_class: DeliveryClass::Normal,
-            wake_hint: None,
             sender_proof: SenderProof {
                 proof_type: "device_signature".into(),
                 value: sender_proof,
@@ -13904,7 +13897,7 @@ mod tests {
 
     fn pending_has_message(engine: &CoreEngine, device_id: &str, message_id: &str) -> bool {
         engine.state.sync_states.get(device_id).is_some_and(|sync| {
-            sync.pending_records
+            sync.quarantine
                 .values()
                 .any(|record| record.envelope.message_id == message_id)
         })
@@ -14177,9 +14170,6 @@ mod tests {
                 inline_ciphertext: Some("cipher".into()),
                 storage_refs: vec![],
                 delivery_class: DeliveryClass::Normal,
-                wake_hint: Some(WakeHint {
-                    latest_seq_hint: Some(seq),
-                }),
                 sender_proof: SenderProof {
                     proof_type: "signature".into(),
                     value: "proof".into(),

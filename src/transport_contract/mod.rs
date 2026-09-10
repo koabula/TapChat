@@ -807,7 +807,6 @@ mod tests {
                     expires_at: Some(10),
                 }],
                 delivery_class: DeliveryClass::Normal,
-                wake_hint: None,
                 sender_proof: SenderProof {
                     proof_type: "signature".into(),
                     value: "proof".into(),

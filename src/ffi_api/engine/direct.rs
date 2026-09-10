@@ -2490,22 +2490,11 @@ impl CoreEngine {
             .sync_states
             .iter_mut()
             .filter_map(|(device_id, sync_state)| {
-                let pending_seqs = sync_state
-                    .pending_records
-                    .iter()
-                    .filter_map(|(seq, record)| {
-                        (record.envelope.conversation_id == conversation_id).then_some(*seq)
-                    })
-                    .collect::<Vec<_>>();
-                if pending_seqs.is_empty() {
-                    return None;
-                }
-                for seq in &pending_seqs {
-                    sync_state.pending_records.remove(seq);
-                    sync_state.pending_record_seqs.remove(seq);
-                }
-                sync_state.pending_retry = !sync_state.pending_record_seqs.is_empty();
-                Some(device_id.clone())
+                let before = sync_state.quarantine.len();
+                sync_state
+                    .quarantine
+                    .retain(|_, record| record.envelope.conversation_id != conversation_id);
+                (sync_state.quarantine.len() != before).then(|| device_id.clone())
             })
             .collect();
 

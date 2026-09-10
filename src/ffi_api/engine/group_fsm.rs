@@ -62,7 +62,6 @@ impl CoreEngine {
             inline_ciphertext: Some(payload_b64),
             storage_refs,
             delivery_class: DeliveryClass::Normal,
-            wake_hint: None,
             sender_proof: SenderProof {
                 proof_type: "device_signature".into(),
                 value: String::new(),

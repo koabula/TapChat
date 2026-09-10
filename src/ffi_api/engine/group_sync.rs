@@ -3617,10 +3617,10 @@ impl CoreEngine {
             let Some(sync_state) = self.state.sync_states.get(&device_id) else {
                 return Ok(CoreOutput::default());
             };
-            if sync_state.pending_records.is_empty() {
+            if sync_state.quarantine.is_empty() {
                 return Ok(CoreOutput::default());
             }
-            sync_state.pending_records.values().cloned().collect()
+            sync_state.quarantine.values().cloned().collect()
         };
         let to_seq = records.iter().map(|record| record.seq).max().unwrap_or(0);
         let output = self.handle_inbox_records_internal(
@@ -3630,13 +3630,13 @@ impl CoreEngine {
             false,
             InboxRecordSource::PendingReplay,
         )?;
-        let pending_retry = self
+        let has_quarantine = self
             .state
             .sync_states
             .get(&device_id)
-            .map(|state| state.pending_retry)
+            .map(SyncEngine::has_quarantine)
             .unwrap_or(false);
-        let next_phase = if pending_retry {
+        let next_phase = if has_quarantine {
             RecoveryPhase::WaitingForPendingReplay
         } else {
             RecoveryPhase::WaitingForIdentityRefresh

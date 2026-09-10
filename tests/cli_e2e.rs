@@ -6065,7 +6065,6 @@ fn append_runtime_control_message(
                 inline_ciphertext: Some(payload.to_string()),
                 storage_refs: vec![],
                 delivery_class: DeliveryClass::Normal,
-                wake_hint: None,
                 sender_proof: SenderProof {
                     proof_type: "signature".into(),
                     value: "proof".into(),

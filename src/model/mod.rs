@@ -389,18 +389,6 @@ impl Validate for ProtectedAppMessage {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct WakeHint {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub latest_seq_hint: Option<u64>,
-}
-
-impl Validate for WakeHint {
-    fn validate(&self) -> CoreResult<()> {
-        Ok(())
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeviceContactProfile {
@@ -628,8 +616,6 @@ pub struct Envelope {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub storage_refs: Vec<StorageRef>,
     pub delivery_class: DeliveryClass,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub wake_hint: Option<WakeHint>,
     pub sender_proof: SenderProof,
 }
 
@@ -643,9 +629,6 @@ impl Validate for Envelope {
         validate_required("recipient_device_id", &self.recipient_device_id)?;
         match self.delivery_class {
             DeliveryClass::Normal => {}
-        }
-        if let Some(wake_hint) = &self.wake_hint {
-            wake_hint.validate()?;
         }
         self.sender_proof.validate()?;
         if self.inline_ciphertext.is_none() && self.storage_refs.is_empty() {
@@ -2703,9 +2686,6 @@ mod tests {
             inline_ciphertext: Some("ciphertext".into()),
             storage_refs: vec![],
             delivery_class: DeliveryClass::Normal,
-            wake_hint: Some(WakeHint {
-                latest_seq_hint: Some(3),
-            }),
             sender_proof: SenderProof {
                 proof_type: "signature".into(),
                 value: "proof".into(),
