@@ -2860,7 +2860,7 @@ impl CoreEngine {
         if record.recipient_device_id != device_id {
             return Err("record is addressed to a different device");
         }
-        if !INBOX_DELIVERABLE_MESSAGE_TYPES.contains(&record.envelope.message_type) {
+        if !inbox_deliverable(record.envelope.message_type) {
             return Err("message type is not deliverable over the direct inbox");
         }
         // Direct envelopes are never addressed to our own devices

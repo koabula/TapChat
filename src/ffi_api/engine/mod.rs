@@ -105,26 +105,36 @@ enum InboxRecordSource {
     PendingReplay,
 }
 
-/// Message types the direct inbox may deliver.
+/// Whether the direct inbox may deliver a record of this type.
 ///
-/// This is an allowlist, not a denylist, and it is shorter than
-/// `MessageType`'s variant list because four variants have no honest producer
-/// on this path: nothing ever builds a direct envelope carrying
-/// `MlsProposal`, `ControlIdentityStateUpdated`,
+/// An allowlist, not a denylist, and written as an exhaustive match rather
+/// than a slice on purpose: a new `MessageType` variant must fail to compile
+/// here instead of being silently dropped by the authentication gate.
+/// Rejection is by design invisible — no error state, no log, no retry — so a
+/// variant that fell through the allowlist would be close to undiagnosable.
+///
+/// Four variants have no honest producer on this path: nothing ever builds a
+/// direct envelope carrying `MlsProposal`, `ControlIdentityStateUpdated`,
 /// `ControlConversationNeedsRebuild` or `ControlGroupStateEvent` — those exist
 /// only as group-outbox message types projected onto stored messages. Two of
 /// them were pure attack surface: one forced a conversation rebuild, the other
 /// triggered an outbound identity fetch.
-const INBOX_DELIVERABLE_MESSAGE_TYPES: &[MessageType] = &[
-    MessageType::MlsApplication,
-    MessageType::MlsCommit,
-    MessageType::MlsWelcome,
-    MessageType::ControlContactRemoved,
-    MessageType::ControlContactAccepted,
-    MessageType::ControlDirectCommitAccept,
-    MessageType::ControlDeviceMembershipChanged,
-    MessageType::ControlGroupWelcomePickup,
-];
+const fn inbox_deliverable(message_type: MessageType) -> bool {
+    match message_type {
+        MessageType::MlsApplication
+        | MessageType::MlsCommit
+        | MessageType::MlsWelcome
+        | MessageType::ControlContactRemoved
+        | MessageType::ControlContactAccepted
+        | MessageType::ControlDirectCommitAccept
+        | MessageType::ControlDeviceMembershipChanged
+        | MessageType::ControlGroupWelcomePickup => true,
+        MessageType::MlsProposal
+        | MessageType::ControlIdentityStateUpdated
+        | MessageType::ControlConversationNeedsRebuild
+        | MessageType::ControlGroupStateEvent => false,
+    }
+}
 
 /// Whether the inbox loop kept a local copy of a record it could not apply.
 ///
