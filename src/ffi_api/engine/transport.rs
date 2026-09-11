@@ -443,27 +443,25 @@ impl CoreEngine {
             ],
             view_model: None,
         };
-        let outbox_grew = self.retransmit_pending_direct_pcs()?;
-        if retry_reset_ops.is_empty() && !outbox_grew {
+        // Nothing to retransmit here any more: a PCS rotation is an ordinary
+        // outbox envelope with ordinary retry, not a handshake this path had
+        // to re-offer.
+        if retry_reset_ops.is_empty() {
             return Ok(sync_output);
         }
-        let extra = if retry_reset_ops.is_empty() {
-            self.flush_outbox()?
-        } else {
-            merge_outputs(
-                CoreOutput {
-                    state_update: CoreStateUpdate {
-                        checkpoints_changed: true,
-                        messages_changed: true,
-                        system_statuses_changed: vec![SystemStatus::SyncInProgress],
-                        ..CoreStateUpdate::default()
-                    },
-                    effects: vec![persist_effect(&self.state, retry_reset_ops)],
-                    view_model: None,
+        let extra = merge_outputs(
+            CoreOutput {
+                state_update: CoreStateUpdate {
+                    checkpoints_changed: true,
+                    messages_changed: true,
+                    system_statuses_changed: vec![SystemStatus::SyncInProgress],
+                    ..CoreStateUpdate::default()
                 },
-                self.flush_pending_transport()?,
-            )
-        };
+                effects: vec![persist_effect(&self.state, retry_reset_ops)],
+                view_model: None,
+            },
+            self.flush_pending_transport()?,
+        );
         Ok(merge_outputs(extra, sync_output))
     }
 
@@ -2426,8 +2424,8 @@ impl CoreEngine {
                 manifest_json,
                 Some(message_id),
             );
-            self.observe_direct_application(&task.conversation_id)?;
-            self.enqueue_direct_pcs_protocol(&task.conversation_id, &peer_user_id)?;
+            self.observe_direct_application(&task.conversation_id);
+            self.maybe_rotate_direct_pcs(&task.conversation_id)?;
             persist_ops.extend(self.direct_send_persist_ops(&task.conversation_id));
             Ok(merge_outputs(
                 CoreOutput {
@@ -3167,20 +3165,6 @@ impl CoreEngine {
                 processed_records.push(record);
                 continue;
             }
-            if record.envelope.message_type == MessageType::ControlDirectCommitAccept {
-                output = merge_outputs(output, self.handle_direct_commit_accept(&record)?);
-                {
-                    let sync_state = self
-                        .state
-                        .sync_states
-                        .entry(device_id.clone())
-                        .or_insert_with(|| SyncEngine::new_device_state(&device_id));
-                    SyncEngine::release_quarantined(sync_state, record.seq);
-                }
-                advance_contiguous_ack(&mut contiguous_ack, &mut deferred_ackable_seqs, record.seq);
-                processed_records.push(record);
-                continue;
-            }
             if self.should_ignore_closed_relationship_record(&local_user_id, &record) {
                 log::info!(
                     "handle_inbox_records: acking and ignoring {:?} for closed relationship conversation_id={} sender_user_id={} message_id={}",
@@ -3281,11 +3265,7 @@ impl CoreEngine {
                                             )?,
                                         );
                                     }
-                                    self.observe_direct_application(&conversation_id)?;
-                                    self.enqueue_direct_pcs_protocol(
-                                        &conversation_id,
-                                        &record.envelope.sender_user_id,
-                                    )?;
+                                    self.observe_direct_application(&conversation_id);
                                 }
                                 ApplicationPlaintextDecision::DuplicateAppMessage {
                                     app_message_id,
@@ -3447,10 +3427,13 @@ impl CoreEngine {
                     MessageType::MlsApplication
                     | MessageType::MlsCommit
                     | MessageType::MlsWelcome => {
-                        let mut handled_direct_pcs = false;
+                        // A commit racing our own for the same base epoch is
+                        // settled here, before ingest: the winner discards it
+                        // with no state change, the loser repairs itself.
+                        let mut arbitrated = false;
                         if record.envelope.message_type == MessageType::MlsCommit {
                             if let Some(extra) =
-                                self.handle_direct_mls_commit(&conversation_id, &record)?
+                                self.direct_pcs_arbitration(&conversation_id, &record)?
                             {
                                 output = merge_outputs(output, extra);
                                 self.finish_mls_apply_pending(
@@ -3460,37 +3443,11 @@ impl CoreEngine {
                                 );
                                 touched_mls_conversation_ids.insert(conversation_id.clone());
                                 touched_recovery_context_ids.insert(conversation_id.clone());
-                                handled_direct_pcs = true;
+                                arbitrated = true;
                             }
                         }
-                        if handled_direct_pcs {
-                            // Direct PCS handshake consumed this commit.
-                        } else if record.envelope.message_type == MessageType::MlsCommit
-                            && self
-                                .state
-                                .conversations
-                                .get(&conversation_id)
-                                .is_some_and(|state| state.pcs.handshake.is_some())
-                        {
-                            // One epoch-changing commit at a time: keep membership
-                            // commits pending until the staged PCS handshake applies.
-                            let reason = self.recovery_reason_for_record(&conversation_id);
-                            {
-                                let sync_state = self
-                                    .state
-                                    .sync_states
-                                    .entry(device_id.clone())
-                                    .or_insert_with(|| SyncEngine::new_device_state(&device_id));
-                                SyncEngine::quarantine_record(sync_state, &record);
-                            }
-                            self.mark_recovery_needed(&conversation_id, reason);
-                            self.transition_recovery_phase(
-                                &conversation_id,
-                                RecoveryPhase::WaitingForPendingReplay,
-                            );
-                            touched_recovery_context_ids.insert(conversation_id.clone());
-                            pending_recovery_conversations.insert(conversation_id.clone());
-                            retention = RecordRetention::Quarantined;
+                        if arbitrated {
+                            // Terminal for this record.
                         } else {
                             match self
                                 .state
@@ -3585,6 +3542,19 @@ impl CoreEngine {
                                         conversation_id,
                                         epoch
                                     );
+                                    // To merge, this commit had to match our live
+                                    // epoch, which is already past the base epoch
+                                    // of our own commit — the peer moved on and can
+                                    // no longer race us there. Closes the
+                                    // arbitration window, and deliberately leaves
+                                    // our rotation debt alone: a peer commit does
+                                    // not replace our leaf key, so it heals nothing
+                                    // of ours.
+                                    if let Some(state) =
+                                        self.state.conversations.get_mut(&conversation_id)
+                                    {
+                                        state.pcs.clear_own_commit();
+                                    }
                                     if let Ok(summary) = self
                                         .state
                                         .mls_adapter
@@ -3799,6 +3769,21 @@ impl CoreEngine {
             processed_records.push(record);
         }
 
+        // PCS rotation is decided here, on settled state, never part-way
+        // through the loop above. A device returning from a long absence
+        // drains a backlog whose tail may hold the peer's own commit; deciding
+        // per record would cross the threshold and fire before reading it,
+        // manufacturing a collision that never existed.
+        let mut rotated_conversation_ids = Vec::new();
+        for conversation_id in touched_conversation_ids.iter().cloned().collect::<Vec<_>>() {
+            if self.maybe_rotate_direct_pcs(&conversation_id)? {
+                touched_mls_conversation_ids.insert(conversation_id.clone());
+                // The new epoch may have made quarantined records applicable.
+                pending_recovery_conversations.insert(conversation_id.clone());
+                rotated_conversation_ids.push(conversation_id);
+            }
+        }
+
         {
             let sync_state = self
                 .state
@@ -3846,6 +3831,13 @@ impl CoreEngine {
             touched_recovery_context_ids.insert(conversation_id);
         }
         let mut persist_ops = Vec::new();
+        // A rotation merged the new leaf key into the MLS state; its commit
+        // envelope has to reach disk in the same batch. If only the merge
+        // survived a crash the peer would be stranded forever, because the
+        // commit bytes are gone once the pending commit is consumed.
+        for conversation_id in &rotated_conversation_ids {
+            persist_ops.extend(self.direct_send_persist_ops(conversation_id));
+        }
         persist_ops.extend(
             touched_conversation_ids
                 .into_iter()
@@ -4137,9 +4129,7 @@ impl CoreEngine {
         let protocol_only_contact_control = envelope.as_ref().is_some_and(|env| {
             matches!(
                 env.message_type,
-                MessageType::ControlContactRemoved
-                    | MessageType::ControlContactAccepted
-                    | MessageType::ControlDirectCommitAccept
+                MessageType::ControlContactRemoved | MessageType::ControlContactAccepted
             )
         });
         let current_relationship_removed = self

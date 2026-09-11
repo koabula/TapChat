@@ -1,16 +1,5 @@
 use super::*;
 
-enum DirectPcsRosterCheck {
-    Allowed,
-    Ignore,
-    Rebuild(&'static str),
-}
-
-enum DirectPcsApplyOutcome {
-    Applied(CoreOutput),
-    Skipped(CoreOutput),
-}
-
 impl CoreEngine {
     pub(super) fn import_deployment_bundle(
         &mut self,
@@ -941,7 +930,6 @@ impl CoreEngine {
                         last_message_type: existing_last_message_type,
                         message_count: None,
                         recovery,
-                        pcs_degraded: None,
                     }],
                     ..CoreViewModel::default()
                 }),
@@ -1062,7 +1050,6 @@ impl CoreEngine {
                     last_message_type: Some(MessageType::MlsCommit),
                     message_count: None,
                     recovery: None,
-                    pcs_degraded: None,
                 }],
                 messages: generated
                     .iter()
@@ -1098,14 +1085,6 @@ impl CoreEngine {
         let app_message_nonce = self.next_message_nonce();
         let app_message_id =
             self.next_app_message_id(&conversation_id, &sender_device_id, app_message_nonce);
-        let last_certified_commit_hash = self
-            .state
-            .conversations
-            .get(&conversation_id)
-            .and_then(|state| state.pcs.last_certified_commit_hash.clone())
-            .ok_or_else(|| {
-                CoreError::invalid_state("direct conversation is missing a certified commit hash")
-            })?;
         let protected_message = ProtectedAppMessage::new_text(
             app_message_id.clone(),
             conversation_id.clone(),
@@ -1114,7 +1093,6 @@ impl CoreEngine {
             peer_user_id.clone(),
             recipient_device_ids.clone(),
             plaintext.clone(),
-            last_certified_commit_hash,
         )?;
         let protected_bytes = protected_message.to_json_bytes()?;
         let payload = self
@@ -1141,8 +1119,8 @@ impl CoreEngine {
             plaintext.clone(),
             Some(app_message_id.clone()),
         );
-        self.observe_direct_application(&conversation_id)?;
-        self.enqueue_direct_pcs_protocol(&conversation_id, &peer_user_id)?;
+        self.observe_direct_application(&conversation_id);
+        self.maybe_rotate_direct_pcs(&conversation_id)?;
         self.merge_with_transport_flush(CoreOutput {
             state_update: CoreStateUpdate {
                 messages_changed: true,
@@ -1800,26 +1778,6 @@ impl CoreEngine {
                         app_message_id: protected.app_message_id,
                     };
                 }
-                if let Some(pcs) = self
-                    .state
-                    .conversations
-                    .get(&record.envelope.conversation_id)
-                    .map(|state| &state.pcs)
-                {
-                    let expected = if application.from_previous_epoch {
-                        pcs.previous_certified_commit_hash.as_ref()
-                    } else {
-                        pcs.last_certified_commit_hash.as_ref()
-                    };
-                    if let Some(expected) = expected {
-                        if &protected.last_certified_commit_hash != expected {
-                            return ApplicationPlaintextDecision::RejectedProtocol {
-                                reason: "protected last_certified_commit_hash does not match decrypted epoch"
-                                    .into(),
-                            };
-                        }
-                    }
-                }
                 ApplicationPlaintextDecision::Accepted {
                     plaintext: protected.body,
                     app_message_id: Some(protected.app_message_id),
@@ -2058,7 +2016,6 @@ impl CoreEngine {
                 last_message_type: conversation.last_message_type,
                 message_count: Some(conversation.messages.len()),
                 recovery: self.recovery_snapshot_for_conversation(conversation_id),
-                pcs_degraded: None,
             });
         }
         Ok(ConversationSummary {
@@ -2090,7 +2047,6 @@ impl CoreEngine {
             last_message_type: conversation.last_message_type,
             message_count: None,
             recovery: self.recovery_snapshot_for_conversation(conversation_id),
-            pcs_degraded: conversation.pcs.degraded.then_some(true),
         })
     }
 
@@ -3267,7 +3223,9 @@ impl CoreEngine {
             .is_some_and(|state| state.conversation.kind == ConversationKind::Direct)
     }
 
-    /// Called only after locally creating a group or successfully joining a Welcome.
+    /// Called only after locally creating a group or successfully joining a
+    /// Welcome. Either way this device's leaf key is brand new, so the
+    /// rotation clock starts now with no debt.
     pub(super) fn initialize_direct_pcs_from_mls(
         &mut self,
         conversation_id: &str,
@@ -3275,12 +3233,6 @@ impl CoreEngine {
         if !self.conversation_is_direct(conversation_id) {
             return Ok(());
         }
-        let initial_hash = self
-            .state
-            .mls_adapter
-            .as_ref()
-            .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
-            .direct_pcs_initial_hash(conversation_id)?;
         let now_ms = current_unix_millis(self.state.message_nonce);
         let state = self
             .state
@@ -3288,24 +3240,49 @@ impl CoreEngine {
             .get_mut(conversation_id)
             .ok_or_else(|| CoreError::invalid_input("conversation does not exist"))?;
         state.pcs = crate::direct_pcs::DirectPcsState {
-            last_certified_commit_hash: Some(initial_hash),
-            last_certified_at_ms: Some(now_ms),
+            self_rotated_at_ms: Some(now_ms),
             ..Default::default()
         };
         Ok(())
     }
 
-    pub(super) fn observe_direct_application(&mut self, conversation_id: &str) -> CoreResult<()> {
+    /// Count one application message against this device's rotation debt.
+    ///
+    /// Deliberately does *not* decide whether to rotate. That decision is made
+    /// on settled state — see [`Self::maybe_rotate_direct_pcs`].
+    pub(super) fn observe_direct_application(&mut self, conversation_id: &str) {
         if !self.conversation_is_direct(conversation_id) {
-            return Ok(());
+            return;
         }
         if let Some(state) = self.state.conversations.get_mut(conversation_id) {
             state.pcs.note_application_message();
         }
-        self.maybe_stage_direct_pcs(conversation_id)
     }
 
-    fn maybe_stage_direct_pcs(&mut self, conversation_id: &str) -> CoreResult<()> {
+    /// Replace this device's leaf key if the rotation schedule says it is due,
+    /// and enqueue the commit. Returns whether a rotation happened.
+    ///
+    /// Unilateral by construction: create, merge and enqueue happen in one
+    /// step, so healing never waits on the counterparty. `designated_committer`
+    /// only decides who goes first (see `DirectPcsState::should_rotate`) and
+    /// who wins a same-epoch collision (see [`Self::direct_pcs_arbitration`]).
+    ///
+    /// Must be called on settled state — never part-way through an inbound
+    /// batch. A device returning from a long absence drains a backlog whose
+    /// tail may hold the peer's own commit; deciding per record would fire
+    /// before reading it and manufacture a collision that did not exist.
+    pub(super) fn maybe_rotate_direct_pcs(&mut self, conversation_id: &str) -> CoreResult<bool> {
+        if !self.conversation_is_direct(conversation_id) {
+            return Ok(false);
+        }
+        let Some(adapter) = self.state.mls_adapter.as_ref() else {
+            return Ok(false);
+        };
+        if !adapter.has_conversation(conversation_id) {
+            return Ok(false);
+        }
+        let member_device_ids = adapter.member_device_ids(conversation_id)?;
+        let epoch = adapter.export_group_summary(conversation_id)?.epoch;
         let local_device_id = self
             .state
             .local_identity
@@ -3314,190 +3291,71 @@ impl CoreEngine {
             .device_identity
             .device_id
             .clone();
-        let member_device_ids = self
-            .state
-            .mls_adapter
-            .as_ref()
-            .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
-            .member_device_ids(conversation_id)?;
-        let epoch = self
-            .state
-            .mls_summaries
-            .get(conversation_id)
-            .map(|summary| summary.epoch)
-            .or_else(|| {
-                self.state
-                    .mls_adapter
-                    .as_ref()
-                    .and_then(|adapter| adapter.export_group_summary(conversation_id).ok())
-                    .map(|summary| summary.epoch)
-            })
-            .unwrap_or(1);
-        let committer = designated_committer(&member_device_ids, epoch)?;
+        let is_designated = designated_committer(&member_device_ids, epoch)? == local_device_id;
         let now_ms = current_unix_millis(self.state.message_nonce);
-        let should_initiate = self
+        let due = self
             .state
             .conversations
             .get(conversation_id)
-            .is_some_and(|state| {
-                state
-                    .pcs
-                    .should_initiate_commit(&local_device_id, &committer, now_ms)
-            });
-        if !should_initiate {
-            return Ok(());
+            .is_some_and(|state| state.pcs.should_rotate(is_designated, now_ms));
+        if !due {
+            return Ok(false);
         }
-        let parent = self
-            .state
-            .conversations
-            .get(conversation_id)
-            .and_then(|state| state.pcs.last_certified_commit_hash.clone())
-            .ok_or_else(|| {
-                CoreError::invalid_state("direct PCS commit is missing a parent commit hash")
-            })?;
-        let staged = self
+        // Resolved before the merge so nothing fallible stands between merging
+        // the commit and putting it in the outbox: a merge whose commit never
+        // reaches the peer strands it forever, because the bytes are gone once
+        // the pending commit is consumed.
+        let peer_user_id = self.peer_user_for_conversation(conversation_id)?;
+        let recipient_device_ids = self.recipient_device_ids(conversation_id)?;
+        let rotated = self
             .state
             .mls_adapter
             .as_mut()
             .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
-            .stage_direct_self_update(conversation_id)?;
-        let identity = self
+            .rotate_direct_self_update(conversation_id)?;
+        let summary = self
             .state
-            .local_identity
-            .clone()
-            .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))?;
-        let committer_sig = sign_certificate(
-            &identity,
-            conversation_id,
-            staged.base_epoch,
-            &parent,
-            &staged.commit_hash,
-        );
-        let conversation = self
-            .state
-            .conversations
-            .get_mut(conversation_id)
-            .ok_or_else(|| CoreError::invalid_input("conversation does not exist"))?;
-        conversation
-            .pcs
-            .record_signature(staged.base_epoch, &staged.commit_hash)?;
-        conversation.pcs.handshake = Some(DirectPcsHandshake {
-            role: DirectPcsRole::Committer,
-            epoch: staged.base_epoch,
-            commit_hash: staged.commit_hash,
-            commit_b64: staged.commit_b64,
-            parent_commit_hash: parent,
-            committer_device_id: committer,
-            acceptor_device_id: None,
-            committer_sig: Some(committer_sig),
-            acceptor_sig: None,
-        });
-        Ok(())
-    }
-
-    pub(super) fn enqueue_direct_pcs_protocol(
-        &mut self,
-        conversation_id: &str,
-        peer_user_id: &str,
-    ) -> CoreResult<()> {
-        let handshake = match self
-            .state
-            .conversations
-            .get(conversation_id)
-            .and_then(|state| state.pcs.handshake.clone())
-        {
-            Some(handshake) => handshake,
-            None => return Ok(()),
-        };
-        let recipient_device_ids = self.recipient_device_ids(conversation_id)?;
-        match handshake.role {
-            DirectPcsRole::Committer => {
-                let already_pending = self.state.pending_outbox.iter().any(|item| {
-                    item.envelope.conversation_id == conversation_id
-                        && item.envelope.message_type == MessageType::MlsCommit
-                        && item.envelope.inline_ciphertext.as_deref()
-                            == Some(handshake.commit_b64.as_str())
-                });
-                if already_pending {
-                    return Ok(());
-                }
-                let envelopes = recipient_device_ids
-                    .iter()
-                    .map(|device_id| {
-                        self.build_envelope(
-                            conversation_id,
-                            device_id,
-                            MessageType::MlsCommit,
-                            handshake.commit_b64.clone(),
-                        )
-                    })
-                    .collect::<CoreResult<Vec<_>>>()?;
-                self.enqueue_envelopes(peer_user_id.to_string(), envelopes);
-            }
-            DirectPcsRole::Acceptor => {
-                let cert = handshake.certificate(conversation_id);
-                if cert.acceptor_sig.is_none() {
-                    return Ok(());
-                }
-                self.enqueue_direct_commit_accept(conversation_id, peer_user_id, &cert)?;
-            }
+            .mls_adapter
+            .as_ref()
+            .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
+            .export_group_summary(conversation_id)?;
+        self.state
+            .mls_summaries
+            .insert(conversation_id.to_string(), summary);
+        if let Some(state) = self.state.conversations.get_mut(conversation_id) {
+            state.pcs.mark_rotated(
+                OwnCommit {
+                    base_epoch: rotated.base_epoch,
+                    commit_hash: rotated.commit_hash,
+                    won_arbitration: is_designated,
+                },
+                now_ms,
+            );
         }
-        Ok(())
-    }
-
-    pub(super) fn retransmit_pending_direct_pcs(&mut self) -> CoreResult<bool> {
-        let pending: Vec<(String, String)> = self
-            .state
-            .conversations
-            .iter()
-            .filter(|(_, state)| {
-                state.conversation.kind == ConversationKind::Direct && state.pcs.handshake.is_some()
-            })
-            .map(|(conversation_id, state)| (conversation_id.clone(), state.peer_user_id.clone()))
-            .collect();
-        let outbox_before = self.state.pending_outbox.len();
-        for (conversation_id, peer_user_id) in pending {
-            self.enqueue_direct_pcs_protocol(&conversation_id, &peer_user_id)?;
-        }
-        Ok(self.state.pending_outbox.len() > outbox_before)
-    }
-
-    fn enqueue_direct_commit_accept(
-        &mut self,
-        conversation_id: &str,
-        peer_user_id: &str,
-        cert: &DirectCommitCertificate,
-    ) -> CoreResult<()> {
-        let payload_b64 = STANDARD.encode(serde_json::to_vec(cert).map_err(|error| {
-            CoreError::invalid_input(format!(
-                "failed to encode direct commit certificate: {error}"
-            ))
-        })?);
-        let already_pending = self.state.pending_outbox.iter().any(|item| {
-            item.envelope.conversation_id == conversation_id
-                && item.envelope.message_type == MessageType::ControlDirectCommitAccept
-                && item.envelope.inline_ciphertext.as_deref() == Some(payload_b64.as_str())
-        });
-        if already_pending {
-            return Ok(());
-        }
-        let recipient_device_ids = self.recipient_device_ids(conversation_id)?;
         let envelopes = recipient_device_ids
             .iter()
             .map(|device_id| {
                 self.build_envelope(
                     conversation_id,
                     device_id,
-                    MessageType::ControlDirectCommitAccept,
-                    payload_b64.clone(),
+                    MessageType::MlsCommit,
+                    rotated.commit_b64.clone(),
                 )
             })
             .collect::<CoreResult<Vec<_>>>()?;
-        self.enqueue_envelopes(peer_user_id.to_string(), envelopes);
-        Ok(())
+        self.enqueue_envelopes(peer_user_id, envelopes);
+        Ok(true)
     }
 
-    pub(super) fn handle_direct_mls_commit(
+    /// Arbitrate an inbound commit against our own commit for the same base
+    /// epoch. `None` means there is no collision and the caller should take
+    /// the ordinary ingest path.
+    ///
+    /// Reachable only when *we* committed at that epoch, and only for a record
+    /// the inbound gate already bound to an established contact's device key —
+    /// so it cannot be manufactured, and a replay of some older commit carries
+    /// the wrong base epoch.
+    pub(super) fn direct_pcs_arbitration(
         &mut self,
         conversation_id: &str,
         record: &InboxRecord,
@@ -3510,631 +3368,48 @@ impl CoreEngine {
             .inline_ciphertext
             .as_deref()
             .unwrap_or_default();
-        let payload_hash = commit_hash_from_b64(payload_b64).ok();
-        let already_certified = payload_hash.as_ref().is_some_and(|incoming| {
-            self.state
-                .conversations
-                .get(conversation_id)
-                .is_some_and(|state| state.pcs.is_certified_hash(incoming))
-        });
-        let has_group = self
+        let (Ok(incoming_epoch), Ok(incoming_hash)) = (
+            MlsAdapter::protocol_message_epoch(payload_b64),
+            commit_hash_from_b64(payload_b64),
+        ) else {
+            return Ok(None);
+        };
+        let verdict = self
             .state
-            .mls_adapter
-            .as_ref()
-            .is_some_and(|adapter| adapter.has_conversation(conversation_id));
-        if has_group && already_certified {
-            return Ok(Some(CoreOutput::default()));
-        }
-        let class = self
-            .state
-            .mls_adapter
-            .as_ref()
-            .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
-            .classify_direct_commit(conversation_id, payload_b64)?;
-        match class {
-            // Decline: let the generic ingest path decide. It re-derives the
-            // same verdict and quarantines the record exactly once.
-            DirectCommitClass::NotSelfUpdate | DirectCommitClass::Deferred(_) => Ok(None),
-            // Handled here: acked and discarded. Note this no longer escalates
-            // to a rebuild — an unclassifiable inbound commit is attacker
-            // input, so it must not be able to tear down the session.
-            DirectCommitClass::Rejected(reason) => {
+            .conversations
+            .get(conversation_id)
+            .and_then(|state| state.pcs.arbitrate(incoming_epoch, &incoming_hash));
+        match verdict {
+            None => Ok(None),
+            // We won. The peer will find our commit, lose, and repair itself.
+            // Ack and discard, with no state transition of any kind.
+            Some(true) => {
                 log::warn!(
-                    "handle_direct_mls_commit: discarding {reason:?} commit for conversation {}",
+                    "direct_pcs_arbitration: discarding a commit that lost to ours in conversation {}",
                     redact_id("conversation", conversation_id)
                 );
                 Ok(Some(CoreOutput::default()))
             }
-            DirectCommitClass::PcsSelfUpdate {
-                commit_hash,
-                base_epoch,
-                sender_identity,
-            } => Ok(Some(self.accept_direct_pcs_commit(
-                conversation_id,
-                record,
-                commit_hash,
-                base_epoch,
-                payload_b64,
-                sender_identity,
-            )?)),
-        }
-    }
-
-    fn accept_direct_pcs_commit(
-        &mut self,
-        conversation_id: &str,
-        record: &InboxRecord,
-        commit_hash: String,
-        base_epoch: u64,
-        payload_b64: &str,
-        sender_identity: String,
-    ) -> CoreResult<CoreOutput> {
-        let Some(mls_sender) = Self::parse_mls_sender_identity(&sender_identity) else {
-            return Ok(CoreOutput::default());
-        };
-        if record.envelope.sender_user_id != mls_sender.user_id
-            || record.envelope.sender_device_id != mls_sender.device_id
-        {
-            return Ok(CoreOutput::default());
-        }
-        let local_device_id = self
-            .state
-            .local_identity
-            .as_ref()
-            .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))?
-            .device_identity
-            .device_id
-            .clone();
-        let member_device_ids = self
-            .state
-            .mls_adapter
-            .as_ref()
-            .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
-            .member_device_ids(conversation_id)?;
-        let expected_committer = designated_committer(&member_device_ids, base_epoch)?;
-        if mls_sender.device_id != expected_committer {
-            return self.escalate_conversation_to_rebuild(
-                conversation_id,
-                RecoveryEscalationReason::MlsMarkedUnrecoverable,
-                "direct PCS commit sender is not the designated committer",
-            );
-        }
-        match self.check_direct_pcs_roster_signer(
-            conversation_id,
-            base_epoch,
-            &mls_sender.user_id,
-            &mls_sender.device_id,
-            Some(DirectPcsRole::Committer),
-        )? {
-            DirectPcsRosterCheck::Ignore => return Ok(CoreOutput::default()),
-            DirectPcsRosterCheck::Rebuild(reason) => {
-                return self.escalate_conversation_to_rebuild(
+            // We lost. Our own commit for this epoch is already merged and
+            // openmls cannot un-merge, so the only route back to a shared
+            // group is to rebuild it. `rebuild_conversation` only tears down,
+            // so the re-bootstrap is driven in the same turn: a collision
+            // nobody asked for must not leave the conversation dead waiting
+            // for the user to press repair.
+            Some(false) => {
+                log::warn!(
+                    "direct_pcs_arbitration: lost a same-epoch commit race, rebuilding conversation {}",
+                    redact_id("conversation", conversation_id)
+                );
+                let torn_down = self.escalate_conversation_to_rebuild(
                     conversation_id,
-                    RecoveryEscalationReason::MlsMarkedUnrecoverable,
-                    reason,
-                );
-            }
-            DirectPcsRosterCheck::Allowed => {}
-        }
-        let parent = self
-            .state
-            .conversations
-            .get(conversation_id)
-            .and_then(|state| state.pcs.last_certified_commit_hash.clone())
-            .unwrap_or_default();
-        if parent.is_empty() {
-            return self.escalate_conversation_to_rebuild(
-                conversation_id,
-                RecoveryEscalationReason::MlsMarkedUnrecoverable,
-                "direct PCS commit is missing a parent hash",
-            );
-        }
-        if let Some(existing_hash) = self
-            .state
-            .conversations
-            .get(conversation_id)
-            .and_then(|state| state.pcs.handshake.as_ref().map(|h| h.commit_hash.clone()))
-        {
-            if existing_hash != commit_hash {
-                return self.escalate_conversation_to_rebuild(
-                    conversation_id,
-                    RecoveryEscalationReason::MlsMarkedUnrecoverable,
-                    "direct PCS epoch already has a different staged commit",
-                );
-            }
-            let peer_user_id = record.envelope.sender_user_id.clone();
-            let cert = self
-                .state
-                .conversations
-                .get(conversation_id)
-                .and_then(|state| state.pcs.handshake.as_ref())
-                .map(|handshake| handshake.certificate(conversation_id))
-                .expect("handshake exists");
-            self.enqueue_direct_commit_accept(conversation_id, &peer_user_id, &cert)?;
-            return self.direct_pcs_persist_output(conversation_id);
-        }
-        let identity = self
-            .state
-            .local_identity
-            .clone()
-            .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))?;
-        let acceptor_sig = sign_certificate(
-            &identity,
-            conversation_id,
-            base_epoch,
-            &parent,
-            &commit_hash,
-        );
-        let signature_conflict = {
-            let conversation = self
-                .state
-                .conversations
-                .get_mut(conversation_id)
-                .ok_or_else(|| CoreError::invalid_input("conversation does not exist"))?;
-            conversation
-                .pcs
-                .record_signature(base_epoch, &commit_hash)
-                .is_err()
-        };
-        if signature_conflict {
-            return self.escalate_conversation_to_rebuild(
-                conversation_id,
-                RecoveryEscalationReason::MlsMarkedUnrecoverable,
-                "direct PCS epoch already has a different signed commit",
-            );
-        }
-        {
-            let conversation = self
-                .state
-                .conversations
-                .get_mut(conversation_id)
-                .ok_or_else(|| CoreError::invalid_input("conversation does not exist"))?;
-            conversation.pcs.handshake = Some(DirectPcsHandshake {
-                role: DirectPcsRole::Acceptor,
-                epoch: base_epoch,
-                commit_hash: commit_hash.clone(),
-                commit_b64: payload_b64.to_string(),
-                parent_commit_hash: parent,
-                committer_device_id: expected_committer,
-                acceptor_device_id: Some(local_device_id),
-                committer_sig: None,
-                acceptor_sig: Some(acceptor_sig),
-            });
-        }
-        let peer_user_id = record.envelope.sender_user_id.clone();
-        let cert = self
-            .state
-            .conversations
-            .get(conversation_id)
-            .and_then(|state| state.pcs.handshake.as_ref())
-            .map(|handshake| handshake.certificate(conversation_id))
-            .expect("handshake just stored");
-        self.enqueue_direct_commit_accept(conversation_id, &peer_user_id, &cert)?;
-        self.direct_pcs_persist_output(conversation_id)
-    }
-
-    pub(super) fn handle_direct_commit_accept(
-        &mut self,
-        record: &InboxRecord,
-    ) -> CoreResult<CoreOutput> {
-        let conversation_id = record.envelope.conversation_id.clone();
-        if !self.conversation_is_direct(&conversation_id) {
-            return Ok(CoreOutput::default());
-        }
-        let payload_b64 = record
-            .envelope
-            .inline_ciphertext
-            .as_deref()
-            .ok_or_else(|| CoreError::invalid_input("direct commit accept is missing payload"))?;
-        let payload = match STANDARD.decode(payload_b64) {
-            Ok(payload) => payload,
-            Err(_) => return Ok(CoreOutput::default()),
-        };
-        let mut cert: DirectCommitCertificate = match serde_json::from_slice(&payload) {
-            Ok(cert) => cert,
-            Err(_) => return Ok(CoreOutput::default()),
-        };
-        if self
-            .verify_device_signature(
-                &record.envelope.sender_user_id,
-                &record.envelope.sender_device_id,
-                &envelope_sender_proof_payload(&record.envelope),
-                &record.envelope.sender_proof.value,
-            )
-            .is_err()
-        {
-            return Ok(CoreOutput::default());
-        }
-        match self.check_direct_pcs_roster_signer(
-            &conversation_id,
-            cert.epoch,
-            &record.envelope.sender_user_id,
-            &record.envelope.sender_device_id,
-            None,
-        )? {
-            DirectPcsRosterCheck::Ignore => return Ok(CoreOutput::default()),
-            DirectPcsRosterCheck::Rebuild(reason) => {
-                return self.escalate_conversation_to_rebuild(
-                    &conversation_id,
-                    RecoveryEscalationReason::MlsMarkedUnrecoverable,
-                    reason,
-                );
-            }
-            DirectPcsRosterCheck::Allowed => {}
-        }
-        if cert.conversation_id != conversation_id {
-            return Ok(CoreOutput::default());
-        }
-        let already_certified = self
-            .state
-            .conversations
-            .get(&conversation_id)
-            .is_some_and(|state| state.pcs.is_certified_hash(&cert.commit_hash));
-        if already_certified {
-            return self.handle_direct_commit_accept_without_handshake(record, &mut cert);
-        }
-        let handshake = match self
-            .state
-            .conversations
-            .get(&conversation_id)
-            .and_then(|state| state.pcs.handshake.clone())
-        {
-            Some(handshake) => handshake,
-            None => {
-                return self.handle_direct_commit_accept_without_handshake(record, &mut cert);
-            }
-        };
-        if cert.epoch < handshake.epoch {
-            return Ok(CoreOutput::default());
-        }
-        if handshake.epoch == cert.epoch && handshake.commit_hash != cert.commit_hash {
-            return self.escalate_conversation_to_rebuild(
-                &conversation_id,
-                RecoveryEscalationReason::MlsMarkedUnrecoverable,
-                "direct commit certificate does not match staged commit",
-            );
-        }
-        if handshake.commit_hash != cert.commit_hash
-            || handshake.epoch != cert.epoch
-            || handshake.parent_commit_hash != cert.parent_commit_hash
-        {
-            return self.escalate_conversation_to_rebuild(
-                &conversation_id,
-                RecoveryEscalationReason::MlsMarkedUnrecoverable,
-                "direct commit certificate does not match staged commit",
-            );
-        }
-        let parent = self
-            .state
-            .conversations
-            .get(&conversation_id)
-            .and_then(|state| state.pcs.last_certified_commit_hash.clone())
-            .unwrap_or_default();
-        if cert.parent_commit_hash != parent {
-            return self.escalate_conversation_to_rebuild(
-                &conversation_id,
-                RecoveryEscalationReason::MlsMarkedUnrecoverable,
-                "direct commit certificate parent hash mismatch",
-            );
-        }
-        let expected_role = match handshake.role {
-            DirectPcsRole::Committer => DirectPcsRole::Acceptor,
-            DirectPcsRole::Acceptor => DirectPcsRole::Committer,
-        };
-        match self.check_direct_pcs_roster_signer(
-            &conversation_id,
-            cert.epoch,
-            &record.envelope.sender_user_id,
-            &record.envelope.sender_device_id,
-            Some(expected_role),
-        )? {
-            DirectPcsRosterCheck::Ignore => return Ok(CoreOutput::default()),
-            DirectPcsRosterCheck::Rebuild(reason) => {
-                return self.escalate_conversation_to_rebuild(
-                    &conversation_id,
-                    RecoveryEscalationReason::MlsMarkedUnrecoverable,
-                    reason,
-                );
-            }
-            DirectPcsRosterCheck::Allowed => {}
-        }
-        let handshake_role = handshake.role;
-        match handshake.role {
-            DirectPcsRole::Committer => {
-                if cert.acceptor_sig.is_none() {
-                    return Ok(CoreOutput::default());
-                }
-                if self
-                    .verify_certificate_signature(
-                        &record.envelope.sender_user_id,
-                        &record.envelope.sender_device_id,
-                        &cert,
-                        cert.acceptor_sig.as_deref().unwrap_or_default(),
-                    )
-                    .is_err()
-                {
-                    return self.escalate_conversation_to_rebuild(
-                        &conversation_id,
-                        RecoveryEscalationReason::MlsMarkedUnrecoverable,
-                        "direct commit acceptor signature is invalid",
-                    );
-                }
-                let missing_committer_sig = self
-                    .state
-                    .conversations
-                    .get(&conversation_id)
-                    .and_then(|state| state.pcs.handshake.as_ref())
-                    .is_some_and(|handshake| handshake.committer_sig.is_none());
-                if missing_committer_sig {
-                    return self.escalate_conversation_to_rebuild(
-                        &conversation_id,
-                        RecoveryEscalationReason::MlsMarkedUnrecoverable,
-                        "direct PCS committer signature is missing",
-                    );
-                }
-                if let Some(handshake) = self
-                    .state
-                    .conversations
-                    .get_mut(&conversation_id)
-                    .and_then(|state| state.pcs.handshake.as_mut())
-                {
-                    handshake.acceptor_sig = cert.acceptor_sig.clone();
-                    handshake.acceptor_device_id = Some(record.envelope.sender_device_id.clone());
-                    cert.committer_sig = handshake.committer_sig.clone();
-                    cert.acceptor_device_id = handshake.acceptor_device_id.clone();
-                }
-            }
-            DirectPcsRole::Acceptor => {
-                if !cert.is_complete() {
-                    return Ok(CoreOutput::default());
-                }
-                if self
-                    .verify_certificate_signature(
-                        &record.envelope.sender_user_id,
-                        &record.envelope.sender_device_id,
-                        &cert,
-                        cert.committer_sig.as_deref().unwrap_or_default(),
-                    )
-                    .is_err()
-                {
-                    return self.escalate_conversation_to_rebuild(
-                        &conversation_id,
-                        RecoveryEscalationReason::MlsMarkedUnrecoverable,
-                        "direct commit committer signature is invalid",
-                    );
-                }
-                let conversation = self
-                    .state
-                    .conversations
-                    .get_mut(&conversation_id)
-                    .ok_or_else(|| CoreError::invalid_input("conversation does not exist"))?;
-                if let Some(handshake) = conversation.pcs.handshake.as_mut() {
-                    handshake.committer_sig = cert.committer_sig.clone();
-                }
+                    RecoveryEscalationReason::PcsCommitRace,
+                    "direct PCS commit lost a same-epoch race with the peer",
+                )?;
+                let rebuilt = self.reconcile_conversation_membership(conversation_id.to_string())?;
+                Ok(Some(merge_outputs(torn_down, rebuilt)))
             }
         }
-        let complete = self
-            .state
-            .conversations
-            .get(&conversation_id)
-            .and_then(|state| state.pcs.handshake.as_ref())
-            .map(|handshake| handshake.certificate(&conversation_id).is_complete())
-            .unwrap_or(false);
-        if !complete {
-            return self.direct_pcs_persist_output(&conversation_id);
-        }
-        match self.apply_certified_direct_pcs(&conversation_id)? {
-            DirectPcsApplyOutcome::Applied(applied) => {
-                if matches!(handshake_role, DirectPcsRole::Committer) && cert.is_complete() {
-                    let peer_user_id = record.envelope.sender_user_id.clone();
-                    self.enqueue_direct_commit_accept(&conversation_id, &peer_user_id, &cert)?;
-                }
-                let membership = self.reconcile_conversation_membership(conversation_id.clone())?;
-                let mut output = merge_outputs(applied, membership);
-                if let Some(device_id) = self
-                    .state
-                    .local_identity
-                    .as_ref()
-                    .map(|identity| identity.device_identity.device_id.clone())
-                {
-                    output =
-                        merge_outputs(output, self.replay_pending_records_for_device(device_id)?);
-                }
-                Ok(output)
-            }
-            DirectPcsApplyOutcome::Skipped(output) => Ok(output),
-        }
-    }
-
-    fn handle_direct_commit_accept_without_handshake(
-        &mut self,
-        record: &InboxRecord,
-        cert: &mut DirectCommitCertificate,
-    ) -> CoreResult<CoreOutput> {
-        let conversation_id = record.envelope.conversation_id.clone();
-        let last_certified = self
-            .state
-            .conversations
-            .get(&conversation_id)
-            .and_then(|state| state.pcs.last_certified_commit_hash.clone())
-            .unwrap_or_default();
-        let already_certified = self
-            .state
-            .conversations
-            .get(&conversation_id)
-            .is_some_and(|state| state.pcs.is_certified_hash(&cert.commit_hash));
-        let local_device_id = self
-            .state
-            .local_identity
-            .as_ref()
-            .map(|identity| identity.device_identity.device_id.clone())
-            .unwrap_or_default();
-        if last_certified.is_empty()
-            || !already_certified
-            || cert.committer_device_id != local_device_id
-            || cert.acceptor_sig.is_none()
-        {
-            return Ok(CoreOutput::default());
-        }
-        match self.check_direct_pcs_roster_signer(
-            &conversation_id,
-            cert.epoch,
-            &record.envelope.sender_user_id,
-            &record.envelope.sender_device_id,
-            Some(DirectPcsRole::Acceptor),
-        )? {
-            DirectPcsRosterCheck::Ignore => return Ok(CoreOutput::default()),
-            DirectPcsRosterCheck::Rebuild(reason) => {
-                return self.escalate_conversation_to_rebuild(
-                    &conversation_id,
-                    RecoveryEscalationReason::MlsMarkedUnrecoverable,
-                    reason,
-                );
-            }
-            DirectPcsRosterCheck::Allowed => {}
-        }
-        if self
-            .verify_certificate_signature(
-                &record.envelope.sender_user_id,
-                &record.envelope.sender_device_id,
-                cert,
-                cert.acceptor_sig.as_deref().unwrap_or_default(),
-            )
-            .is_err()
-        {
-            return self.escalate_conversation_to_rebuild(
-                &conversation_id,
-                RecoveryEscalationReason::MlsMarkedUnrecoverable,
-                "direct commit acceptor signature is invalid",
-            );
-        }
-        let identity = self
-            .state
-            .local_identity
-            .clone()
-            .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))?;
-        cert.committer_sig = Some(sign_certificate(
-            &identity,
-            &conversation_id,
-            cert.epoch,
-            &cert.parent_commit_hash,
-            &cert.commit_hash,
-        ));
-        cert.acceptor_device_id = Some(record.envelope.sender_device_id.clone());
-        let peer_user_id = record.envelope.sender_user_id.clone();
-        self.enqueue_direct_commit_accept(&conversation_id, &peer_user_id, cert)?;
-        self.direct_pcs_persist_output(&conversation_id)
-    }
-
-    fn check_direct_pcs_roster_signer(
-        &self,
-        conversation_id: &str,
-        epoch: u64,
-        signer_user_id: &str,
-        signer_device_id: &str,
-        expected_role: Option<DirectPcsRole>,
-    ) -> CoreResult<DirectPcsRosterCheck> {
-        let member_users = self
-            .state
-            .conversations
-            .get(conversation_id)
-            .map(|state| state.conversation.member_users.clone())
-            .unwrap_or_default();
-        if !member_users.iter().any(|user_id| user_id == signer_user_id) {
-            return Ok(DirectPcsRosterCheck::Ignore);
-        }
-        let member_device_ids = match self
-            .state
-            .mls_adapter
-            .as_ref()
-            .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
-            .member_device_ids(conversation_id)
-        {
-            Ok(ids) => ids,
-            Err(_) => return Ok(DirectPcsRosterCheck::Ignore),
-        };
-        if !member_device_ids
-            .iter()
-            .any(|device_id| device_id == signer_device_id)
-        {
-            return Ok(DirectPcsRosterCheck::Ignore);
-        }
-        let Some(expected_role) = expected_role else {
-            return Ok(DirectPcsRosterCheck::Allowed);
-        };
-        let committer = designated_committer(&member_device_ids, epoch)?;
-        match expected_role {
-            DirectPcsRole::Committer => {
-                if signer_device_id != committer {
-                    return Ok(DirectPcsRosterCheck::Rebuild(
-                        "direct PCS committer is not the designated roster committer",
-                    ));
-                }
-            }
-            DirectPcsRole::Acceptor => {
-                if signer_device_id == committer {
-                    return Ok(DirectPcsRosterCheck::Rebuild(
-                        "direct PCS acceptor must not be the designated committer",
-                    ));
-                }
-            }
-        }
-        Ok(DirectPcsRosterCheck::Allowed)
-    }
-
-    fn verify_certificate_signature(
-        &self,
-        signer_user_id: &str,
-        signer_device_id: &str,
-        cert: &DirectCommitCertificate,
-        signature_hex: &str,
-    ) -> CoreResult<()> {
-        self.verify_device_signature(
-            signer_user_id,
-            signer_device_id,
-            &cert.signing_payload(),
-            signature_hex,
-        )
-    }
-
-    fn apply_certified_direct_pcs(
-        &mut self,
-        conversation_id: &str,
-    ) -> CoreResult<DirectPcsApplyOutcome> {
-        let handshake = self
-            .state
-            .conversations
-            .get(conversation_id)
-            .and_then(|state| state.pcs.handshake.clone())
-            .ok_or_else(|| CoreError::invalid_state("direct PCS handshake is missing"))?;
-        let live_epoch = self
-            .state
-            .mls_adapter
-            .as_ref()
-            .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
-            .export_group_summary(conversation_id)?
-            .epoch;
-        if live_epoch != handshake.epoch {
-            return Ok(DirectPcsApplyOutcome::Skipped(
-                self.direct_pcs_persist_output(conversation_id)?,
-            ));
-        }
-        let summary = self
-            .state
-            .mls_adapter
-            .as_mut()
-            .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
-            .apply_certified_direct_commit(conversation_id, &handshake.commit_b64)?;
-        self.state
-            .mls_summaries
-            .insert(conversation_id.to_string(), summary);
-        let now_ms = current_unix_millis(self.state.message_nonce);
-        if let Some(state) = self.state.conversations.get_mut(conversation_id) {
-            state.pcs.mark_certified(handshake.commit_hash, now_ms);
-        }
-        Ok(DirectPcsApplyOutcome::Applied(
-            self.direct_pcs_persist_output(conversation_id)?,
-        ))
     }
 
     pub(super) fn direct_send_persist_ops(&self, conversation_id: &str) -> Vec<PersistOp> {
@@ -4158,24 +3433,4 @@ impl CoreEngine {
         ops
     }
 
-    fn direct_pcs_persist_output(&self, conversation_id: &str) -> CoreResult<CoreOutput> {
-        Ok(CoreOutput {
-            state_update: CoreStateUpdate {
-                conversations_changed: true,
-                ..CoreStateUpdate::default()
-            },
-            effects: vec![persist_effect(
-                &self.state,
-                vec![
-                    PersistOp::SaveConversation {
-                        conversation_id: conversation_id.to_string(),
-                    },
-                    PersistOp::SaveMlsState {
-                        conversation_id: conversation_id.to_string(),
-                    },
-                ],
-            )],
-            view_model: None,
-        })
-    }
 }

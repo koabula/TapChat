@@ -26,17 +26,14 @@ use crate::conversation::{
     direct_conversation_id, ConversationArchiveMetadata, ConversationManager,
     LocalConversationState, ReconcileMembershipInput, RecoveryStatus, StoredMessage,
 };
-use crate::direct_pcs::{
-    commit_hash_from_b64, designated_committer, sign_certificate, DirectCommitCertificate,
-    DirectPcsHandshake, DirectPcsRole,
-};
+use crate::direct_pcs::{commit_hash_from_b64, designated_committer, OwnCommit};
 use crate::error::{CoreError, CoreResult};
 use crate::ffi_api::types::*;
 use crate::identity::{parse_signature, parse_verifying_key, IdentityManager};
 use crate::log_sanitize::redact_id;
 use crate::mls_adapter::{
-    CreateConversationArtifacts, DecryptedApplicationMessage, DeferReason, DirectCommitClass,
-    IngestResult, MlsAdapter, PeerDeviceKeyPackage, RejectReason, RemoveMembersArtifacts,
+    CreateConversationArtifacts, DecryptedApplicationMessage, DeferReason, IngestResult,
+    MlsAdapter, PeerDeviceKeyPackage, RejectReason, RemoveMembersArtifacts,
 };
 use crate::model::signing::envelope_sender_proof_payload;
 use crate::model::{
@@ -126,7 +123,6 @@ const fn inbox_deliverable(message_type: MessageType) -> bool {
         | MessageType::MlsWelcome
         | MessageType::ControlContactRemoved
         | MessageType::ControlContactAccepted
-        | MessageType::ControlDirectCommitAccept
         | MessageType::ControlDeviceMembershipChanged
         | MessageType::ControlGroupWelcomePickup => true,
         MessageType::MlsProposal
@@ -676,6 +672,9 @@ impl CoreEngine {
                             }
                             PersistedRecoveryEscalationReason::RecoveryPolicyExhausted => {
                                 RecoveryEscalationReason::RecoveryPolicyExhausted
+                            }
+                            PersistedRecoveryEscalationReason::PcsCommitRace => {
+                                RecoveryEscalationReason::PcsCommitRace
                             }
                         }),
                         restore_failure_reason: context.restore_failure_reason,
@@ -3272,6 +3271,9 @@ fn build_persistence_snapshot(state: &CoreState) -> CorePersistenceSnapshot {
                     RecoveryEscalationReason::RecoveryPolicyExhausted => {
                         PersistedRecoveryEscalationReason::RecoveryPolicyExhausted
                     }
+                    RecoveryEscalationReason::PcsCommitRace => {
+                        PersistedRecoveryEscalationReason::PcsCommitRace
+                    }
                 }),
                 restore_failure_reason: context.restore_failure_reason.clone(),
                 restore_failure_detail: context.restore_failure_detail.clone(),
@@ -3424,7 +3426,6 @@ mod protected_application_message_tests {
             "user:bob".into(),
             audience,
             "hello protected".into(),
-            "sha256:genesis".into(),
         )
         .expect("protected message")
         .to_json_bytes()

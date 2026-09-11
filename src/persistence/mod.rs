@@ -462,6 +462,7 @@ pub enum PersistedRecoveryEscalationReason {
     IdentityRefreshRetryExhausted,
     ExplicitNeedsRebuildControl,
     RecoveryPolicyExhausted,
+    PcsCommitRace,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -30,7 +30,6 @@ export type MessageType =
   | "control_conversation_needs_rebuild"
   | "control_contact_removed"
   | "control_contact_accepted"
-  | "control_direct_commit_accept"
   | "control_group_state_event"
   | "control_group_welcome_pickup";
 

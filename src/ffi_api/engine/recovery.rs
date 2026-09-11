@@ -31,58 +31,10 @@ impl CoreEngine {
                 },
             )?
         };
-        let needs_rebootstrap = {
-            let conversation_state = self
-                .state
-                .conversations
-                .get(&conversation_id)
-                .ok_or_else(|| CoreError::invalid_input("conversation does not exist"))?;
-            conversation_state.conversation.state == ConversationState::NeedsRebuild
-                || conversation_state.recovery_status == RecoveryStatus::NeedsRebuild
-                || self
-                    .state
-                    .mls_summaries
-                    .get(&conversation_id)
-                    .map(|summary| summary.status == MlsStateStatus::NeedsRebuild)
-                    .unwrap_or(false)
-        };
-        let handshake_active = self
-            .state
-            .conversations
-            .get(&conversation_id)
-            .is_some_and(|state| state.pcs.handshake.is_some());
-        if handshake_active && (reconcile.changed || needs_rebootstrap) {
-            self.mark_recovery_needed(&conversation_id, RecoveryReason::MembershipChanged);
-            let recovery_context_op = if self.state.recovery_contexts.contains_key(&conversation_id)
-            {
-                PersistOp::SaveRecoveryContext {
-                    conversation_id: conversation_id.clone(),
-                }
-            } else {
-                PersistOp::DeleteRecoveryContext {
-                    conversation_id: conversation_id.clone(),
-                }
-            };
-            return Ok(CoreOutput {
-                state_update: CoreStateUpdate {
-                    conversations_changed: true,
-                    ..CoreStateUpdate::default()
-                },
-                effects: vec![persist_effect(
-                    &self.state,
-                    vec![
-                        PersistOp::SaveConversation {
-                            conversation_id: conversation_id.clone(),
-                        },
-                        recovery_context_op,
-                    ],
-                )],
-                view_model: Some(CoreViewModel {
-                    conversations: vec![self.conversation_summary(&conversation_id)?],
-                    ..CoreViewModel::default()
-                }),
-            });
-        }
+        // No membership deferral: a direct PCS rotation is created, merged and
+        // enqueued in one step, so there is no in-flight handshake for a
+        // membership change to collide with. `needs_rebootstrap` is computed
+        // below, after the membership is applied.
         {
             let conversation_state = self
                 .state
@@ -510,7 +462,6 @@ impl CoreEngine {
                     last_message_type,
                     message_count: None,
                     recovery: self.recovery_snapshot_for_conversation(&conversation_id),
-                    pcs_degraded: None,
                 }],
                 ..CoreViewModel::default()
             }),

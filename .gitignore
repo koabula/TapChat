@@ -1,5 +1,5 @@
 /target
-/doc/*
+/doc
 /draft
 node_modules/
 /app/desktop/node_modules/

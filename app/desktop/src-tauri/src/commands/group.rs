@@ -676,8 +676,7 @@ pub async fn get_group_messages_impl(
             tapchat_core::model::MessageType::MlsWelcome
             | tapchat_core::model::MessageType::MlsCommit
             | tapchat_core::model::MessageType::MlsProposal
-            | tapchat_core::model::MessageType::ControlGroupWelcomePickup
-            | tapchat_core::model::MessageType::ControlDirectCommitAccept => {
+            | tapchat_core::model::MessageType::ControlGroupWelcomePickup => {
                 // Protocol messages never surface in the chat UI.
             }
             tapchat_core::model::MessageType::ControlConversationNeedsRebuild => {

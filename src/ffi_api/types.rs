@@ -1048,8 +1048,6 @@ pub struct ConversationSummary {
     pub message_count: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovery: Option<RecoveryDiagnostics>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pcs_degraded: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1505,6 +1503,10 @@ pub enum RecoveryEscalationReason {
     IdentityRefreshRetryExhausted,
     ExplicitNeedsRebuildControl,
     RecoveryPolicyExhausted,
+    /// Our own direct-PCS commit lost a same-epoch race with the peer.
+    /// We already merged it and openmls cannot un-merge, so the group has
+    /// to be rebuilt.
+    PcsCommitRace,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

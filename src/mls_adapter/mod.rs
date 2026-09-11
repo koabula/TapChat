@@ -214,34 +214,11 @@ impl From<Verdict> for IngestResult {
     }
 }
 
-impl From<Verdict> for DirectCommitClass {
-    fn from(verdict: Verdict) -> Self {
-        match verdict {
-            Verdict::Rejected(reason) => DirectCommitClass::Rejected(reason),
-            Verdict::Deferred(reason) => DirectCommitClass::Deferred(reason),
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StagedDirectSelfUpdate {
+pub struct DirectSelfUpdate {
     pub commit_b64: String,
     pub commit_hash: String,
     pub base_epoch: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DirectCommitClass {
-    PcsSelfUpdate {
-        commit_hash: String,
-        base_epoch: u64,
-        sender_identity: String,
-    },
-    /// Authenticated, but not a bare self-update: the direct-PCS handler
-    /// declines and lets the generic ingest path deal with it.
-    NotSelfUpdate,
-    Rejected(RejectReason),
-    Deferred(DeferReason),
 }
 
 #[derive(Debug)]
@@ -1266,10 +1243,16 @@ impl MlsAdapter {
         })
     }
 
-    pub fn stage_direct_self_update(
+    /// Replace this device's leaf key and merge the commit immediately.
+    ///
+    /// Staging alone heals nothing: `self_update` only produces a pending
+    /// commit, and the old leaf key stays in use until the merge. Post-compromise
+    /// healing therefore has to be a single unilateral step, which is what makes
+    /// it independent of the counterparty.
+    pub fn rotate_direct_self_update(
         &mut self,
         conversation_id: &str,
-    ) -> CoreResult<StagedDirectSelfUpdate> {
+    ) -> CoreResult<DirectSelfUpdate> {
         if !self.groups.contains_key(conversation_id) {
             return Err(CoreError::invalid_input(
                 "conversation MLS state does not exist",
@@ -1282,6 +1265,7 @@ impl MlsAdapter {
             .groups
             .get_mut(conversation_id)
             .ok_or_else(|| CoreError::invalid_input("conversation MLS state does not exist"))?;
+        let members_before = state.member_device_ids.clone();
         let bundle = state
             .group
             .self_update(provider, signer, LeafNodeParameters::default())
@@ -1291,19 +1275,40 @@ impl MlsAdapter {
                 ))
             })?;
         let commit = bundle.into_commit();
+        state
+            .group
+            .merge_pending_commit(provider)
+            .map_err(|error| {
+                CoreError::invalid_state(format!("failed to merge direct PCS self-update: {error}"))
+            })?;
+        state.member_device_ids = extract_member_device_ids(&state.group)?;
+        if state.member_device_ids != members_before {
+            return Err(CoreError::invalid_state(
+                "direct PCS self-update changed MLS membership",
+            ));
+        }
+        state.pcs_updates.clear();
+        state.pcs_update_epoch = state.group.epoch().as_u64();
+        state.status = MlsStateStatus::Active;
         let commit_b64 = encode_mls_message(commit)?;
         let commit_hash = crate::direct_pcs::commit_hash_from_b64(&commit_b64)?;
-        Ok(StagedDirectSelfUpdate {
+        Ok(DirectSelfUpdate {
             commit_b64,
             commit_hash,
             base_epoch,
         })
     }
 
+    /// Produce a self-update commit for the live epoch **without** advancing
+    /// this adapter, by building it on a `fork()`.
+    ///
+    /// The only way to construct a rival commit for a same-epoch collision, so
+    /// the arbitration tests can exercise a race that is otherwise a
+    /// one-message-wide window in wall-clock time.
     pub fn create_forked_direct_self_update(
         &self,
         conversation_id: &str,
-    ) -> CoreResult<StagedDirectSelfUpdate> {
+    ) -> CoreResult<DirectSelfUpdate> {
         if !self.groups.contains_key(conversation_id) {
             return Err(CoreError::invalid_input(
                 "conversation MLS state does not exist",
@@ -1316,16 +1321,6 @@ impl MlsAdapter {
         let state = fork.groups.get_mut(conversation_id).ok_or_else(|| {
             CoreError::invalid_state("forked MLS adapter is missing the conversation")
         })?;
-        if state.group.pending_commit().is_some() {
-            state
-                .group
-                .clear_pending_commit(provider.storage())
-                .map_err(|error| {
-                    CoreError::invalid_state(format!(
-                        "failed to clear pending commit on fork: {error}"
-                    ))
-                })?;
-        }
         let bundle = state
             .group
             .self_update(provider, signer, LeafNodeParameters::default())
@@ -1337,142 +1332,17 @@ impl MlsAdapter {
         let commit = bundle.into_commit();
         let commit_b64 = encode_mls_message(commit)?;
         let commit_hash = crate::direct_pcs::commit_hash_from_b64(&commit_b64)?;
-        Ok(StagedDirectSelfUpdate {
+        Ok(DirectSelfUpdate {
             commit_b64,
             commit_hash,
             base_epoch,
         })
     }
 
-    pub fn classify_direct_commit(
-        &self,
-        conversation_id: &str,
-        payload_b64: &str,
-    ) -> CoreResult<DirectCommitClass> {
-        if !self.groups.contains_key(conversation_id) {
-            return Ok(DirectCommitClass::Deferred(DeferReason::NoLocalGroup));
-        }
-        let base_epoch = self.export_group_summary(conversation_id)?.epoch;
-        let mut fork = self.fork()?;
-        let provider = &fork.provider;
-        let state = fork.groups.get_mut(conversation_id).ok_or_else(|| {
-            CoreError::invalid_state("forked MLS adapter is missing the conversation")
-        })?;
-        let protocol_message = decode_mls_message(payload_b64)?
-            .try_into_protocol_message()
-            .map_err(|_| CoreError::invalid_input("expected a protocol MLS message"))?;
-        // Welcome joiners never process the creating Add Commit; its epoch is
-        // already behind live. Same for any Commit we have already advanced past.
-        if protocol_message.epoch().as_u64() < base_epoch {
-            return Ok(DirectCommitClass::Rejected(RejectReason::Replay));
-        }
-        let processed = match state.group.process_message(provider, protocol_message) {
-            Ok(processed) => processed,
-            Err(error) => return Ok(classify_process_error(error)?.into()),
-        };
-        let sender_identity = extract_sender_identity(processed.credential())?;
-        match processed.into_content() {
-            ProcessedMessageContent::StagedCommitMessage(staged_commit) => {
-                let has_add = staged_commit.add_proposals().next().is_some();
-                let has_remove = staged_commit.remove_proposals().next().is_some();
-                let has_path = staged_commit.update_path_leaf_node().is_some();
-                if has_add || has_remove || !has_path {
-                    return Ok(DirectCommitClass::NotSelfUpdate);
-                }
-                Ok(DirectCommitClass::PcsSelfUpdate {
-                    commit_hash: crate::direct_pcs::commit_hash_from_b64(payload_b64)?,
-                    base_epoch,
-                    sender_identity,
-                })
-            }
-            ProcessedMessageContent::ApplicationMessage(_) => Ok(DirectCommitClass::NotSelfUpdate),
-            _ => Ok(DirectCommitClass::Rejected(RejectReason::Unauthorized)),
-        }
-    }
-
-    pub fn apply_certified_direct_commit(
-        &mut self,
-        conversation_id: &str,
-        commit_b64: &str,
-    ) -> CoreResult<MlsStateSummary> {
-        {
-            let provider = &self.provider;
-            let state = self
-                .groups
-                .get_mut(conversation_id)
-                .ok_or_else(|| CoreError::invalid_input("conversation MLS state does not exist"))?;
-            if state.group.pending_commit().is_some() {
-                state
-                    .group
-                    .merge_pending_commit(provider)
-                    .map_err(|error| {
-                        CoreError::invalid_state(format!(
-                            "failed to merge pending certified direct commit: {error}"
-                        ))
-                    })?;
-            } else {
-                let protocol_message = decode_mls_message(commit_b64)?
-                    .try_into_protocol_message()
-                    .map_err(|_| CoreError::invalid_input("expected a protocol MLS message"))?;
-                let processed = state
-                    .group
-                    .process_message(provider, protocol_message)
-                    .map_err(|error| {
-                        CoreError::invalid_state(format!(
-                            "failed to process certified direct commit: {error}"
-                        ))
-                    })?;
-                match processed.into_content() {
-                    ProcessedMessageContent::StagedCommitMessage(staged_commit) => {
-                        state
-                            .group
-                            .merge_staged_commit(provider, *staged_commit)
-                            .map_err(|_| {
-                                CoreError::invalid_state("failed to merge certified direct commit")
-                            })?;
-                    }
-                    _ => {
-                        return Err(CoreError::invalid_state(
-                            "certified direct commit did not produce a staged commit",
-                        ));
-                    }
-                }
-            }
-            state.member_device_ids = extract_member_device_ids(&state.group)?;
-            state.status = MlsStateStatus::Active;
-        }
-        self.export_group_summary(conversation_id)
-    }
-
     pub fn member_device_ids(&self, conversation_id: &str) -> CoreResult<Vec<String>> {
         Ok(self
             .export_group_summary(conversation_id)?
             .member_device_ids)
-    }
-
-    /// Bootstrap the PCS chain from shared, authenticated MLS state, never from
-    /// an unverified creating Commit (Welcome joiners cannot process that Commit).
-    pub fn direct_pcs_initial_hash(&self, conversation_id: &str) -> CoreResult<String> {
-        let state = self
-            .groups
-            .get(conversation_id)
-            .ok_or_else(|| CoreError::invalid_input("conversation MLS state does not exist"))?;
-        let exported = zeroize::Zeroizing::new(
-            state
-                .group
-                .export_secret(
-                    self.provider.crypto(),
-                    "tapchat-direct-pcs-initial-v1",
-                    conversation_id.as_bytes(),
-                    32,
-                )
-                .map_err(|error| {
-                    CoreError::invalid_state(format!(
-                        "failed to derive direct PCS initial hash: {error}"
-                    ))
-                })?,
-        );
-        Ok(crate::direct_pcs::commit_hash_from_bytes(&exported))
     }
 
     pub fn ingest_message(
@@ -2601,8 +2471,8 @@ pub fn validate_published_key_package_lifetime(
 #[cfg(test)]
 mod tests {
     use super::{
-        key_package_rotation_jitter_ms, validate_published_key_package_lifetime, DirectCommitClass,
-        IngestResult, MlsAdapter, MlsAdapterModule, PeerDeviceKeyPackage, PublishedKeyPackage,
+        key_package_rotation_jitter_ms, validate_published_key_package_lifetime, IngestResult,
+        MlsAdapter, MlsAdapterModule, PeerDeviceKeyPackage, PublishedKeyPackage,
         RejectReason, KEY_PACKAGE_CLOCK_SKEW_MS, KEY_PACKAGE_LIFECYCLE_VERSION,
         KEY_PACKAGE_LIFETIME_MS, KEY_PACKAGE_ROTATION_WINDOW_MS, ONE_TIME_KEY_PACKAGE_POOL_TARGET,
     };
@@ -3768,55 +3638,39 @@ mod tests {
         }
     }
 
+    /// The whole point of R1: rotating replaces our leaf key and advances our
+    /// epoch in one step, with no input from the counterparty.
     #[test]
-    fn direct_self_update_keeps_live_epoch_until_certified() {
+    fn direct_self_update_advances_the_epoch_immediately() {
         let (mut alice, mut bob, alice_identity, _, _) = pair_adapters();
         let live_epoch = alice
             .export_group_summary("conv:alice:bob")
             .expect("summary")
             .epoch;
-        let staged = alice
-            .stage_direct_self_update("conv:alice:bob")
-            .expect("stage");
+        let rotated = alice
+            .rotate_direct_self_update("conv:alice:bob")
+            .expect("rotate");
+        assert_eq!(rotated.base_epoch, live_epoch);
         assert_eq!(
             alice
                 .export_group_summary("conv:alice:bob")
                 .expect("live")
                 .epoch,
-            live_epoch
+            live_epoch + 1,
+            "the committer must not wait for anyone to merge its own commit"
         );
-        assert_eq!(staged.base_epoch, live_epoch);
-        match alice
-            .classify_direct_commit("conv:alice:bob", &staged.commit_b64)
-            .expect("alice would not ingest own commit as pcs on unmerged live")
-        {
-            DirectCommitClass::PcsSelfUpdate { .. }
-            | DirectCommitClass::Rejected(_)
-            | DirectCommitClass::Deferred(_) => {}
-            other => panic!("unexpected class on committer live: {other:?}"),
-        }
         match bob
-            .classify_direct_commit("conv:alice:bob", &staged.commit_b64)
-            .expect("bob classify")
+            .ingest_message(
+                "conv:alice:bob",
+                &alice_identity.device_identity.device_id,
+                MessageType::MlsCommit,
+                &rotated.commit_b64,
+            )
+            .expect("bob ingest commit")
         {
-            DirectCommitClass::PcsSelfUpdate {
-                commit_hash,
-                base_epoch,
-                ..
-            } => {
-                assert_eq!(commit_hash, staged.commit_hash);
-                assert_eq!(base_epoch, live_epoch);
-                let applied = bob
-                    .apply_certified_direct_commit("conv:alice:bob", &staged.commit_b64)
-                    .expect("bob apply");
-                assert_eq!(applied.epoch, live_epoch + 1);
-            }
-            other => panic!("expected PCS self-update, got {other:?}"),
+            IngestResult::AppliedCommit { epoch } => assert_eq!(epoch, live_epoch + 1),
+            other => panic!("expected an applied commit, got {other:?}"),
         }
-        let applied = alice
-            .apply_certified_direct_commit("conv:alice:bob", &staged.commit_b64)
-            .expect("alice apply");
-        assert_eq!(applied.epoch, live_epoch + 1);
 
         let outbound = alice
             .encrypt_application("conv:alice:bob", b"after pcs")
@@ -3838,24 +3692,24 @@ mod tests {
     }
 
     #[test]
-    fn previous_epoch_still_decrypts_after_certified_commit() {
+    fn previous_epoch_still_decrypts_after_rotation() {
         let (mut alice, mut bob, alice_identity, _, _) = pair_adapters();
         let stale = alice
             .encrypt_application("conv:alice:bob", b"stale epoch")
             .expect("stale");
-        let staged = alice
-            .stage_direct_self_update("conv:alice:bob")
-            .expect("stage");
-        match bob
-            .classify_direct_commit("conv:alice:bob", &staged.commit_b64)
-            .expect("classify")
-        {
-            DirectCommitClass::PcsSelfUpdate { .. } => {
-                bob.apply_certified_direct_commit("conv:alice:bob", &staged.commit_b64)
-                    .expect("apply");
-            }
-            other => panic!("expected PCS, got {other:?}"),
-        }
+        let rotated = alice
+            .rotate_direct_self_update("conv:alice:bob")
+            .expect("rotate");
+        assert!(matches!(
+            bob.ingest_message(
+                "conv:alice:bob",
+                &alice_identity.device_identity.device_id,
+                MessageType::MlsCommit,
+                &rotated.commit_b64,
+            )
+            .expect("bob ingest commit"),
+            IngestResult::AppliedCommit { .. }
+        ));
         match bob
             .ingest_message(
                 "conv:alice:bob",
@@ -3873,33 +3727,38 @@ mod tests {
         }
     }
 
+    /// A rotation lands between two sends; the receiver adopts the commit and
+    /// must still read both, one as a previous-epoch message.
     #[test]
-    fn certified_commit_still_applies_after_live_application_messages() {
+    fn rotation_keeps_both_adjacent_epochs_decryptable() {
         let (mut alice, mut bob, alice_identity, _, _) = pair_adapters();
         let live_epoch = alice
             .export_group_summary("conv:alice:bob")
             .expect("summary")
             .epoch;
-        let staged = alice
-            .stage_direct_self_update("conv:alice:bob")
-            .expect("stage");
         let stale = alice
-            .encrypt_application("conv:alice:bob", b"during handshake")
-            .expect("encrypt during handshake");
-        let applied = alice
-            .apply_certified_direct_commit("conv:alice:bob", &staged.commit_b64)
-            .expect("alice apply after live sends");
-        assert_eq!(applied.epoch, live_epoch + 1);
-        match bob
-            .classify_direct_commit("conv:alice:bob", &staged.commit_b64)
-            .expect("bob classify")
-        {
-            DirectCommitClass::PcsSelfUpdate { .. } => {
-                bob.apply_certified_direct_commit("conv:alice:bob", &staged.commit_b64)
-                    .expect("bob apply");
-            }
-            other => panic!("expected PCS, got {other:?}"),
-        }
+            .encrypt_application("conv:alice:bob", b"before rotation")
+            .expect("encrypt before rotation");
+        let rotated = alice
+            .rotate_direct_self_update("conv:alice:bob")
+            .expect("rotate");
+        assert_eq!(
+            alice
+                .export_group_summary("conv:alice:bob")
+                .expect("live")
+                .epoch,
+            live_epoch + 1
+        );
+        assert!(matches!(
+            bob.ingest_message(
+                "conv:alice:bob",
+                &alice_identity.device_identity.device_id,
+                MessageType::MlsCommit,
+                &rotated.commit_b64,
+            )
+            .expect("bob ingest commit"),
+            IngestResult::AppliedCommit { .. }
+        ));
         match bob
             .ingest_message(
                 "conv:alice:bob",
@@ -3907,10 +3766,10 @@ mod tests {
                 MessageType::MlsApplication,
                 &stale.payload_b64,
             )
-            .expect("handshake-period decrypt")
+            .expect("pre-rotation decrypt")
         {
             IngestResult::AppliedApplication(application) => {
-                assert_eq!(application.plaintext, b"during handshake");
+                assert_eq!(application.plaintext, b"before rotation");
                 assert!(application.from_previous_epoch);
             }
             other => panic!("expected previous-epoch application, got {other:?}"),
@@ -3950,12 +3809,9 @@ mod tests {
                 }],
             )
             .expect("second conversation");
-        let staged = alice
-            .stage_direct_self_update("conv:alice:bob")
-            .expect("stage");
         alice
-            .apply_certified_direct_commit("conv:alice:bob", &staged.commit_b64)
-            .expect("apply");
+            .rotate_direct_self_update("conv:alice:bob")
+            .expect("rotate");
         assert!(alice.has_conversation("conv:alice:bob"));
         assert!(alice.has_conversation("conv:alice:bob2"));
     }
@@ -3966,14 +3822,19 @@ mod tests {
         let late_e = alice
             .encrypt_application("conv:alice:bob", b"late e")
             .expect("late e");
-        let staged = alice
-            .stage_direct_self_update("conv:alice:bob")
-            .expect("stage");
-        alice
-            .apply_certified_direct_commit("conv:alice:bob", &staged.commit_b64)
-            .expect("alice apply");
-        bob.apply_certified_direct_commit("conv:alice:bob", &staged.commit_b64)
-            .expect("bob apply");
+        let rotated = alice
+            .rotate_direct_self_update("conv:alice:bob")
+            .expect("rotate");
+        assert!(matches!(
+            bob.ingest_message(
+                "conv:alice:bob",
+                &alice_identity.device_identity.device_id,
+                MessageType::MlsCommit,
+                &rotated.commit_b64,
+            )
+            .expect("bob ingest commit"),
+            IngestResult::AppliedCommit { .. }
+        ));
         let consumed = alice
             .encrypt_application("conv:alice:bob", b"e+1")
             .expect("e+1");
@@ -4010,7 +3871,7 @@ mod tests {
                 "conv:alice:bob",
                 &alice_identity.device_identity.device_id,
                 MessageType::MlsCommit,
-                &staged.commit_b64,
+                &rotated.commit_b64,
             )
             .expect("replay C")
         {

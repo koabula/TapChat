@@ -117,7 +117,6 @@ impl MessageType {
             MessageType::ControlConversationNeedsRebuild => "control_conversation_needs_rebuild",
             MessageType::ControlContactRemoved => "control_contact_removed",
             MessageType::ControlContactAccepted => "control_contact_accepted",
-            MessageType::ControlDirectCommitAccept => "control_direct_commit_accept",
             MessageType::ControlGroupWelcomePickup => "control_group_welcome_pickup",
             MessageType::ControlGroupStateEvent => "control_group_state_event",
         }

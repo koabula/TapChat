@@ -3,185 +3,106 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::error::{CoreError, CoreResult};
-use crate::identity::LocalIdentityState;
 
 pub const DIRECT_PCS_COMMIT_INTERVAL: u32 = 32;
-pub const DIRECT_PCS_DEBT_HARD: u32 = 256;
-/// Time-based fallback for `should_initiate_commit`: a low-traffic
-/// conversation may never reach `DIRECT_PCS_COMMIT_INTERVAL` messages, which
-/// would otherwise let post-compromise healing stall indefinitely.
+/// Time-based fallback for `should_rotate`: a low-traffic conversation may
+/// never reach `DIRECT_PCS_COMMIT_INTERVAL` messages, which would otherwise
+/// let post-compromise healing stall indefinitely.
 pub const DIRECT_PCS_MAX_AGE_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 
-const SIGNING_DOMAIN: &str = "tapchat-direct-pcs-v1";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DirectPcsRole {
-    Committer,
-    Acceptor,
-}
-
+/// Our own commit for `base_epoch`, retained only long enough to arbitrate a
+/// same-epoch race with the peer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct DirectCommitCertificate {
-    pub conversation_id: String,
-    pub epoch: u64,
-    pub parent_commit_hash: String,
+pub struct OwnCommit {
+    pub base_epoch: u64,
     pub commit_hash: String,
-    pub committer_device_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub acceptor_device_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub committer_sig: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub acceptor_sig: Option<String>,
-}
-
-impl DirectCommitCertificate {
-    pub fn signing_payload(&self) -> Vec<u8> {
-        certificate_signing_payload(
-            &self.conversation_id,
-            self.epoch,
-            &self.parent_commit_hash,
-            &self.commit_hash,
-        )
-    }
-
-    pub fn is_complete(&self) -> bool {
-        self.committer_sig.as_ref().is_some_and(|s| !s.is_empty())
-            && self.acceptor_sig.as_ref().is_some_and(|s| !s.is_empty())
-            && self
-                .acceptor_device_id
-                .as_ref()
-                .is_some_and(|s| !s.is_empty())
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DirectPcsHandshake {
-    pub role: DirectPcsRole,
-    pub epoch: u64,
-    pub commit_hash: String,
-    pub commit_b64: String,
-    pub parent_commit_hash: String,
-    pub committer_device_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub acceptor_device_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub committer_sig: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub acceptor_sig: Option<String>,
-}
-
-impl DirectPcsHandshake {
-    pub fn certificate(&self, conversation_id: &str) -> DirectCommitCertificate {
-        DirectCommitCertificate {
-            conversation_id: conversation_id.to_string(),
-            epoch: self.epoch,
-            parent_commit_hash: self.parent_commit_hash.clone(),
-            commit_hash: self.commit_hash.clone(),
-            committer_device_id: self.committer_device_id.clone(),
-            acceptor_device_id: self.acceptor_device_id.clone(),
-            committer_sig: self.committer_sig.clone(),
-            acceptor_sig: self.acceptor_sig.clone(),
-        }
-    }
-
-    pub fn is_promised(&self) -> bool {
-        self.acceptor_sig
-            .as_ref()
-            .is_some_and(|sig| !sig.is_empty())
-    }
+    /// `designated_committer(roster@base_epoch, base_epoch) == this device`,
+    /// evaluated **when the commit was made**. Re-deriving it later would read
+    /// the roster of whichever epoch we ended up in, and two racing membership
+    /// commits leave the two sides with different rosters — the arbitration
+    /// verdict has to be the same on both sides or the fork never resolves.
+    pub won_arbitration: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct DirectPcsState {
+    /// Application messages observed since **this device** last replaced its
+    /// own leaf key.
+    ///
+    /// Deliberately not epoch-scoped. A peer's commit rotates the group secret
+    /// but not our leaf, so an attacker holding our snapshot follows it
+    /// straight through; only our own commit heals us. If a peer's commit
+    /// cleared this counter, a peer that commits often enough would keep us
+    /// permanently below the threshold and our leaf would never rotate — the
+    /// separation R1 exists to close, wearing a different hat.
     #[serde(default)]
-    pub epoch_app_count: u32,
+    pub self_debt: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_certified_commit_hash: Option<String>,
+    pub self_rotated_at_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub previous_certified_commit_hash: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_certified_at_ms: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub signed_epoch: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub signed_commit_hash: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub handshake: Option<DirectPcsHandshake>,
-    #[serde(default)]
-    pub degraded: bool,
+    pub own_commit: Option<OwnCommit>,
 }
 
 impl DirectPcsState {
-    pub fn record_signature(&mut self, epoch: u64, commit_hash: &str) -> CoreResult<()> {
-        if let (Some(signed_epoch), Some(signed_hash)) =
-            (self.signed_epoch, self.signed_commit_hash.as_ref())
-        {
-            if signed_epoch == epoch && signed_hash != commit_hash {
-                return Err(CoreError::invalid_state(
-                    "already signed a different commit for this epoch",
-                ));
-            }
-        }
-        self.signed_epoch = Some(epoch);
-        self.signed_commit_hash = Some(commit_hash.to_string());
-        Ok(())
-    }
-
     pub fn note_application_message(&mut self) {
-        self.epoch_app_count = self.epoch_app_count.saturating_add(1);
-        if self.epoch_app_count >= DIRECT_PCS_DEBT_HARD {
-            self.degraded = true;
-        }
+        self.self_debt = self.self_debt.saturating_add(1);
     }
 
-    pub fn should_initiate_commit(
-        &self,
-        local_device_id: &str,
-        committer_device_id: &str,
-        now_ms: u64,
-    ) -> bool {
-        self.handshake.is_none()
-            && local_device_id == committer_device_id
-            && (self.epoch_app_count >= DIRECT_PCS_COMMIT_INTERVAL || self.commit_overdue(now_ms))
+    /// Whether this device should replace its own leaf key now.
+    ///
+    /// The designated committer goes first, at one interval. Everyone else
+    /// waits two, which is how "it did not go" is measured without a clock
+    /// shared with the peer or a reply from it. Exactly one party sits at the
+    /// 1× threshold at any epoch, so the common case produces no race at all;
+    /// the 2× party only fires when the designated one is absent, and an
+    /// absent peer cannot race.
+    pub fn should_rotate(&self, is_designated: bool, now_ms: u64) -> bool {
+        let factor = if is_designated { 1 } else { 2 };
+        self.self_debt >= DIRECT_PCS_COMMIT_INTERVAL.saturating_mul(factor)
+            || self.rotation_overdue(now_ms, DIRECT_PCS_MAX_AGE_MS.saturating_mul(factor as u64))
     }
 
-    fn commit_overdue(&self, now_ms: u64) -> bool {
-        self.last_certified_at_ms
-            .is_some_and(|at| now_ms.saturating_sub(at) >= DIRECT_PCS_MAX_AGE_MS)
+    fn rotation_overdue(&self, now_ms: u64, max_age_ms: u64) -> bool {
+        self.self_rotated_at_ms
+            .is_some_and(|at| now_ms.saturating_sub(at) >= max_age_ms)
     }
 
-    pub fn abort_handshake(&mut self) {
-        self.handshake = None;
+    /// Record that our own leaf key was just replaced. The only place the
+    /// rotation debt is cleared.
+    pub fn mark_rotated(&mut self, own_commit: OwnCommit, now_ms: u64) {
+        self.self_debt = 0;
+        self.self_rotated_at_ms = Some(now_ms);
+        self.own_commit = Some(own_commit);
     }
 
-    pub fn handshake_is_promised(&self) -> bool {
-        self.handshake
-            .as_ref()
-            .is_some_and(DirectPcsHandshake::is_promised)
+    /// Close the race window.
+    ///
+    /// Called when a peer commit merges. To merge, its epoch had to equal our
+    /// live epoch, which is already past the base epoch of our own commit — so
+    /// the peer demonstrably moved past it and can no longer race us there.
+    /// Note this does **not** touch `self_debt`; see the field comment.
+    pub fn clear_own_commit(&mut self) {
+        self.own_commit = None;
     }
 
-    pub fn is_certified_hash(&self, commit_hash: &str) -> bool {
-        self.last_certified_commit_hash.as_deref() == Some(commit_hash)
-            || self.previous_certified_commit_hash.as_deref() == Some(commit_hash)
-    }
-
-    pub fn mark_certified(&mut self, commit_hash: String, now_ms: u64) {
-        self.previous_certified_commit_hash = self.last_certified_commit_hash.clone();
-        self.last_certified_commit_hash = Some(commit_hash);
-        self.last_certified_at_ms = Some(now_ms);
-        self.epoch_app_count = 0;
-        self.degraded = false;
-        self.handshake = None;
-        self.signed_epoch = None;
-        self.signed_commit_hash = None;
+    /// `Some(won)` when `incoming` is a peer commit racing our own commit at
+    /// the same base epoch — `true` if we win the arbitration. `None` when
+    /// there is no race and the frame should take the ordinary ingest path.
+    pub fn arbitrate(&self, incoming_epoch: u64, incoming_hash: &str) -> Option<bool> {
+        let own = self.own_commit.as_ref()?;
+        (incoming_epoch == own.base_epoch && incoming_hash != own.commit_hash)
+            .then_some(own.won_arbitration)
     }
 }
 
+/// Who wins a same-epoch collision.
+///
+/// This is an **arbiter, not a gatekeeper**: any member may commit at any
+/// epoch. The function also orders the two duties — the device it names goes
+/// first, at `DIRECT_PCS_COMMIT_INTERVAL`, and everyone else waits twice that
+/// (see [`DirectPcsState::should_rotate`]).
 pub fn designated_committer(member_device_ids: &[String], epoch: u64) -> CoreResult<String> {
     let mut ids = member_device_ids.to_vec();
     ids.retain(|id| !id.trim().is_empty());
@@ -207,39 +128,17 @@ pub fn commit_hash_from_b64(payload_b64: &str) -> CoreResult<String> {
     Ok(commit_hash_from_bytes(&bytes))
 }
 
-pub fn certificate_signing_payload(
-    conversation_id: &str,
-    epoch: u64,
-    parent_commit_hash: &str,
-    commit_hash: &str,
-) -> Vec<u8> {
-    format!("{SIGNING_DOMAIN}\n{conversation_id}\n{epoch}\n{parent_commit_hash}\n{commit_hash}")
-        .into_bytes()
-}
-
-pub fn sign_certificate(
-    identity: &LocalIdentityState,
-    conversation_id: &str,
-    epoch: u64,
-    parent_commit_hash: &str,
-    commit_hash: &str,
-) -> String {
-    identity.sign_sender_proof(&certificate_signing_payload(
-        conversation_id,
-        epoch,
-        parent_commit_hash,
-        commit_hash,
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::identity::IdentityManager;
 
-    const ALICE_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
-    const BOB_MNEMONIC: &str =
-        "legal winner thank year wave sausage worth useful legal winner thank yellow";
+    fn own_commit(base_epoch: u64, hash: &str, won: bool) -> OwnCommit {
+        OwnCommit {
+            base_epoch,
+            commit_hash: hash.into(),
+            won_arbitration: won,
+        }
+    }
 
     #[test]
     fn committer_rotates_with_epoch() {
@@ -251,138 +150,77 @@ mod tests {
     }
 
     #[test]
-    fn sign_once_rejects_a_second_hash_in_the_same_epoch() {
-        let mut state = DirectPcsState::default();
-        state
-            .record_signature(1, "sha256:aaa")
-            .expect("first signature");
-        state
-            .record_signature(1, "sha256:aaa")
-            .expect("same hash is idempotent");
-        let error = state
-            .record_signature(1, "sha256:bbb")
-            .expect_err("different hash must fail");
-        assert_eq!(error.code(), "invalid_state");
-    }
-
-    #[test]
-    fn handshake_is_promised_only_after_acceptor_signature() {
-        let handshake = DirectPcsHandshake {
-            role: DirectPcsRole::Acceptor,
-            epoch: 1,
-            commit_hash: "sha256:commit".into(),
-            commit_b64: "commit".into(),
-            parent_commit_hash: "sha256:parent".into(),
-            committer_device_id: "device:alice:phone".into(),
-            acceptor_device_id: Some("device:bob:phone".into()),
-            committer_sig: Some("committer".into()),
-            acceptor_sig: None,
+    fn designated_goes_first_and_the_other_waits_one_extra_interval() {
+        let mut state = DirectPcsState {
+            self_debt: DIRECT_PCS_COMMIT_INTERVAL,
+            ..Default::default()
         };
-        assert!(!handshake.is_promised());
-        let mut promised = handshake.clone();
-        promised.acceptor_sig = Some("acceptor".into());
-        assert!(promised.is_promised());
+        assert!(state.should_rotate(true, 0));
+        assert!(!state.should_rotate(false, 0));
+        state.self_debt = DIRECT_PCS_COMMIT_INTERVAL * 2;
+        assert!(state.should_rotate(false, 0));
     }
 
     #[test]
-    fn certificate_requires_both_signatures() {
-        let alice =
-            IdentityManager::create_or_recover(Some(ALICE_MNEMONIC), Some("phone")).expect("alice");
-        let bob =
-            IdentityManager::create_or_recover(Some(BOB_MNEMONIC), Some("phone")).expect("bob");
-        let mut cert = DirectCommitCertificate {
-            conversation_id: "conv:alice:bob".into(),
-            epoch: 1,
-            parent_commit_hash: "sha256:parent".into(),
-            commit_hash: "sha256:commit".into(),
-            committer_device_id: alice.device_identity.device_id.clone(),
-            acceptor_device_id: Some(bob.device_identity.device_id.clone()),
-            committer_sig: Some(sign_certificate(
-                &alice,
-                "conv:alice:bob",
-                1,
-                "sha256:parent",
-                "sha256:commit",
-            )),
-            acceptor_sig: None,
+    fn stale_rotation_triggers_even_with_few_messages() {
+        let mut state = DirectPcsState {
+            self_rotated_at_ms: Some(0),
+            ..Default::default()
         };
-        assert!(!cert.is_complete());
-        cert.acceptor_sig = Some(sign_certificate(
-            &bob,
-            "conv:alice:bob",
-            1,
-            "sha256:parent",
-            "sha256:commit",
-        ));
-        assert!(cert.is_complete());
-        crate::identity::verify_device_payload_signature(
-            &alice.device_identity.device_public_key,
-            &cert.signing_payload(),
-            cert.committer_sig.as_deref().expect("committer sig"),
-        )
-        .expect("alice signature");
-        crate::identity::verify_device_payload_signature(
-            &bob.device_identity.device_public_key,
-            &cert.signing_payload(),
-            cert.acceptor_sig.as_deref().expect("acceptor sig"),
-        )
-        .expect("bob signature");
-    }
-
-    #[test]
-    fn wrong_parent_hash_changes_the_signed_payload() {
-        let alice =
-            IdentityManager::create_or_recover(Some(ALICE_MNEMONIC), Some("phone")).expect("alice");
-        let sig = sign_certificate(
-            &alice,
-            "conv:alice:bob",
-            1,
-            "sha256:parent",
-            "sha256:commit",
-        );
-        let error = crate::identity::verify_device_payload_signature(
-            &alice.device_identity.device_public_key,
-            &certificate_signing_payload("conv:alice:bob", 1, "sha256:other", "sha256:commit"),
-            &sig,
-        )
-        .expect_err("parent mismatch must fail verification");
-        assert_eq!(error.code(), "invalid_input");
-    }
-
-    #[test]
-    fn debt_hard_marks_degraded_without_resetting_count() {
-        let mut state = DirectPcsState::default();
-        state.epoch_app_count = DIRECT_PCS_DEBT_HARD - 1;
         state.note_application_message();
-        assert!(state.degraded);
-        assert_eq!(state.epoch_app_count, DIRECT_PCS_DEBT_HARD);
+        assert!(!state.should_rotate(true, DIRECT_PCS_MAX_AGE_MS - 1));
+        assert!(state.should_rotate(true, DIRECT_PCS_MAX_AGE_MS));
+        // The non-designated device waits twice as long here too.
+        assert!(!state.should_rotate(false, DIRECT_PCS_MAX_AGE_MS));
+        assert!(state.should_rotate(false, DIRECT_PCS_MAX_AGE_MS * 2));
     }
 
     #[test]
-    fn stale_epoch_triggers_commit_even_with_few_messages() {
+    fn mark_rotated_clears_the_debt_and_resets_the_staleness_clock() {
         let mut state = DirectPcsState {
-            last_certified_at_ms: Some(0),
+            self_rotated_at_ms: Some(0),
             ..Default::default()
         };
-        state.epoch_app_count = 1;
-        let committer = "device:alice:phone";
-        assert!(!state.should_initiate_commit(committer, committer, DIRECT_PCS_MAX_AGE_MS - 1));
-        assert!(state.should_initiate_commit(committer, committer, DIRECT_PCS_MAX_AGE_MS));
+        state.self_debt = DIRECT_PCS_COMMIT_INTERVAL;
+        state.mark_rotated(
+            own_commit(7, "sha256:mine", true),
+            DIRECT_PCS_MAX_AGE_MS,
+        );
+        assert_eq!(state.self_debt, 0);
+        assert_eq!(state.self_rotated_at_ms, Some(DIRECT_PCS_MAX_AGE_MS));
+        assert!(!state.should_rotate(true, DIRECT_PCS_MAX_AGE_MS * 2 - 1));
     }
 
     #[test]
-    fn mark_certified_resets_the_staleness_clock() {
+    fn clearing_the_race_window_does_not_clear_the_rotation_debt() {
+        // A peer commit closes the arbitration window but heals nothing of
+        // ours, so our debt must survive it — otherwise a peer that commits
+        // often enough starves our own rotation.
         let mut state = DirectPcsState {
-            last_certified_at_ms: Some(0),
+            self_debt: DIRECT_PCS_COMMIT_INTERVAL,
+            own_commit: Some(own_commit(3, "sha256:mine", false)),
             ..Default::default()
         };
-        state.mark_certified("sha256:commit".into(), DIRECT_PCS_MAX_AGE_MS);
-        assert_eq!(state.last_certified_at_ms, Some(DIRECT_PCS_MAX_AGE_MS));
-        let committer = "device:alice:phone";
-        assert!(!state.should_initiate_commit(
-            committer,
-            committer,
-            DIRECT_PCS_MAX_AGE_MS + DIRECT_PCS_MAX_AGE_MS - 1
-        ));
+        state.clear_own_commit();
+        assert_eq!(state.self_debt, DIRECT_PCS_COMMIT_INTERVAL);
+        assert!(state.should_rotate(true, 0));
+    }
+
+    #[test]
+    fn arbitration_fires_only_on_a_different_hash_at_our_base_epoch() {
+        let mut state = DirectPcsState::default();
+        assert_eq!(state.arbitrate(3, "sha256:theirs"), None);
+
+        state.own_commit = Some(own_commit(3, "sha256:mine", true));
+        // Our own bytes echoed back are not a race.
+        assert_eq!(state.arbitrate(3, "sha256:mine"), None);
+        // Neither is a commit from any other epoch.
+        assert_eq!(state.arbitrate(2, "sha256:theirs"), None);
+        assert_eq!(state.arbitrate(4, "sha256:theirs"), None);
+        // A different commit at our base epoch is the collision.
+        assert_eq!(state.arbitrate(3, "sha256:theirs"), Some(true));
+
+        state.own_commit = Some(own_commit(3, "sha256:mine", false));
+        assert_eq!(state.arbitrate(3, "sha256:theirs"), Some(false));
     }
 }
