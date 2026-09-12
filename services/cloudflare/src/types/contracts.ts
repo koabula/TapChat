@@ -715,13 +715,20 @@ export interface DeploymentBundle {
   expectedDeviceId?: string;
 }
 
+/** Mirrors `CapabilityService` in `src/model/mod.rs`. */
+export type CapabilityService = "inbox" | "group_outbox";
+/** Mirrors `CapabilityOperation` in `src/model/mod.rs`. */
+export type CapabilityOperation = "append";
+
 export interface InboxAppendCapability {
   version: string;
-  service: "inbox";
+  service: CapabilityService;
   userId: string;
   targetDeviceId: string;
   endpoint: string;
-  operations: string[];
+  // A named union, not `string[]`: a new Rust variant that nobody adds here is
+  // then a tsc error rather than a signature that silently fails to verify.
+  operations: CapabilityOperation[];
   conversationScope?: string[];
   expiresAt: number;
   constraints?: CapabilityConstraints;

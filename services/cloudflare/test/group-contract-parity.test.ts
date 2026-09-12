@@ -10,6 +10,8 @@ import {
 } from "../src/auth/capability";
 import { deviceRuntimeSigningPayload } from "../src/auth/runtime-auth";
 import type {
+  CapabilityOperation,
+  CapabilityService,
   DeviceBinding,
   DeviceRuntimeRefreshChallenge,
   GroupCapability,
@@ -223,4 +225,23 @@ test("shared signing-domain fixture matches the Rust framing", async () => {
     await sha256Hex(deviceRuntimeSigningPayload(signingFixture.deviceRuntimeChallenge)),
     signingFixture.expected.deviceRuntimeChallengeSha256
   );
+});
+
+/**
+ * The capability arrives from an attacker-controlled header via `JSON.parse`,
+ * so the type union is a claim about producers, not a runtime guarantee. The
+ * payload builder has to reject what the union excludes: the previous encoding
+ * mapped both "append" and "Append" onto the same signed bytes while the grant
+ * check treated them differently.
+ */
+test("capability payload rejects wire values outside the closed set", () => {
+  const capability = { ...signingFixture.inboxAppendCapability };
+  assert.throws(() =>
+    capabilityPayload({ ...capability, operations: ["Append" as CapabilityOperation] })
+  );
+  assert.throws(() =>
+    capabilityPayload({ ...capability, service: "Inbox" as CapabilityService })
+  );
+  // The control: the real wire names still build.
+  assert.ok(capabilityPayload(capability).length > 0);
 });

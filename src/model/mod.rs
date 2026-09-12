@@ -145,6 +145,26 @@ pub enum CapabilityOperation {
     Append,
 }
 
+impl CapabilityService {
+    /// The stable wire name used in signing domains. An exhaustive match, for
+    /// the same reason `MessageType::wire_name` is one: `{:?}` is not a format,
+    /// and the worker used to reconstruct its output by hand.
+    pub fn wire_name(&self) -> &'static str {
+        match self {
+            CapabilityService::Inbox => "inbox",
+            CapabilityService::GroupOutbox => "group_outbox",
+        }
+    }
+}
+
+impl CapabilityOperation {
+    pub fn wire_name(&self) -> &'static str {
+        match self {
+            CapabilityOperation::Append => "append",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InboxAppendCapability {

@@ -35,7 +35,7 @@
     "expiresAt": 1775004800000
   },
   "expected": {
-    "inboxAppendCapabilitySha256": "a8ae549f9cde67fc87498849e06784e6ce2191495c009656a44486f37d2c677d",
+    "inboxAppendCapabilitySha256": "ef59c2a508c08cb1990b02f0d60c9e506345d52b91dd01c24d4e80faf9cc38b3",
     "deviceBindingSha256": "fbf03d7eec288e60e0425e6835522ed26c6588f3b371590e153b08543aef7e83",
     "deviceRuntimeChallengeSha256": "c2a6a0a3b823eac398bf80e5ac243e083a4aec3b60a159418cb6cc33f8567606"
   }

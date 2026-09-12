@@ -53,6 +53,39 @@ export class SigningPayload {
     return this;
   }
 
+  /** A fixed-width 64-bit integer. No length prefix: the width is implicit. */
+  pushU64(value: number): this {
+    if (!Number.isSafeInteger(value) || value < 0) {
+      throw new Error("signing payload u64 must be a non-negative safe integer");
+    }
+    const encoded = new Uint8Array(8);
+    new DataView(encoded.buffer).setBigUint64(0, BigInt(value), false);
+    this.chunks.push(encoded);
+    return this;
+  }
+
+  /** A fixed-width 32-bit count. */
+  pushU32(value: number): this {
+    if (!Number.isSafeInteger(value) || value < 0 || value > 0xffff_ffff) {
+      throw new Error("signing payload u32 is out of range");
+    }
+    const encoded = new Uint8Array(4);
+    new DataView(encoded.buffer).setUint32(0, value, false);
+    this.chunks.push(encoded);
+    return this;
+  }
+
+  /** An optional 64-bit integer, with an explicit presence byte, so that an
+   * absent value and a zero never encode identically. */
+  pushOptionalU64(value: number | undefined): this {
+    if (value === undefined) {
+      this.chunks.push(new Uint8Array([0]));
+      return this;
+    }
+    this.chunks.push(new Uint8Array([1]));
+    return this.pushU64(value);
+  }
+
   bytes() {
     const total = this.chunks.reduce((sum, chunk) => sum + chunk.length, 0);
     const out = new Uint8Array(total);

@@ -246,6 +246,13 @@ fn push_storage_ref(payload: &mut SigningPayload, reference: &StorageRef) {
 ///
 /// `storage_refs` are signed in transmission order, not sorted: the order is
 /// semantically live, since it is copied verbatim into the stored message.
+/// The finished bytes, for tests that assert two payloads differ. Not a way
+/// to sign: `LocalIdentityState` is still the only thing that can do that.
+#[cfg(test)]
+pub fn signing_payload_bytes_for_test(payload: SigningPayload) -> Vec<u8> {
+    payload.into_bytes()
+}
+
 pub fn envelope_sender_proof_payload(envelope: &Envelope) -> SigningPayload {
     let mut payload = SigningPayload::new(SignatureDomain::EnvelopeSenderProof);
     payload.push_str(&envelope.version);

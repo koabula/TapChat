@@ -2052,6 +2052,36 @@ var SigningPayload = class {
     this.chunks.push(length, value);
     return this;
   }
+  /** A fixed-width 64-bit integer. No length prefix: the width is implicit. */
+  pushU64(value) {
+    if (!Number.isSafeInteger(value) || value < 0) {
+      throw new Error("signing payload u64 must be a non-negative safe integer");
+    }
+    const encoded = new Uint8Array(8);
+    new DataView(encoded.buffer).setBigUint64(0, BigInt(value), false);
+    this.chunks.push(encoded);
+    return this;
+  }
+  /** A fixed-width 32-bit count. */
+  pushU32(value) {
+    if (!Number.isSafeInteger(value) || value < 0 || value > 4294967295) {
+      throw new Error("signing payload u32 is out of range");
+    }
+    const encoded = new Uint8Array(4);
+    new DataView(encoded.buffer).setUint32(0, value, false);
+    this.chunks.push(encoded);
+    return this;
+  }
+  /** An optional 64-bit integer, with an explicit presence byte, so that an
+   * absent value and a zero never encode identically. */
+  pushOptionalU64(value) {
+    if (value === void 0) {
+      this.chunks.push(new Uint8Array([0]));
+      return this;
+    }
+    this.chunks.push(new Uint8Array([1]));
+    return this.pushU64(value);
+  }
   bytes() {
     const total = this.chunks.reduce((sum, chunk) => sum + chunk.length, 0);
     const out = new Uint8Array(total);
@@ -2181,27 +2211,31 @@ async function validateAppendAuthorization(request, deviceId, body, now, loadAut
 var APPEND_AUTH_CONTEXT_HEADER = "X-Tapchat-Append-Auth";
 var APPEND_AUTH_REASON_HEADER = "X-Tapchat-Append-Auth-Reason";
 function capabilityPayload(capability) {
-  return signingPayload(SIGNATURE_DOMAIN.inboxAppendCapability).pushStr(capabilityBody(capability)).bytes();
+  const payload = signingPayload(SIGNATURE_DOMAIN.inboxAppendCapability).pushStr(capability.version).pushStr(wireName(CAPABILITY_SERVICES, capability.service, "capability service")).pushStr(capability.userId).pushStr(capability.targetDeviceId).pushStr(capability.endpoint).pushU32(capability.operations.length);
+  for (const operation of capability.operations) {
+    payload.pushStr(wireName(CAPABILITY_OPERATIONS, operation, "capability operation"));
+  }
+  const scope = capability.conversationScope ?? [];
+  payload.pushU32(scope.length);
+  for (const conversationId of scope) {
+    payload.pushStr(conversationId);
+  }
+  payload.pushU64(capability.expiresAt);
+  if (capability.constraints) {
+    payload.pushU32(1).pushOptionalU64(capability.constraints.maxBytes).pushOptionalU64(capability.constraints.maxOpsPerMinute);
+  } else {
+    payload.pushU32(0);
+  }
+  return payload.bytes();
 }
-function capabilityBody(capability) {
-  const constraints = capability.constraints ? `${capability.constraints.maxBytes ?? ""}:${capability.constraints.maxOpsPerMinute ?? ""}` : "";
-  return [
-    capability.version,
-    rustCapabilityServiceDebug(capability.service),
-    capability.userId,
-    capability.targetDeviceId,
-    capability.endpoint,
-    rustCapabilityOperationsDebug(capability.operations),
-    (capability.conversationScope ?? []).join(","),
-    String(capability.expiresAt),
-    constraints
-  ].join("|");
-}
-function rustCapabilityServiceDebug(service) {
-  return service === "inbox" ? "Inbox" : service;
-}
-function rustCapabilityOperationsDebug(operations) {
-  return `[${operations.map((operation) => operation === "append" ? "Append" : operation).join(", ")}]`;
+var CAPABILITY_SERVICES = ["inbox", "group_outbox"];
+var CAPABILITY_OPERATIONS = ["append"];
+function wireName(allowed, value, kind) {
+  const match = allowed.find((candidate) => candidate === value);
+  if (!match) {
+    throw new HttpError(403, "invalid_capability", `unknown ${kind}`);
+  }
+  return match;
 }
 function bindingPayload(binding) {
   return signingPayload(SIGNATURE_DOMAIN.deviceBinding).pushStr(
@@ -2262,7 +2296,11 @@ function verifyDeviceBinding(userPublicKey, binding) {
   return verifyEd25519(userPublicKey, binding.signature, bindingPayload(binding));
 }
 function verifyInboxAppendCapability(capability, devicePublicKey) {
-  return verifyEd25519(devicePublicKey, capability.signature, capabilityPayload(capability));
+  try {
+    return verifyEd25519(devicePublicKey, capability.signature, capabilityPayload(capability));
+  } catch {
+    return false;
+  }
 }
 function verifyEd25519(publicKeyHex, signatureHex, payload) {
   try {

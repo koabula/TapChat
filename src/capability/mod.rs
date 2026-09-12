@@ -183,58 +183,148 @@ impl CapabilityManager {
     }
 }
 
-/// The body is still `|`-joined and still derived from `{:?}`. Commit 2
-/// replaces it with structured pushes; commit 1 only puts the domain in
-/// front, so the two changes stay reviewable apart.
+/// The exact bytes an inbox append capability signs.
+///
+/// Every variable-length field is length-prefixed and every list carries a
+/// count, so no field value can shift a boundary. The previous encoding
+/// joined the fields with `|` and took two of them from Rust `Debug` output:
+/// an `endpoint` or a `conversation_scope` entry containing `|` could reframe
+/// the capability into a different one bearing the same signature, and the
+/// worker had to reconstruct `Debug` formatting by hand to verify anything.
+///
+/// `constraints` needs a presence byte of its own because it is an `Option`
+/// wrapping two more: the old encoding collapsed absent, empty and zero into
+/// the same text.
 pub fn inbox_append_capability_payload(capability: &InboxAppendCapability) -> SigningPayload {
     let mut payload = SigningPayload::new(SignatureDomain::InboxAppendCapability);
-    payload.push_str(&capability_body(capability));
+    payload.push_str(&capability.version);
+    payload.push_str(capability.service.wire_name());
+    payload.push_str(&capability.user_id);
+    payload.push_str(&capability.target_device_id);
+    payload.push_str(&capability.endpoint);
+    payload.push_u32(capability.operations.len() as u32);
+    for operation in &capability.operations {
+        payload.push_str(operation.wire_name());
+    }
+    payload.push_u32(capability.conversation_scope.len() as u32);
+    for conversation_id in &capability.conversation_scope {
+        payload.push_str(conversation_id);
+    }
+    payload.push_u64(capability.expires_at);
+    match &capability.constraints {
+        Some(constraints) => {
+            payload.push_u32(1);
+            payload.push_optional_u64(constraints.max_bytes);
+            payload.push_optional_u64(constraints.max_ops_per_minute.map(u64::from));
+        }
+        None => payload.push_u32(0),
+    }
     payload
-}
-
-fn capability_body(capability: &InboxAppendCapability) -> String {
-    let constraints = capability
-        .constraints
-        .as_ref()
-        .map(|constraints| {
-            format!(
-                "{}:{}",
-                constraints
-                    .max_bytes
-                    .map(|value| value.to_string())
-                    .unwrap_or_default(),
-                constraints
-                    .max_ops_per_minute
-                    .map(|value| value.to_string())
-                    .unwrap_or_default()
-            )
-        })
-        .unwrap_or_default();
-    format!(
-        "{}|{:?}|{}|{}|{}|{:?}|{}|{}|{}",
-        capability.version,
-        capability.service,
-        capability.user_id,
-        capability.target_device_id,
-        capability.endpoint,
-        capability.operations,
-        capability.conversation_scope.join(","),
-        capability.expires_at,
-        constraints
-    )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{CapabilityManager, CapabilityModule};
+    use super::{inbox_append_capability_payload, CapabilityManager, CapabilityModule};
     use crate::identity::IdentityManager;
-    use crate::model::DeploymentBundle;
+    use crate::model::{
+        CapabilityConstraints, CapabilityOperation, CapabilityService, DeploymentBundle,
+        InboxAppendCapability, CURRENT_MODEL_VERSION,
+    };
 
     const ALICE_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+    fn sample_capability() -> InboxAppendCapability {
+        InboxAppendCapability {
+            version: CURRENT_MODEL_VERSION.to_string(),
+            service: CapabilityService::Inbox,
+            user_id: "user:alice".into(),
+            target_device_id: "device:alice:phone".into(),
+            endpoint: "https://example.com/v1/inbox/device/messages".into(),
+            operations: vec![CapabilityOperation::Append],
+            conversation_scope: vec![],
+            expires_at: 1_775_004_800_000,
+            constraints: Some(CapabilityConstraints {
+                max_bytes: Some(256 * 1024),
+                max_ops_per_minute: Some(60),
+            }),
+            signature: String::new(),
+        }
+    }
+
+    fn payload_bytes(capability: &InboxAppendCapability) -> Vec<u8> {
+        crate::model::signing::signing_payload_bytes_for_test(inbox_append_capability_payload(
+            capability,
+        ))
+    }
 
     #[test]
     fn module_name_is_stable() {
         assert_eq!(CapabilityModule.name(), "capability");
+    }
+
+    /// The bug a delimiter-joined domain has, on the one pair of adjacent
+    /// free-form fields: under the old `|`-joined encoding both of these
+    /// produce the byte-identical string
+    /// `0.1|Inbox|user:alice|b|device:alice:phone|...`, so one signature was
+    /// valid for a capability naming a different device.
+    #[test]
+    fn capability_field_boundaries_cannot_be_shifted() {
+        let mut left = sample_capability();
+        left.user_id = "user:alice".into();
+        left.target_device_id = "b|device:alice:phone".into();
+
+        let mut right = sample_capability();
+        right.user_id = "user:alice|b".into();
+        right.target_device_id = "device:alice:phone".into();
+
+        assert_ne!(payload_bytes(&left), payload_bytes(&right));
+    }
+
+    /// The scope list was `join(",")`, so one entry containing a comma and two
+    /// entries split on it were the same bytes. It is length-prefixed per
+    /// entry now.
+    #[test]
+    fn capability_scope_entries_cannot_be_merged() {
+        let mut joined = sample_capability();
+        joined.conversation_scope = vec!["conv:one,conv:two".into()];
+
+        let mut split = sample_capability();
+        split.conversation_scope = vec!["conv:one".into(), "conv:two".into()];
+
+        assert_ne!(payload_bytes(&joined), payload_bytes(&split));
+    }
+
+    /// Unlike the two above, these three states were already distinguishable
+    /// under the old encoding (`""`, `":"`, `"0:0"`). The explicit presence
+    /// bytes are what keep them distinguishable now that the text formatting
+    /// is gone, so the property is pinned rather than newly acquired.
+    #[test]
+    fn capability_absent_and_zero_constraints_differ() {
+        let mut absent = sample_capability();
+        absent.constraints = None;
+
+        let mut empty = sample_capability();
+        empty.constraints = Some(CapabilityConstraints {
+            max_bytes: None,
+            max_ops_per_minute: None,
+        });
+
+        let mut zero = sample_capability();
+        zero.constraints = Some(CapabilityConstraints {
+            max_bytes: Some(0),
+            max_ops_per_minute: Some(0),
+        });
+
+        let encodings = [
+            payload_bytes(&absent),
+            payload_bytes(&empty),
+            payload_bytes(&zero),
+        ];
+        for (index, left) in encodings.iter().enumerate() {
+            for right in &encodings[index + 1..] {
+                assert_ne!(left, right, "constraint states must not share an encoding");
+            }
+        }
     }
 
     #[test]

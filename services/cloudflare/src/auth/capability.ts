@@ -157,33 +157,54 @@ export async function validateAppendAuthorization(
 export const APPEND_AUTH_CONTEXT_HEADER = "X-Tapchat-Append-Auth";
 export const APPEND_AUTH_REASON_HEADER = "X-Tapchat-Append-Auth-Reason";
 
+/**
+ * The exact bytes an inbox append capability signs. Mirrors
+ * `inbox_append_capability_payload` in `src/capability/mod.rs`.
+ *
+ * The capability arrives from an attacker-controlled header via `JSON.parse`,
+ * so the wire names are looked up in a closed set that throws on anything
+ * else. Rust gets exhaustiveness from the compiler; a mapper with a
+ * fall-through would give this side a silent passthrough instead, which is
+ * how the previous encoding let `["append"]` and `["Append"]` sign
+ * identically while the grant check treated them differently.
+ */
 export function capabilityPayload(capability: InboxAppendCapability) {
-  return signingPayload(SIGNATURE_DOMAIN.inboxAppendCapability).pushStr(capabilityBody(capability)).bytes();
+  const payload = signingPayload(SIGNATURE_DOMAIN.inboxAppendCapability)
+    .pushStr(capability.version)
+    .pushStr(wireName(CAPABILITY_SERVICES, capability.service, "capability service"))
+    .pushStr(capability.userId)
+    .pushStr(capability.targetDeviceId)
+    .pushStr(capability.endpoint)
+    .pushU32(capability.operations.length);
+  for (const operation of capability.operations) {
+    payload.pushStr(wireName(CAPABILITY_OPERATIONS, operation, "capability operation"));
+  }
+  const scope = capability.conversationScope ?? [];
+  payload.pushU32(scope.length);
+  for (const conversationId of scope) {
+    payload.pushStr(conversationId);
+  }
+  payload.pushU64(capability.expiresAt);
+  if (capability.constraints) {
+    payload
+      .pushU32(1)
+      .pushOptionalU64(capability.constraints.maxBytes)
+      .pushOptionalU64(capability.constraints.maxOpsPerMinute);
+  } else {
+    payload.pushU32(0);
+  }
+  return payload.bytes();
 }
 
-function capabilityBody(capability: InboxAppendCapability): string {
-  const constraints = capability.constraints
-    ? `${capability.constraints.maxBytes ?? ""}:${capability.constraints.maxOpsPerMinute ?? ""}`
-    : "";
-  return [
-    capability.version,
-    rustCapabilityServiceDebug(capability.service),
-    capability.userId,
-    capability.targetDeviceId,
-    capability.endpoint,
-    rustCapabilityOperationsDebug(capability.operations),
-    (capability.conversationScope ?? []).join(","),
-    String(capability.expiresAt),
-    constraints
-  ].join("|");
-}
+const CAPABILITY_SERVICES = ["inbox", "group_outbox"] as const;
+const CAPABILITY_OPERATIONS = ["append"] as const;
 
-function rustCapabilityServiceDebug(service: InboxAppendCapability["service"]): string {
-  return service === "inbox" ? "Inbox" : service;
-}
-
-function rustCapabilityOperationsDebug(operations: string[]): string {
-  return `[${operations.map((operation) => (operation === "append" ? "Append" : operation)).join(", ")}]`;
+function wireName<T extends string>(allowed: readonly T[], value: string, kind: string): T {
+  const match = allowed.find((candidate) => candidate === value);
+  if (!match) {
+    throw new HttpError(403, "invalid_capability", `unknown ${kind}`);
+  }
+  return match;
 }
 
 export function bindingPayload(binding: DeviceBinding) {
@@ -253,7 +274,12 @@ export function verifyDeviceBinding(userPublicKey: string, binding: DeviceBindin
 }
 
 function verifyInboxAppendCapability(capability: InboxAppendCapability, devicePublicKey: string): boolean {
-  return verifyEd25519(devicePublicKey, capability.signature, capabilityPayload(capability));
+  try {
+    return verifyEd25519(devicePublicKey, capability.signature, capabilityPayload(capability));
+  } catch {
+    // An unrepresentable service or operation cannot have been signed.
+    return false;
+  }
 }
 
 /**
