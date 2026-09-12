@@ -5298,6 +5298,28 @@ var ManagedSession = class {
   }
 };
 
+// src/leakage-keys.ts
+function segment(value) {
+  return value.replace(/[^A-Za-z0-9:_-]/g, "_");
+}
+var R2_KEYS = {
+  blob: (input) => [
+    "blobs",
+    input.variant,
+    segment(input.ownerUserId),
+    segment(input.ownerDeviceId),
+    input.storageScope,
+    segment(input.groupSegment),
+    segment(input.conversationId),
+    `${segment(input.messageId)}-${segment(input.taskId)}`
+  ].join("/"),
+  inboxPayload: (deviceId, seq) => `inbox-payload/${deviceId}/${seq}.json`,
+  sharedStateIdentityBundle: (userId) => `shared-state/${segment(userId)}/identity_bundle.json`,
+  sharedStateDeviceList: (userId) => `shared-state/${segment(userId)}/device_list.json`,
+  sharedStateDeviceStatus: (userId) => `shared-state/${segment(userId)}/device_status.json`,
+  welcomePickup: (groupId, deviceId, requestId) => `welcome-pickup/${groupId}/${deviceId}/${requestId ?? "unbound"}.json`
+};
+
 // src/inbox/service.ts
 var META_KEY2 = "meta";
 var IDEMPOTENCY_PREFIX2 = "idempotency:";
@@ -5614,7 +5636,7 @@ var InboxService = class {
       };
       await this.state.put(storageKey, inlineIndex);
     } else {
-      const payloadRef = `inbox-payload/${this.deviceId}/${seq}.json`;
+      const payloadRef = R2_KEYS.inboxPayload(this.deviceId, seq);
       await this.spillStore.putJson(payloadRef, record);
       const indexed = {
         seq,
@@ -6323,9 +6345,6 @@ var ManagedSession2 = class {
 };
 
 // src/storage/shared-state.ts
-function sanitizeSegment(value) {
-  return value.replace(/[^a-zA-Z0-9:_-]/g, "_");
-}
 var SharedStateService = class {
   store;
   baseUrl;
@@ -6334,13 +6353,13 @@ var SharedStateService = class {
     this.baseUrl = baseUrl2;
   }
   identityBundleKey(userId) {
-    return `shared-state/${sanitizeSegment(userId)}/identity_bundle.json`;
+    return R2_KEYS.sharedStateIdentityBundle(userId);
   }
   deviceListKey(userId) {
-    return `shared-state/${sanitizeSegment(userId)}/device_list.json`;
+    return R2_KEYS.sharedStateDeviceList(userId);
   }
   deviceStatusKey(userId) {
-    return `shared-state/${sanitizeSegment(userId)}/device_status.json`;
+    return R2_KEYS.sharedStateDeviceStatus(userId);
   }
   identityBundleUrl(userId) {
     return `${this.baseUrl}/v1/shared-state/${encodeURIComponent(userId)}/identity-bundle`;
@@ -6408,9 +6427,6 @@ var SHORT_BLOB_TOKEN_TTL_MS = 15 * 60 * 1e3;
 var CAPABILITY_METADATA_KEY = "read-capability-sha256";
 var DELETE_CAPABILITY_METADATA_KEY = "delete-capability-sha256";
 var BLOB_EXPIRY_METADATA_KEY = "blob-expires-at";
-function sanitizeSegment2(value) {
-  return value.replace(/[^a-zA-Z0-9:_-]/g, "_");
-}
 function requireNonEmpty(value, field) {
   if (!value || value.trim().length === 0) {
     throw new HttpError(400, "invalid_input", `${field} is required`);
@@ -6463,16 +6479,16 @@ var StorageService = class {
     if (storageScope === "group" && (!input.groupId || input.groupId.trim().length === 0)) {
       throw new HttpError(400, "invalid_input", "groupId is required for group storage");
     }
-    const blobKey = [
-      "blobs",
-      input.variant,
-      sanitizeSegment2(owner.userId),
-      sanitizeSegment2(owner.deviceId),
+    const blobKey = R2_KEYS.blob({
+      variant: input.variant,
+      ownerUserId: owner.userId,
+      ownerDeviceId: owner.deviceId,
       storageScope,
-      storageScope === "group" ? sanitizeSegment2(input.groupId) : "direct",
-      sanitizeSegment2(conversationId),
-      `${sanitizeSegment2(messageId)}-${sanitizeSegment2(taskId)}`
-    ].join("/");
+      groupSegment: storageScope === "group" ? input.groupId : "direct",
+      conversationId,
+      messageId,
+      taskId
+    });
     const uploadExpiresAt = now + SHORT_BLOB_TOKEN_TTL_MS;
     const blobExpiresAt = now + this.retentionMs;
     const readCapability = randomCapability();
@@ -6622,7 +6638,7 @@ function rangeError(size) {
 
 // src/welcome-pickup/service.ts
 function pickupKey(groupId, deviceId, requestId) {
-  return `welcome-pickup/${groupId}/${deviceId}/${requestId ?? "unbound"}.json`;
+  return R2_KEYS.welcomePickup(groupId, deviceId, requestId);
 }
 var WelcomePickupService = class {
   store;

@@ -1,4 +1,5 @@
 import { HttpError, type AppendAuthContext } from "../auth/capability";
+import { R2_KEYS } from "../leakage-keys";
 import type {
   AckRequest,
   AckResult,
@@ -443,7 +444,7 @@ export class InboxService {
       };
       await this.state.put(storageKey, inlineIndex);
     } else {
-      const payloadRef = `inbox-payload/${this.deviceId}/${seq}.json`;
+      const payloadRef = R2_KEYS.inboxPayload(this.deviceId, seq);
       await this.spillStore.putJson(payloadRef, record);
       const indexed: StoredRecordIndex = {
         seq,

@@ -116,7 +116,7 @@ enum InboxRecordSource {
 /// only as group-outbox message types projected onto stored messages. Two of
 /// them were pure attack surface: one forced a conversation rebuild, the other
 /// triggered an outbound identity fetch.
-const fn inbox_deliverable(message_type: MessageType) -> bool {
+pub(crate) const fn inbox_deliverable(message_type: MessageType) -> bool {
     match message_type {
         MessageType::MlsApplication
         | MessageType::MlsCommit

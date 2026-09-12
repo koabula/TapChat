@@ -13,6 +13,8 @@ pub mod ffi_api;
 pub(crate) mod fs_util;
 pub mod group_pcs;
 pub mod identity;
+#[cfg(test)]
+mod leakage_ledger;
 pub mod local_store;
 pub(crate) mod log_sanitize;
 pub mod logging;

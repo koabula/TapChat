@@ -1,0 +1,1051 @@
+{
+  "version": 1,
+  "scope": {
+    "modeled": [
+      "L_ibx",
+      "L_stg",
+      "L_net"
+    ],
+    "note": "Client-to-host direction only. Host-to-client *Result types are authored by the host, so they disclose nothing the host did not already have. This file records what an untrusted host can OBSERVE; it is not an integrity model, so who may forge a field is out of scope except for the `signed` annotation.",
+    "excludedSurfaces": [
+      {
+        "surface": "group_outbox_do",
+        "reason": "Group chat is outside the package scope of the write-up; these entries would have no table row to map to, which would hollow out the unmapped-is-a-failure rule."
+      },
+      {
+        "surface": "device_registry_do",
+        "reason": "Device registration and runtime-auth state. Host-visible and real, but the write-up models the inbox and storage components; these entries would have no table row to map to, which would hollow out the unmapped-is-a-failure rule. Enumerating it is its own work."
+      }
+    ],
+    "excludedRoutePrefixes": [
+      "/v1/groups/",
+      "/v1/group-invite/",
+      "/v2/runtime/",
+      "/v2/runtime-auth/"
+    ],
+    "internalPathMatchers": [
+      "services/cloudflare/src/inbox/durable.ts",
+      "services/cloudflare/src/group-outbox/durable.ts",
+      "services/cloudflare/src/device-registry/durable.ts"
+    ],
+    "nonSyntacticLeakage": [
+      {
+        "channel": "record_count_per_device",
+        "checked": false
+      },
+      {
+        "channel": "ciphertext_length",
+        "checked": false
+      },
+      {
+        "channel": "inter_arrival_timing",
+        "checked": false
+      },
+      {
+        "channel": "commit_frequency",
+        "checked": false,
+        "note": "Doubled by the R1 rotation change; recorded there as a traffic-pattern cost."
+      },
+      {
+        "channel": "retention_window",
+        "checked": false,
+        "note": "Records are deleted only at retention expiry, not on ack, so the host holds every envelope header for 30 days past delivery."
+      },
+      {
+        "channel": "source_ip_and_tls_fingerprint",
+        "checked": false,
+        "note": "Already carried by the Linkability row as `sender address`. The network layer is not addressable here, so application-layer anonymity is the ceiling of any repair in this component."
+      }
+    ],
+    "limits": [
+      "Containment is not information. This checks for a sentinel SUBSTRING, so any leak that is a FUNCTION of a secret - a hash, a size bucket, a first byte, a few bits of tag - passes clean. Consequence worth stating plainly: if conversation_id is ever 'fixed' by hashing it, these checks go quiet while the leak may be unchanged.",
+      "Non-syntactic channels are not modelled at all; see nonSyntacticLeakage, where checked:false records that their absence is a decision and not an oversight.",
+      "`table` is not reconciled against the write-up. CI proves a human recorded a placement, not that the table contains that row. Closing this needs the table vendored into the repo.",
+      "Inhabitation (bits) is declared, not yet measured. `constant` and `absent` claims are reviewed by hand until an engine-driven corpus check lands; the structural path set and the carries sets ARE measured.",
+      "Compile-time exhaustiveness has holes: serde(flatten), a serde_json::Value-typed field, serde(untagged), or a non-exhaustive match elsewhere would each make these checks go quiet rather than red. None are present in the in-scope types today."
+    ]
+  },
+  "tables": {
+    "sender_identity": "tab:inbox, Social graph rows",
+    "message_index": "tab:inbox, Linkability rows",
+    "envelope_metadata": "tab:inbox, Timing and Traffic type rows",
+    "attachment_refs": "tab:inbox, storage-ref rows (new; not in the table as published)",
+    "non_repudiation": "tab:inbox, Non-repudiation row",
+    "transport_addressing": "L_net, request-line addressing",
+    "storage_namespaces": "L_stg, object key namespaces",
+    "unmapped": "NO DECISION RECORDED - this value fails CI",
+    "inbox_state_keys": "tab:inbox, inbox-side state keys (new; not in the table as published)",
+    "realtime_push": "tab:inbox, Receiver behaviour rows"
+  },
+  "sentinels": {
+    "literal": [
+      "plaintext_body",
+      "group_title",
+      "display_name",
+      "attachment_file_name"
+    ],
+    "captured": [
+      "sender_user",
+      "recipient_user",
+      "sender_device",
+      "recipient_device",
+      "message_nonce"
+    ]
+  },
+  "inlineCiphertext": {
+    "mls_application": "opaque",
+    "mls_commit": "opaque",
+    "mls_welcome": "opaque",
+    "control_contact_removed": "base64_json_snake",
+    "control_contact_accepted": "base64_json_snake",
+    "control_group_welcome_pickup": "base64_json_camel",
+    "control_device_membership_changed": "base64_ascii"
+  },
+  "entries": [
+    {
+      "surface": "append_request",
+      "path": "envelope.conversationId",
+      "bits": "inhabited",
+      "carries": [
+        "recipient_user",
+        "sender_user"
+      ],
+      "signed": true,
+      "table": "message_index"
+    },
+    {
+      "surface": "append_request",
+      "path": "envelope.createdAt",
+      "bits": "inhabited",
+      "carries": [],
+      "signed": true,
+      "table": "envelope_metadata"
+    },
+    {
+      "surface": "append_request",
+      "path": "envelope.deliveryClass",
+      "bits": "constant",
+      "value": "normal",
+      "carries": [],
+      "signed": true,
+      "table": "envelope_metadata"
+    },
+    {
+      "surface": "append_request",
+      "path": "envelope.inlineCiphertext",
+      "bits": "inhabited",
+      "carries": [],
+      "signed": true,
+      "table": "envelope_metadata"
+    },
+    {
+      "surface": "append_request",
+      "path": "envelope.messageId",
+      "bits": "inhabited",
+      "carries": [
+        "message_nonce",
+        "recipient_device",
+        "recipient_user",
+        "sender_user"
+      ],
+      "signed": true,
+      "table": "message_index"
+    },
+    {
+      "surface": "append_request",
+      "path": "envelope.messageType",
+      "bits": "inhabited",
+      "carries": [],
+      "signed": true,
+      "table": "envelope_metadata"
+    },
+    {
+      "surface": "append_request",
+      "path": "envelope.recipientDeviceId",
+      "bits": "inhabited",
+      "carries": [
+        "recipient_device",
+        "recipient_user"
+      ],
+      "signed": true,
+      "table": "transport_addressing"
+    },
+    {
+      "surface": "append_request",
+      "path": "envelope.senderDeviceId",
+      "bits": "inhabited",
+      "carries": [
+        "sender_device",
+        "sender_user"
+      ],
+      "signed": true,
+      "table": "sender_identity"
+    },
+    {
+      "surface": "append_request",
+      "path": "envelope.senderProof.type",
+      "bits": "constant",
+      "value": "signature",
+      "carries": [],
+      "signed": false,
+      "table": "non_repudiation"
+    },
+    {
+      "surface": "append_request",
+      "path": "envelope.senderProof.value",
+      "bits": "inhabited",
+      "carries": [],
+      "signed": false,
+      "table": "non_repudiation"
+    },
+    {
+      "surface": "append_request",
+      "path": "envelope.senderUserId",
+      "bits": "inhabited",
+      "carries": [
+        "sender_user"
+      ],
+      "signed": true,
+      "table": "sender_identity"
+    },
+    {
+      "surface": "append_request",
+      "path": "envelope.storageRefs[].expiresAt",
+      "bits": "inhabited",
+      "carries": [],
+      "signed": true,
+      "table": "attachment_refs"
+    },
+    {
+      "surface": "append_request",
+      "path": "envelope.storageRefs[].fileName",
+      "bits": "absent",
+      "carries": [
+        "attachment_file_name"
+      ],
+      "signed": true,
+      "table": "attachment_refs"
+    },
+    {
+      "surface": "append_request",
+      "path": "envelope.storageRefs[].kind",
+      "bits": "inhabited",
+      "carries": [],
+      "signed": true,
+      "table": "attachment_refs"
+    },
+    {
+      "surface": "append_request",
+      "path": "envelope.storageRefs[].mimeType",
+      "bits": "constant",
+      "value": "application/octet-stream",
+      "carries": [],
+      "signed": true,
+      "table": "attachment_refs"
+    },
+    {
+      "surface": "append_request",
+      "path": "envelope.storageRefs[].ref",
+      "bits": "inhabited",
+      "carries": [
+        "sender_device",
+        "sender_user"
+      ],
+      "signed": true,
+      "table": "attachment_refs"
+    },
+    {
+      "surface": "append_request",
+      "path": "envelope.storageRefs[].sizeBytes",
+      "bits": "inhabited",
+      "carries": [],
+      "signed": true,
+      "table": "attachment_refs"
+    },
+    {
+      "surface": "append_request",
+      "path": "envelope.version",
+      "bits": "constant",
+      "value": "0.1",
+      "carries": [],
+      "signed": true,
+      "table": "envelope_metadata"
+    },
+    {
+      "surface": "append_request",
+      "path": "recipientDeviceId",
+      "bits": "inhabited",
+      "carries": [
+        "recipient_device",
+        "recipient_user"
+      ],
+      "signed": false,
+      "table": "transport_addressing"
+    },
+    {
+      "surface": "append_request",
+      "path": "senderBundleHash",
+      "bits": "inhabited",
+      "carries": [],
+      "signed": false,
+      "table": "sender_identity"
+    },
+    {
+      "surface": "append_request",
+      "path": "senderBundleShareUrl",
+      "bits": "inhabited",
+      "carries": [],
+      "signed": false,
+      "table": "sender_identity"
+    },
+    {
+      "surface": "append_request",
+      "path": "senderDisplayName",
+      "bits": "inhabited",
+      "carries": [
+        "display_name"
+      ],
+      "signed": false,
+      "table": "sender_identity"
+    },
+    {
+      "surface": "append_request",
+      "path": "version",
+      "bits": "constant",
+      "value": "0.1",
+      "carries": [],
+      "signed": false,
+      "table": "envelope_metadata"
+    },
+    {
+      "surface": "ack_request",
+      "path": "ack.ackSeq",
+      "bits": "inhabited",
+      "carries": [],
+      "signed": false,
+      "table": "transport_addressing"
+    },
+    {
+      "surface": "ack_request",
+      "path": "ack.ackedAt",
+      "bits": "inhabited",
+      "carries": [],
+      "signed": false,
+      "table": "transport_addressing"
+    },
+    {
+      "surface": "ack_request",
+      "path": "ack.ackedMessageIds[]",
+      "bits": "inhabited",
+      "carries": [
+        "message_nonce",
+        "recipient_device",
+        "recipient_user",
+        "sender_user"
+      ],
+      "signed": false,
+      "table": "message_index"
+    },
+    {
+      "surface": "ack_request",
+      "path": "ack.deviceId",
+      "bits": "inhabited",
+      "carries": [
+        "recipient_device",
+        "recipient_user"
+      ],
+      "signed": false,
+      "table": "transport_addressing"
+    },
+    {
+      "surface": "fetch_messages_request",
+      "path": "deviceId",
+      "bits": "inhabited",
+      "carries": [
+        "recipient_device",
+        "recipient_user"
+      ],
+      "signed": false,
+      "table": "transport_addressing"
+    },
+    {
+      "surface": "fetch_messages_request",
+      "path": "fromSeq",
+      "bits": "inhabited",
+      "carries": [],
+      "signed": false,
+      "table": "transport_addressing"
+    },
+    {
+      "surface": "fetch_messages_request",
+      "path": "limit",
+      "bits": "inhabited",
+      "carries": [],
+      "signed": false,
+      "table": "transport_addressing"
+    },
+    {
+      "surface": "replace_allowlist_request",
+      "path": "auth.deviceId",
+      "bits": "inhabited",
+      "carries": [
+        "recipient_device",
+        "recipient_user"
+      ],
+      "signed": false,
+      "table": "transport_addressing"
+    },
+    {
+      "surface": "replace_allowlist_request",
+      "path": "auth.runtimeId",
+      "bits": "inhabited",
+      "carries": [],
+      "signed": false,
+      "table": "transport_addressing"
+    },
+    {
+      "surface": "replace_allowlist_request",
+      "path": "auth.type",
+      "bits": "constant",
+      "value": "device_runtime",
+      "carries": [],
+      "signed": false,
+      "table": "transport_addressing"
+    },
+    {
+      "surface": "replace_allowlist_request",
+      "path": "deviceId",
+      "bits": "inhabited",
+      "carries": [
+        "recipient_device",
+        "recipient_user"
+      ],
+      "signed": false,
+      "table": "transport_addressing"
+    },
+    {
+      "surface": "replace_allowlist_request",
+      "path": "document.allowedSenderUserIds[]",
+      "bits": "inhabited",
+      "carries": [
+        "sender_user"
+      ],
+      "signed": false,
+      "table": "sender_identity"
+    },
+    {
+      "surface": "replace_allowlist_request",
+      "path": "document.rejectedSenderUserIds[]",
+      "bits": "inhabited",
+      "carries": [
+        "recipient_user"
+      ],
+      "signed": false,
+      "table": "sender_identity"
+    },
+    {
+      "surface": "replace_allowlist_request",
+      "path": "endpoint",
+      "bits": "inhabited",
+      "carries": [
+        "recipient_device",
+        "recipient_user"
+      ],
+      "signed": false,
+      "table": "transport_addressing"
+    },
+    {
+      "surface": "message_request_action_request",
+      "path": "action",
+      "bits": "inhabited",
+      "carries": [],
+      "signed": false,
+      "table": "envelope_metadata"
+    },
+    {
+      "surface": "message_request_action_request",
+      "path": "auth.deviceId",
+      "bits": "inhabited",
+      "carries": [
+        "recipient_device",
+        "recipient_user"
+      ],
+      "signed": false,
+      "table": "transport_addressing"
+    },
+    {
+      "surface": "message_request_action_request",
+      "path": "auth.runtimeId",
+      "bits": "inhabited",
+      "carries": [],
+      "signed": false,
+      "table": "transport_addressing"
+    },
+    {
+      "surface": "message_request_action_request",
+      "path": "auth.type",
+      "bits": "constant",
+      "value": "device_runtime",
+      "carries": [],
+      "signed": false,
+      "table": "transport_addressing"
+    },
+    {
+      "surface": "message_request_action_request",
+      "path": "deviceId",
+      "bits": "inhabited",
+      "carries": [
+        "recipient_device",
+        "recipient_user"
+      ],
+      "signed": false,
+      "table": "transport_addressing"
+    },
+    {
+      "surface": "message_request_action_request",
+      "path": "endpoint",
+      "bits": "inhabited",
+      "carries": [],
+      "signed": false,
+      "table": "transport_addressing"
+    },
+    {
+      "surface": "message_request_action_request",
+      "path": "requestId",
+      "bits": "inhabited",
+      "carries": [
+        "sender_user"
+      ],
+      "signed": false,
+      "table": "sender_identity"
+    },
+    {
+      "surface": "prepare_blob_upload_request",
+      "path": "auth.deviceId",
+      "bits": "inhabited",
+      "carries": [
+        "recipient_device",
+        "recipient_user"
+      ],
+      "signed": false,
+      "table": "transport_addressing"
+    },
+    {
+      "surface": "prepare_blob_upload_request",
+      "path": "auth.runtimeId",
+      "bits": "inhabited",
+      "carries": [],
+      "signed": false,
+      "table": "transport_addressing"
+    },
+    {
+      "surface": "prepare_blob_upload_request",
+      "path": "auth.type",
+      "bits": "constant",
+      "value": "device_runtime",
+      "carries": [],
+      "signed": false,
+      "table": "transport_addressing"
+    },
+    {
+      "surface": "prepare_blob_upload_request",
+      "path": "conversationId",
+      "bits": "inhabited",
+      "carries": [
+        "recipient_user",
+        "sender_user"
+      ],
+      "signed": false,
+      "table": "message_index"
+    },
+    {
+      "surface": "prepare_blob_upload_request",
+      "path": "groupId",
+      "bits": "inhabited",
+      "carries": [],
+      "signed": false,
+      "table": "storage_namespaces"
+    },
+    {
+      "surface": "prepare_blob_upload_request",
+      "path": "messageId",
+      "bits": "inhabited",
+      "carries": [
+        "message_nonce",
+        "recipient_device",
+        "recipient_user",
+        "sender_user"
+      ],
+      "signed": false,
+      "table": "message_index"
+    },
+    {
+      "surface": "prepare_blob_upload_request",
+      "path": "sizeBytes",
+      "bits": "inhabited",
+      "carries": [],
+      "signed": false,
+      "table": "storage_namespaces"
+    },
+    {
+      "surface": "prepare_blob_upload_request",
+      "path": "storageScope",
+      "bits": "inhabited",
+      "carries": [],
+      "signed": false,
+      "table": "storage_namespaces"
+    },
+    {
+      "surface": "prepare_blob_upload_request",
+      "path": "taskId",
+      "bits": "inhabited",
+      "carries": [],
+      "signed": false,
+      "table": "storage_namespaces"
+    },
+    {
+      "surface": "prepare_blob_upload_request",
+      "path": "variant",
+      "bits": "inhabited",
+      "carries": [],
+      "signed": false,
+      "table": "storage_namespaces"
+    },
+    {
+      "surface": "inbox_do_key",
+      "path": "meta",
+      "bits": "inhabited",
+      "carries": [],
+      "signed": false,
+      "table": "inbox_state_keys"
+    },
+    {
+      "surface": "inbox_do_key",
+      "path": "allowlist",
+      "bits": "inhabited",
+      "carries": [],
+      "signed": false,
+      "table": "inbox_state_keys",
+      "note": "The document behind this key holds the recipient's full contact graph as plaintext user ids. R3 deletes it."
+    },
+    {
+      "surface": "inbox_do_key",
+      "path": "record:{seq}",
+      "bits": "inhabited",
+      "carries": [],
+      "signed": false,
+      "table": "inbox_state_keys"
+    },
+    {
+      "surface": "inbox_do_key",
+      "path": "idempotency:{messageId}",
+      "bits": "inhabited",
+      "carries": [
+        "message_nonce",
+        "recipient_device",
+        "recipient_user",
+        "sender_user"
+      ],
+      "signed": false,
+      "table": "message_index",
+      "note": "message_id is msg:{conversation_id}:{nonce}:{recipient_device_id} and conversation_id is conv:{sortedA}:{sortedB}, so this key literally spells out both parties."
+    },
+    {
+      "surface": "inbox_do_key",
+      "path": "append-result:{messageId}",
+      "bits": "inhabited",
+      "carries": [
+        "message_nonce",
+        "recipient_device",
+        "recipient_user",
+        "sender_user"
+      ],
+      "signed": false,
+      "table": "message_index"
+    },
+    {
+      "surface": "inbox_do_key",
+      "path": "message-request:{senderUserId}",
+      "bits": "inhabited",
+      "carries": [
+        "sender_user"
+      ],
+      "signed": false,
+      "table": "sender_identity",
+      "note": "Keyed on a SELF-DECLARED identifier, so it is both a leak and poisonable."
+    },
+    {
+      "surface": "inbox_do_key",
+      "path": "message-request:index",
+      "bits": "inhabited",
+      "carries": [],
+      "signed": false,
+      "table": "inbox_state_keys",
+      "note": "Holds the list of sender user ids that have attempted contact."
+    },
+    {
+      "surface": "inbox_do_key",
+      "path": "message-request:meta",
+      "bits": "inhabited",
+      "carries": [],
+      "signed": false,
+      "table": "inbox_state_keys"
+    },
+    {
+      "surface": "inbox_do_key",
+      "path": "message-request:rate-limit",
+      "bits": "inhabited",
+      "carries": [],
+      "signed": false,
+      "table": "inbox_state_keys"
+    },
+    {
+      "surface": "inbox_do_key",
+      "path": "rate-limit:{senderUserId}",
+      "bits": "inhabited",
+      "carries": [
+        "sender_user"
+      ],
+      "signed": false,
+      "table": "sender_identity",
+      "note": "Self-declared and checked before authorization, so a capability holder can exhaust another sender's bucket. R3 closes this."
+    },
+    {
+      "surface": "r2_key",
+      "path": "blobs/{variant}/{ownerUserId}/{ownerDeviceId}/{storageScope}/{groupSegment}/{conversationId}/{messageId}-{taskId}",
+      "bits": "inhabited",
+      "carries": [
+        "message_nonce",
+        "recipient_device",
+        "recipient_user",
+        "sender_device",
+        "sender_user"
+      ],
+      "signed": false,
+      "table": "storage_namespaces",
+      "note": "Read access is already gated on an independent 256-bit capability, so these identifiers buy nothing. R4 makes the key opaque."
+    },
+    {
+      "surface": "r2_key",
+      "path": "inbox-payload/{deviceId}/{seq}.json",
+      "bits": "inhabited",
+      "carries": [
+        "recipient_device",
+        "recipient_user"
+      ],
+      "signed": false,
+      "table": "storage_namespaces",
+      "note": "Stores the ENTIRE InboxRecord, cleartext envelope header included, for every record above maxInlineBytes (MlsWelcome routinely exceeds it). So L_ibx is a subset of L_stg. Never modelled. R4 does not reach it - the spill is already on the recipient's own storage."
+    },
+    {
+      "surface": "r2_key",
+      "path": "shared-state/{userId}/identity_bundle.json",
+      "bits": "inhabited",
+      "carries": [
+        "sender_user"
+      ],
+      "signed": false,
+      "table": "storage_namespaces",
+      "note": "Served unauthenticated, so anyone who has ever seen a share link can re-fetch the current append capability indefinitely."
+    },
+    {
+      "surface": "r2_key",
+      "path": "shared-state/{userId}/device_list.json",
+      "bits": "inhabited",
+      "carries": [
+        "sender_user"
+      ],
+      "signed": false,
+      "table": "storage_namespaces"
+    },
+    {
+      "surface": "r2_key",
+      "path": "shared-state/{userId}/device_status.json",
+      "bits": "inhabited",
+      "carries": [
+        "sender_user"
+      ],
+      "signed": false,
+      "table": "storage_namespaces"
+    },
+    {
+      "surface": "r2_key",
+      "path": "welcome-pickup/{groupId}/{deviceId}/{requestId}.json",
+      "bits": "inhabited",
+      "carries": [
+        "recipient_device",
+        "recipient_user"
+      ],
+      "signed": false,
+      "table": "storage_namespaces",
+      "note": "Group-scope, but it shares the single storage bucket, so one operator sees it alongside everything else."
+    },
+    {
+      "surface": "realtime_event",
+      "path": "event",
+      "bits": "inhabited",
+      "carries": [],
+      "signed": false,
+      "table": "realtime_push"
+    },
+    {
+      "surface": "realtime_event",
+      "path": "deviceId",
+      "bits": "inhabited",
+      "carries": [
+        "recipient_device",
+        "recipient_user"
+      ],
+      "signed": false,
+      "table": "realtime_push"
+    },
+    {
+      "surface": "realtime_event",
+      "path": "seq",
+      "bits": "inhabited",
+      "carries": [],
+      "signed": false,
+      "table": "realtime_push"
+    },
+    {
+      "surface": "realtime_event",
+      "path": "record",
+      "bits": "inhabited",
+      "carries": [
+        "attachment_file_name",
+        "message_nonce",
+        "recipient_device",
+        "recipient_user",
+        "sender_device",
+        "sender_user"
+      ],
+      "signed": false,
+      "table": "realtime_push",
+      "note": "The full InboxRecord, so every envelope-header leak is pushed over the socket too."
+    },
+    {
+      "surface": "realtime_event",
+      "path": "senderUserId",
+      "bits": "inhabited",
+      "carries": [
+        "sender_user"
+      ],
+      "signed": false,
+      "table": "sender_identity"
+    },
+    {
+      "surface": "realtime_event",
+      "path": "requestId",
+      "bits": "inhabited",
+      "carries": [
+        "sender_user"
+      ],
+      "signed": false,
+      "table": "sender_identity",
+      "note": "requestId is request:{senderUserId}."
+    },
+    {
+      "surface": "realtime_event",
+      "path": "change",
+      "bits": "inhabited",
+      "carries": [],
+      "signed": false,
+      "table": "realtime_push"
+    }
+  ],
+  "protectedFields": [
+    {
+      "field": "version",
+      "visibility": "duplicated_in_header"
+    },
+    {
+      "field": "app_message_id",
+      "visibility": "duplicated_in_header",
+      "note": "app:{conversation_id}:{nonce}:{sender_device_id} - every component is already in the cleartext header."
+    },
+    {
+      "field": "conversation_id",
+      "visibility": "duplicated_in_header"
+    },
+    {
+      "field": "sender_user_id",
+      "visibility": "duplicated_in_header"
+    },
+    {
+      "field": "sender_device_id",
+      "visibility": "duplicated_in_header"
+    },
+    {
+      "field": "recipient_user_id",
+      "visibility": "duplicated_in_header",
+      "note": "Transitively: the header carries recipient_device_id, and a device id is format!(\"device:{user_fp}:{device_fp}\"), so it already names the user."
+    },
+    {
+      "field": "audience_device_ids",
+      "visibility": "confidential",
+      "note": "Fan-out width is deliberately hidden; the header names one recipient device."
+    },
+    {
+      "field": "payload_kind",
+      "visibility": "confidential"
+    },
+    {
+      "field": "body",
+      "visibility": "confidential"
+    }
+  ],
+  "notEnumerated": {
+    "group": {
+      "reason": "Group chat is outside the package scope of the write-up.",
+      "types": [
+        "AppendGroupEnvelopeRequest",
+        "AppendGroupEnvelopeResult",
+        "AppendGroupTransitionRequest",
+        "AppendGroupTransitionResult",
+        "ClaimGroupJoinRequest",
+        "ClaimGroupJoinResult",
+        "ClaimGroupLeaveRequest",
+        "ClaimGroupLeaveResult",
+        "CompleteGroupJoinRequest",
+        "CompleteGroupJoinResult",
+        "CreateGroupInviteRequest",
+        "CreateGroupInviteResult",
+        "DecideGroupJoinRequest",
+        "DecideGroupJoinResult",
+        "FetchGroupInviteRequest",
+        "FetchGroupInviteResult",
+        "FetchGroupOutboxRequest",
+        "FetchGroupOutboxResult",
+        "GetGroupAuthorizationStateRequest",
+        "GetGroupAuthorizationStateResult",
+        "GetGroupJoinRequestStatusRequest",
+        "GetGroupJoinRequestStatusResult",
+        "GetGroupOutboxHeadRequest",
+        "GetGroupOutboxHeadResult",
+        "GroupAuthorizationPhase",
+        "GroupAuthorizationUpdate",
+        "GroupCapability",
+        "GroupCapabilityOperation",
+        "GroupCursor",
+        "GroupEnvelope",
+        "GroupEnvelopeVisibility",
+        "GroupInviteDocument",
+        "GroupInviteStatus",
+        "GroupInviteSummary",
+        "GroupInviteTokenPayload",
+        "GroupJoinDecision",
+        "GroupJoinPolicy",
+        "GroupJoinRequest",
+        "GroupJoinRequestStatus",
+        "GroupLeaveRequest",
+        "GroupLeaveRequestStatus",
+        "GroupManifest",
+        "GroupMember",
+        "GroupMemberDevice",
+        "GroupMemberInvitePolicy",
+        "GroupMemberStatus",
+        "GroupMembershipProof",
+        "GroupMessageType",
+        "GroupOutboxDescriptor",
+        "GroupOutboxRecord",
+        "GroupOutboxRecordState",
+        "GroupRealtimeSubscriptionRequest",
+        "GroupRole",
+        "GroupStateEvent",
+        "GroupStateEventKind",
+        "GroupTransitionOperation",
+        "GroupTransitionRequestBinding",
+        "InitializeGroupAuthorizationRequest",
+        "InitializeGroupAuthorizationResult",
+        "ListGroupInvitesRequest",
+        "ListGroupInvitesResult",
+        "ListGroupJoinRequestsRequest",
+        "ListGroupJoinRequestsResult",
+        "ListGroupLeaveRequestsRequest",
+        "ListGroupLeaveRequestsResult",
+        "RevokeGroupInviteRequest",
+        "RevokeGroupInviteResult",
+        "SealGroupOutboxRequest",
+        "SealGroupOutboxResult",
+        "SubmitGroupJoinRequest",
+        "SubmitGroupJoinResult",
+        "SubmitGroupLeaveRequest",
+        "SubmitGroupLeaveResult"
+      ]
+    },
+    "hostToClient": {
+      "reason": "Authored by the host; discloses nothing it did not have.",
+      "types": [
+        "AckResult",
+        "AppendDeliveryDisposition",
+        "AppendEnvelopeResult",
+        "FetchIdentityBundleResult",
+        "FetchMessageRequestsResult",
+        "FetchMessagesResult",
+        "FetchWelcomePickupResult",
+        "GetHeadResult",
+        "InboxRecord",
+        "InboxRecordState",
+        "MessageRequestActionResult",
+        "MessageRequestItem",
+        "MessageRequestRealtimeChange",
+        "PrepareBlobUploadResult",
+        "PutWelcomePickupResult"
+      ]
+    },
+    "deferred": {
+      "reason": "The identity-publication and runtime-auth surface. Real and host-visible, but a distinct surface that R3 does not touch; enumerating it is its own piece of work. Listed here so a NEW type still fails the partition guard.",
+      "types": [
+        "BlobDownloadRequest",
+        "BlobUploadRequest",
+        "CapabilityConstraints",
+        "CapabilityOperation",
+        "CapabilityService",
+        "DeploymentBundle",
+        "DeviceBinding",
+        "DeviceContactProfile",
+        "DeviceIdentity",
+        "DeviceRuntimeAuth",
+        "DeviceRuntimeRefreshChallenge",
+        "DeviceRuntimeRefreshProof",
+        "DeviceStatus",
+        "DeviceStatusDocument",
+        "DeviceStatusKind",
+        "DeviceStatusRecord",
+        "FetchAllowlistRequest",
+        "FetchIdentityBundleRequest",
+        "FetchMessageRequestsRequest",
+        "FetchWelcomePickupRequest",
+        "GetHeadRequest",
+        "IdentityBundle",
+        "InboxAppendCapability",
+        "KeyPackageRef",
+        "PublishSharedStateRequest",
+        "PutWelcomePickupRequest",
+        "RealtimeKind",
+        "RealtimeSubscriptionRequest",
+        "RuntimeConfig",
+        "SharedStateDocumentKind",
+        "StorageBaseInfo",
+        "StorageProfile",
+        "UserIdentity",
+        "WelcomePickupDescriptor"
+      ]
+    },
+    "localOnly": {
+      "reason": "Never serialized to a host. ProtectedAppMessage is covered separately by protectedFields.",
+      "types": [
+        "Conversation",
+        "ConversationKind",
+        "ConversationMember",
+        "ConversationState",
+        "MlsStateStatus",
+        "MlsStateSummary",
+        "ModelModule",
+        "ProtectedAppMessage",
+        "ProtectedPayloadKind",
+        "SyncCheckpoint"
+      ]
+    }
+  }
+}

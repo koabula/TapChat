@@ -3,6 +3,7 @@ import {
   type PrepareBlobUploadResult
 } from "../types/contracts";
 import type { BinaryBlobStore, BlobByteRange } from "../types/runtime";
+import { R2_KEYS } from "../leakage-keys";
 import { HttpError } from "../auth/capability";
 import { signSharingPayload, verifySharingPayload } from "./sharing";
 
@@ -13,10 +14,6 @@ const SHORT_BLOB_TOKEN_TTL_MS = 15 * 60 * 1000;
 const CAPABILITY_METADATA_KEY = "read-capability-sha256";
 const DELETE_CAPABILITY_METADATA_KEY = "delete-capability-sha256";
 const BLOB_EXPIRY_METADATA_KEY = "blob-expires-at";
-
-function sanitizeSegment(value: string): string {
-  return value.replace(/[^a-zA-Z0-9:_-]/g, "_");
-}
 
 function requireNonEmpty(value: string | undefined, field: string): string {
   if (!value || value.trim().length === 0) {
@@ -80,16 +77,16 @@ export class StorageService {
     if (storageScope === "group" && (!input.groupId || input.groupId.trim().length === 0)) {
       throw new HttpError(400, "invalid_input", "groupId is required for group storage");
     }
-    const blobKey = [
-      "blobs",
-      input.variant,
-      sanitizeSegment(owner.userId),
-      sanitizeSegment(owner.deviceId),
+    const blobKey = R2_KEYS.blob({
+      variant: input.variant,
+      ownerUserId: owner.userId,
+      ownerDeviceId: owner.deviceId,
       storageScope,
-      storageScope === "group" ? sanitizeSegment(input.groupId!) : "direct",
-      sanitizeSegment(conversationId),
-      `${sanitizeSegment(messageId)}-${sanitizeSegment(taskId)}`
-    ].join("/");
+      groupSegment: storageScope === "group" ? input.groupId! : "direct",
+      conversationId,
+      messageId,
+      taskId
+    });
     const uploadExpiresAt = now + SHORT_BLOB_TOKEN_TTL_MS;
     const blobExpiresAt = now + this.retentionMs;
     const readCapability = randomCapability();

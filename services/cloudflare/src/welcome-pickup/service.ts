@@ -1,3 +1,4 @@
+import { R2_KEYS } from "../leakage-keys";
 import { HttpError } from "../auth/capability";
 import type {
   FetchWelcomePickupResult,
@@ -14,7 +15,7 @@ interface StoredWelcomePickup {
 }
 
 function pickupKey(groupId: string, deviceId: string, requestId?: string): string {
-  return `welcome-pickup/${groupId}/${deviceId}/${requestId ?? "unbound"}.json`;
+  return R2_KEYS.welcomePickup(groupId, deviceId, requestId);
 }
 
 export class WelcomePickupService {

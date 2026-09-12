@@ -1,5 +1,5 @@
 mod attachments;
-mod engine;
+pub(crate) mod engine;
 mod groups;
 mod recovery;
 mod sync;

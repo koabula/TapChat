@@ -1,3 +1,4 @@
+import { R2_KEYS } from "../leakage-keys";
 import { HttpError } from "../auth/capability";
 import type {
   DeviceListDocument,
@@ -5,10 +6,6 @@ import type {
   IdentityBundle
 } from "../types/contracts";
 import type { JsonBlobStore } from "../types/runtime";
-
-function sanitizeSegment(value: string): string {
-  return value.replace(/[^a-zA-Z0-9:_-]/g, "_");
-}
 
 export class SharedStateService {
   private readonly store: JsonBlobStore;
@@ -20,15 +17,15 @@ export class SharedStateService {
   }
 
   identityBundleKey(userId: string): string {
-    return `shared-state/${sanitizeSegment(userId)}/identity_bundle.json`;
+    return R2_KEYS.sharedStateIdentityBundle(userId);
   }
 
   deviceListKey(userId: string): string {
-    return `shared-state/${sanitizeSegment(userId)}/device_list.json`;
+    return R2_KEYS.sharedStateDeviceList(userId);
   }
 
   deviceStatusKey(userId: string): string {
-    return `shared-state/${sanitizeSegment(userId)}/device_status.json`;
+    return R2_KEYS.sharedStateDeviceStatus(userId);
   }
 
   identityBundleUrl(userId: string): string {
