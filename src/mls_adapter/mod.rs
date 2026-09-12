@@ -9,7 +9,7 @@ use serde::{Deserialize as SerdeDeserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::error::{CoreError, CoreResult};
-use crate::identity::LocalIdentityState;
+use crate::identity::{parse_verifying_key, LocalIdentityState};
 use crate::log_sanitize::redact_id;
 use crate::model::{MessageType, MlsStateStatus, MlsStateSummary};
 
@@ -91,12 +91,24 @@ pub fn key_package_rotation_jitter_ms(device_id: &str) -> u64 {
     sample % (KEY_PACKAGE_ROTATION_JITTER_MAX_MS + 1)
 }
 
+/// A peer device's KeyPackage together with the identity the caller's own
+/// contact state assigns to it. The KeyPackage is admitted only if its leaf
+/// signature key equals `device_public_key` (see
+/// [`verify_key_package_is_peer_device`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerDeviceKeyPackage {
     pub user_id: String,
     pub device_id: String,
     pub device_public_key: String,
     pub key_package_b64: String,
+}
+
+/// The device a Welcome must have been authored by, as the receiver's own
+/// contact state names it — never as the Welcome or its envelope claims.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WelcomeAuthor {
+    pub device_id: String,
+    pub device_public_key: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -713,10 +725,7 @@ impl MlsAdapter {
         local_identity: &LocalIdentityState,
     ) -> CoreResult<(Self, PublishedKeyPackage)> {
         let provider = OpenMlsRustCrypto::default();
-        let signer =
-            SignatureKeyPair::new(DEFAULT_CIPHERSUITE.signature_algorithm()).map_err(|error| {
-                CoreError::invalid_state(format!("failed to create MLS signer: {error}"))
-            })?;
+        let signer = device_signer(local_identity);
         signer.store(provider.storage()).map_err(|error| {
             CoreError::invalid_state(format!("failed to store MLS signer: {error}"))
         })?;
@@ -727,7 +736,6 @@ impl MlsAdapter {
             credential: credential.into(),
             signature_key: signer.to_public_vec().into(),
         };
-        let credential_identity = build_credential_identity(local_identity);
         let package = Self::build_published_key_package(
             &provider,
             &signer,
@@ -753,10 +761,7 @@ impl MlsAdapter {
         now: u64,
     ) -> CoreResult<PublishedKeyPackage> {
         let provider = OpenMlsRustCrypto::default();
-        let signer =
-            SignatureKeyPair::new(DEFAULT_CIPHERSUITE.signature_algorithm()).map_err(|error| {
-                CoreError::invalid_state(format!("failed to generate MLS signer: {error}"))
-            })?;
+        let signer = device_signer(local_identity);
         signer.store(provider.storage()).map_err(|error| {
             CoreError::invalid_state(format!("failed to store MLS signer: {error}"))
         })?;
@@ -828,6 +833,16 @@ impl MlsAdapter {
             ));
         }
 
+        // Admit every KeyPackage before anything is written, so a rejected
+        // peer leaves the adapter untouched.
+        let key_packages = decode_peer_key_packages(peer_devices_with_keypackages)?;
+        let mut member_device_ids = BTreeSet::from([self.local_device_id.clone()]);
+        member_device_ids.extend(
+            peer_devices_with_keypackages
+                .iter()
+                .map(|peer| peer.device_id.clone()),
+        );
+
         let group_id = GroupId::from_slice(conversation_id.as_bytes());
         self.delete_stale_persisted_group(&group_id)?;
         // max_past_epochs(1): tolerate one epoch of reordering/late delivery.
@@ -848,16 +863,6 @@ impl MlsAdapter {
         .map_err(|error| {
             CoreError::invalid_state(format!("failed to create MLS group: {error}"))
         })?;
-
-        let mut member_device_ids = BTreeSet::from([self.local_device_id.clone()]);
-        let mut key_packages = Vec::with_capacity(peer_devices_with_keypackages.len());
-        for peer in peer_devices_with_keypackages {
-            if peer.device_id.trim().is_empty() {
-                return Err(CoreError::invalid_input("peer device_id must not be empty"));
-            }
-            member_device_ids.insert(peer.device_id.clone());
-            key_packages.push(decode_key_package(&peer.key_package_b64)?);
-        }
 
         let (commit, welcome, _group_info) = group
             .add_members(&self.provider, &self.signer, &key_packages)
@@ -948,18 +953,11 @@ impl MlsAdapter {
                 "peer_devices_with_keypackages must not be empty",
             ));
         }
+        let key_packages = decode_peer_key_packages(peer_devices_with_keypackages)?;
         let state = self
             .groups
             .get_mut(conversation_id)
             .ok_or_else(|| CoreError::invalid_input("conversation MLS state does not exist"))?;
-
-        let mut key_packages = Vec::with_capacity(peer_devices_with_keypackages.len());
-        for peer in peer_devices_with_keypackages {
-            if peer.device_id.trim().is_empty() {
-                return Err(CoreError::invalid_input("peer device_id must not be empty"));
-            }
-            key_packages.push(decode_key_package(&peer.key_package_b64)?);
-        }
 
         let (commit, welcome, _group_info) = state
             .group
@@ -1345,28 +1343,27 @@ impl MlsAdapter {
             .member_device_ids)
     }
 
+    /// Ingest a commit, proposal or application message for a conversation
+    /// this device is already a member of. The sender needs no naming here:
+    /// MLS authenticates the frame against the leaf that was admitted when
+    /// the group was created or joined. Welcomes are the one place where a
+    /// leaf is admitted, and go through [`Self::ingest_welcome`].
     pub fn ingest_message(
         &mut self,
         conversation_id: &str,
-        sender_device_id: &str,
         message_type: MessageType,
         payload_b64: &str,
     ) -> CoreResult<IngestResult> {
         match message_type {
-            MessageType::MlsWelcome => {
-                self.ingest_welcome(conversation_id, sender_device_id, payload_b64)
-            }
             MessageType::MlsCommit | MessageType::MlsApplication | MessageType::MlsProposal => {
                 if !self.groups.contains_key(conversation_id) {
                     return Ok(IngestResult::Deferred(DeferReason::NoLocalGroup));
                 }
-                self.ingest_protocol_message(
-                    conversation_id,
-                    sender_device_id,
-                    message_type,
-                    payload_b64,
-                )
+                self.ingest_protocol_message(conversation_id, message_type, payload_b64)
             }
+            MessageType::MlsWelcome => Err(CoreError::unsupported(
+                "welcomes name a trusted author and go through ingest_welcome",
+            )),
             _ => Err(CoreError::unsupported(
                 "mls adapter only supports MLS message types",
             )),
@@ -1923,10 +1920,10 @@ impl MlsAdapter {
     ///
     /// On any rejection the fork is dropped and the live adapter is unchanged,
     /// bit for bit — which is what `state_fingerprint()` asserts in the tests.
-    fn ingest_welcome(
+    pub fn ingest_welcome(
         &mut self,
         conversation_id: &str,
-        sender_device_id: &str,
+        author: &WelcomeAuthor,
         payload_b64: &str,
     ) -> CoreResult<IngestResult> {
         let Some(welcome) = decode_welcome_body(payload_b64) else {
@@ -1973,9 +1970,13 @@ impl MlsAdapter {
             return Ok(IngestResult::Rejected(RejectReason::Malformed));
         }
 
-        // Bind the Welcome's author to the envelope's sender, so a third party
-        // who fetched our published KeyPackage cannot hand us a group that we
-        // would then treat as this conversation.
+        // Bind the Welcome's author to the device our own contact state
+        // names. The GroupInfo inside the Welcome is signed by the author's
+        // leaf key, and a leaf key is a device key (`device_signer`), so
+        // equality here is what makes the Welcome authenticated rather than
+        // merely well-formed: a third party who fetched our published
+        // KeyPackage cannot hand us a group we would treat as this
+        // conversation.
         let Ok(welcome_sender) = staged.welcome_sender() else {
             log::warn!(
                 "ingest_welcome: welcome has no resolvable sender leaf for conversation {}",
@@ -1983,10 +1984,13 @@ impl MlsAdapter {
             );
             return Ok(IngestResult::Rejected(RejectReason::Malformed));
         };
-        let author = extract_sender_identity(welcome_sender.credential())?;
-        if credential_device_id(&author).as_deref() != Some(sender_device_id) {
+        let expected_key = parse_verifying_key(&author.device_public_key)?;
+        let author_identity = extract_sender_identity(welcome_sender.credential())?;
+        if welcome_sender.signature_key().as_slice() != expected_key.as_bytes().as_slice()
+            || credential_device_id(&author_identity).as_deref() != Some(author.device_id.as_str())
+        {
             log::warn!(
-                "ingest_welcome: welcome author is not the envelope sender for conversation {}",
+                "ingest_welcome: welcome author is not the trusted device for conversation {}",
                 redact_id("conversation", conversation_id)
             );
             return Ok(IngestResult::Rejected(RejectReason::Malformed));
@@ -2041,7 +2045,6 @@ impl MlsAdapter {
     fn ingest_protocol_message(
         &mut self,
         conversation_id: &str,
-        _sender_device_id: &str,
         message_type: MessageType,
         payload_b64: &str,
     ) -> CoreResult<IngestResult> {
@@ -2267,14 +2270,78 @@ fn current_unix_time_ms() -> CoreResult<u64> {
         .map_err(|_| CoreError::invalid_state("system clock is before the Unix epoch"))
 }
 
+/// The MLS leaf signature key *is* the device key.
+///
+/// This is the link that chains an MLS leaf to an identity: the share link
+/// pins the root key, the root key signs the device binding, and the device
+/// key now signs every KeyPackage, Welcome and commit. A KeyPackage served by
+/// a runtime is therefore admitted on the strength of that chain
+/// (`verify_key_package_is_peer_device`) rather than on the runtime's word.
+/// MLS signs under `SignWithLabel`, which keeps its signatures apart from the
+/// other payloads the device key signs.
+fn device_signer(local_identity: &LocalIdentityState) -> SignatureKeyPair {
+    SignatureKeyPair::from_raw(
+        DEFAULT_CIPHERSUITE.signature_algorithm(),
+        local_identity.device_signing_key_bytes().to_vec(),
+        local_identity
+            .device_signing_key()
+            .verifying_key()
+            .to_bytes()
+            .to_vec(),
+    )
+}
+
+/// `user_id|device_id`. The credential names the leaf; it proves nothing.
+/// Trust in a leaf comes from its signature key being a device key the
+/// verifier's own contact state vouches for.
 fn build_credential_identity(local_identity: &LocalIdentityState) -> String {
     format!(
-        "{}|{}|{}|{}",
-        local_identity.user_identity.user_id,
-        local_identity.device_identity.device_id,
-        local_identity.device_identity.device_public_key,
-        local_identity.device_identity.binding.signature,
+        "{}|{}",
+        local_identity.user_identity.user_id, local_identity.device_identity.device_id,
     )
+}
+
+fn peer_credential_identity(peer: &PeerDeviceKeyPackage) -> String {
+    format!("{}|{}", peer.user_id, peer.device_id)
+}
+
+/// Admit a KeyPackage only if its leaf signature key is the device key the
+/// peer's root-signed bundle names. `decode_key_package` has already checked
+/// the KeyPackage's own signature, so equality means the device key signed
+/// it. Without this the runtime that serves the KeyPackage could substitute
+/// one of its own and join the conversation in the peer's place, and the
+/// safety number — which covers root keys only — would not notice.
+fn verify_key_package_is_peer_device(
+    peer: &PeerDeviceKeyPackage,
+    key_package: &KeyPackage,
+) -> CoreResult<()> {
+    let expected_key = parse_verifying_key(&peer.device_public_key)?;
+    let leaf = key_package.leaf_node();
+    if leaf.signature_key().as_slice() != expected_key.as_bytes().as_slice() {
+        return Err(CoreError::invalid_input(
+            "key package is not signed by the peer's device key",
+        ));
+    }
+    if extract_sender_identity(leaf.credential())? != peer_credential_identity(peer) {
+        return Err(CoreError::invalid_input(
+            "key package credential does not name the peer device",
+        ));
+    }
+    Ok(())
+}
+
+fn decode_peer_key_packages(peers: &[PeerDeviceKeyPackage]) -> CoreResult<Vec<KeyPackage>> {
+    peers
+        .iter()
+        .map(|peer| {
+            if peer.device_id.trim().is_empty() {
+                return Err(CoreError::invalid_input("peer device_id must not be empty"));
+            }
+            let key_package = decode_key_package(&peer.key_package_b64)?;
+            verify_key_package_is_peer_device(peer, &key_package)?;
+            Ok(key_package)
+        })
+        .collect()
 }
 
 fn is_member_self_update(proposal: &QueuedProposal) -> bool {
@@ -2402,11 +2469,10 @@ fn decode_welcome_body(payload_b64: &str) -> Option<Welcome> {
 
 /// The device id field of an MLS credential identity.
 ///
-/// Identities are built by `build_credential_identity` as
-/// `user_id|device_id|device_public_key|binding_signature`.
+/// Identities are built by `build_credential_identity` as `user_id|device_id`.
 fn credential_device_id(identity: &str) -> Option<String> {
     let parts: Vec<&str> = identity.split('|').collect();
-    if parts.len() != 4 {
+    if parts.len() != 2 {
         return None;
     }
     parts.get(1).map(|device_id| device_id.to_string())
@@ -2471,23 +2537,97 @@ pub fn validate_published_key_package_lifetime(
 #[cfg(test)]
 mod tests {
     use super::{
-        key_package_rotation_jitter_ms, validate_published_key_package_lifetime, IngestResult,
-        MlsAdapter, MlsAdapterModule, PeerDeviceKeyPackage, PublishedKeyPackage,
-        RejectReason, KEY_PACKAGE_CLOCK_SKEW_MS, KEY_PACKAGE_LIFECYCLE_VERSION,
-        KEY_PACKAGE_LIFETIME_MS, KEY_PACKAGE_ROTATION_WINDOW_MS, ONE_TIME_KEY_PACKAGE_POOL_TARGET,
+        decode_key_package, key_package_rotation_jitter_ms,
+        validate_published_key_package_lifetime, IngestResult, MlsAdapter, MlsAdapterModule,
+        PeerDeviceKeyPackage, PublishedKeyPackage, RejectReason, WelcomeAuthor,
+        KEY_PACKAGE_CLOCK_SKEW_MS, KEY_PACKAGE_LIFECYCLE_VERSION, KEY_PACKAGE_LIFETIME_MS,
+        KEY_PACKAGE_ROTATION_WINDOW_MS, ONE_TIME_KEY_PACKAGE_POOL_TARGET,
     };
-    use crate::identity::IdentityManager;
+    use crate::identity::{IdentityManager, LocalIdentityState};
     use crate::model::{MessageType, MlsStateStatus};
 
     const ALICE_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
     const BOB_MNEMONIC: &str =
         "legal winner thank year wave sausage worth useful legal winner thank yellow";
+    const MALLORY_MNEMONIC: &str =
+        "letter advice cage absurd amount doctor acoustic avoid letter advice cage above";
 
     fn test_now_ms() -> u64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("test clock")
             .as_millis() as u64
+    }
+
+    fn identity(mnemonic: &str) -> LocalIdentityState {
+        IdentityManager::create_or_recover(Some(mnemonic), Some("phone")).expect("identity")
+    }
+
+    /// The Welcome author as the receiver's contact state would name it.
+    fn author(identity: &LocalIdentityState) -> WelcomeAuthor {
+        WelcomeAuthor {
+            device_id: identity.device_identity.device_id.clone(),
+            device_public_key: identity.device_identity.device_public_key.clone(),
+        }
+    }
+
+    fn peer(identity: &LocalIdentityState, key_package_b64: String) -> PeerDeviceKeyPackage {
+        PeerDeviceKeyPackage {
+            user_id: identity.user_identity.user_id.clone(),
+            device_id: identity.device_identity.device_id.clone(),
+            device_public_key: identity.device_identity.device_public_key.clone(),
+            key_package_b64,
+        }
+    }
+
+    #[test]
+    fn published_key_packages_are_signed_by_the_device_key() {
+        // The leaf signature key is the device key: this is the link that
+        // chains an MLS leaf to the root key pinned by the share link.
+        let bob = identity(BOB_MNEMONIC);
+        let package = MlsAdapter::generate_key_package(&bob, test_now_ms()).expect("package");
+        let key_package = decode_key_package(&package.key_package_b64).expect("decode");
+        let device_key =
+            crate::identity::parse_verifying_key(&bob.device_identity.device_public_key)
+                .expect("device key");
+        assert_eq!(
+            key_package.leaf_node().signature_key().as_slice(),
+            device_key.as_bytes().as_slice()
+        );
+    }
+
+    #[test]
+    fn session_establishment_rejects_substituted_key_package() {
+        // The runtime that serves Bob's KeyPackage could hand Alice one of its
+        // own. Alice's contact state names Bob's device key, and a KeyPackage
+        // whose leaf is not signed by that key must not start a session — and
+        // must leave Alice's adapter untouched.
+        let alice = identity(ALICE_MNEMONIC);
+        let bob = identity(BOB_MNEMONIC);
+        let mallory = identity(MALLORY_MNEMONIC);
+        let (mut alice_adapter, _) = MlsAdapter::bootstrap(&alice).expect("alice adapter");
+        let substituted =
+            MlsAdapter::generate_key_package(&mallory, test_now_ms()).expect("mallory package");
+        let before = alice_adapter.state_fingerprint().expect("fingerprint");
+
+        let result = alice_adapter
+            .create_conversation("conv:alice:bob", &[peer(&bob, substituted.key_package_b64)]);
+
+        assert!(
+            result.is_err(),
+            "a substituted key package must not be admitted"
+        );
+        assert_eq!(
+            alice_adapter.state_fingerprint().expect("fingerprint"),
+            before
+        );
+        assert!(!alice_adapter.has_conversation("conv:alice:bob"));
+
+        // Control: Bob's own KeyPackage is admitted.
+        let (_, bob_package) = MlsAdapter::bootstrap(&bob).expect("bob adapter");
+        alice_adapter
+            .create_conversation("conv:alice:bob", &[peer(&bob, bob_package.key_package_b64)])
+            .expect("genuine key package");
     }
 
     #[test]
@@ -2620,10 +2760,9 @@ mod tests {
             .expect("create conversation");
 
         let welcome_result = bob_adapter
-            .ingest_message(
+            .ingest_welcome(
                 "conv:alice:bob",
-                &alice_identity.device_identity.device_id,
-                MessageType::MlsWelcome,
+                &author(&alice_identity),
                 &artifacts.welcomes[0].payload_b64,
             )
             .expect("welcome");
@@ -2635,7 +2774,6 @@ mod tests {
         let commit_result = bob_adapter
             .ingest_message(
                 "conv:alice:bob",
-                &alice_identity.device_identity.device_id,
                 MessageType::MlsCommit,
                 &artifacts.commit_b64,
             )
@@ -2648,7 +2786,6 @@ mod tests {
         let received = bob_adapter
             .ingest_message(
                 "conv:alice:bob",
-                &alice_identity.device_identity.device_id,
                 MessageType::MlsApplication,
                 &outbound.payload_b64,
             )
@@ -2685,17 +2822,15 @@ mod tests {
             .expect("create conversation");
 
         bob_adapter
-            .ingest_message(
+            .ingest_welcome(
                 "conv:alice:bob",
-                &alice_identity.device_identity.device_id,
-                MessageType::MlsWelcome,
+                &author(&alice_identity),
                 &artifacts.welcomes[0].payload_b64,
             )
             .expect("welcome");
         let _ = bob_adapter
             .ingest_message(
                 "conv:alice:bob",
-                &alice_identity.device_identity.device_id,
                 MessageType::MlsCommit,
                 &artifacts.commit_b64,
             )
@@ -2707,7 +2842,6 @@ mod tests {
         let first = bob_adapter
             .ingest_message(
                 "conv:alice:bob",
-                &alice_identity.device_identity.device_id,
                 MessageType::MlsApplication,
                 &outbound.payload_b64,
             )
@@ -2717,7 +2851,6 @@ mod tests {
         let replay = bob_adapter
             .ingest_message(
                 "conv:alice:bob",
-                &alice_identity.device_identity.device_id,
                 MessageType::MlsApplication,
                 &outbound.payload_b64,
             )
@@ -2797,17 +2930,15 @@ mod tests {
             .expect("create conversation");
 
         bob_adapter
-            .ingest_message(
+            .ingest_welcome(
                 "conv:alice:bob",
-                &alice_identity.device_identity.device_id,
-                MessageType::MlsWelcome,
+                &author(&alice_identity),
                 &artifacts.welcomes[0].payload_b64,
             )
             .expect("welcome");
         let _ = bob_adapter
             .ingest_message(
                 "conv:alice:bob",
-                &alice_identity.device_identity.device_id,
                 MessageType::MlsCommit,
                 &artifacts.commit_b64,
             )
@@ -2834,7 +2965,6 @@ mod tests {
         let received = restored_bob
             .ingest_message(
                 "conv:alice:bob",
-                &alice_identity.device_identity.device_id,
                 MessageType::MlsApplication,
                 &outbound.payload_b64,
             )
@@ -2876,10 +3006,9 @@ mod tests {
         let mut restored_bob =
             MlsAdapter::restore_from_bootstrap_state(&bootstrap_state).expect("restore");
         let welcome_result = restored_bob
-            .ingest_message(
+            .ingest_welcome(
                 "conv:alice:bob",
-                &alice_identity.device_identity.device_id,
-                MessageType::MlsWelcome,
+                &author(&alice_identity),
                 &artifacts.welcomes[0].payload_b64,
             )
             .expect("welcome");
@@ -2946,17 +3075,15 @@ mod tests {
             )
             .expect("create conversation");
         bob_adapter
-            .ingest_message(
+            .ingest_welcome(
                 "conv:alice:bob",
-                &alice_identity.device_identity.device_id,
-                MessageType::MlsWelcome,
+                &author(&alice_identity),
                 &artifacts.welcomes[0].payload_b64,
             )
             .expect("welcome");
         let _ = bob_adapter
             .ingest_message(
                 "conv:alice:bob",
-                &alice_identity.device_identity.device_id,
                 MessageType::MlsCommit,
                 &artifacts.commit_b64,
             )
@@ -3022,7 +3149,6 @@ mod tests {
         alice
             .ingest_message(
                 "conv:alice:bob",
-                &bob.local_device_id,
                 MessageType::MlsProposal,
                 &proposal.payload_b64,
             )
@@ -3054,7 +3180,6 @@ mod tests {
         alice
             .ingest_message(
                 "conv:alice:bob",
-                &bob.local_device_id,
                 MessageType::MlsProposal,
                 &proposal.payload_b64,
             )
@@ -3067,7 +3192,7 @@ mod tests {
 
     /// Alice creates a conversation for Bob and returns the welcome Bob is
     /// supposed to receive, plus Bob's untouched adapter.
-    fn welcome_for_bob() -> (MlsAdapter, String, crate::identity::LocalIdentityState) {
+    fn welcome_for_bob() -> (MlsAdapter, String, LocalIdentityState, LocalIdentityState) {
         let alice_identity =
             IdentityManager::create_or_recover(Some(ALICE_MNEMONIC), Some("phone")).expect("alice");
         let bob_identity =
@@ -3089,6 +3214,7 @@ mod tests {
             bob_adapter,
             artifacts.welcomes[0].payload_b64.clone(),
             alice_identity,
+            bob_identity,
         )
     }
 
@@ -3097,16 +3223,11 @@ mod tests {
         // Replaying a legitimate welcome under a different conversation id
         // used to install that group under the claimed id — destroying
         // whatever live group the claimed id already had.
-        let (mut bob, welcome, alice_identity) = welcome_for_bob();
+        let (mut bob, welcome, alice_identity, _) = welcome_for_bob();
         let before = bob.state_fingerprint().expect("fingerprint");
 
         let verdict = bob
-            .ingest_message(
-                "conv:alice:mallory",
-                &alice_identity.device_identity.device_id,
-                MessageType::MlsWelcome,
-                &welcome,
-            )
+            .ingest_welcome("conv:alice:mallory", &author(&alice_identity), &welcome)
             .expect("a mismatched welcome is discarded, not an error");
 
         assert!(matches!(verdict, IngestResult::Rejected(_)), "{verdict:?}");
@@ -3115,37 +3236,39 @@ mod tests {
     }
 
     #[test]
-    fn welcome_from_an_unexpected_sender_leaves_no_trace() {
-        let (mut bob, welcome, _) = welcome_for_bob();
+    fn welcome_from_a_device_other_than_the_trusted_author_leaves_no_trace() {
+        // Bob's contact state says this conversation's Welcome must come from
+        // Mallory's device; the Welcome was authored by Alice's. The leaf key
+        // comparison — not the envelope, not the credential string — is what
+        // rejects it.
+        let (mut bob, welcome, alice_identity, _) = welcome_for_bob();
+        let mallory = identity(MALLORY_MNEMONIC);
         let before = bob.state_fingerprint().expect("fingerprint");
 
+        let mut wrong_key = author(&alice_identity);
+        wrong_key.device_public_key = mallory.device_identity.device_public_key.clone();
         let verdict = bob
-            .ingest_message(
-                "conv:alice:bob",
-                "device:mallory:phone",
-                MessageType::MlsWelcome,
-                &welcome,
-            )
-            .expect("a sender-mismatched welcome is discarded, not an error");
-
+            .ingest_welcome("conv:alice:bob", &wrong_key, &welcome)
+            .expect("an author-mismatched welcome is discarded, not an error");
         assert!(matches!(verdict, IngestResult::Rejected(_)), "{verdict:?}");
+
+        let verdict = bob
+            .ingest_welcome("conv:alice:bob", &author(&mallory), &welcome)
+            .expect("an author-mismatched welcome is discarded, not an error");
+        assert!(matches!(verdict, IngestResult::Rejected(_)), "{verdict:?}");
+
         assert_eq!(bob.state_fingerprint().expect("fingerprint"), before);
         assert!(!bob.has_conversation("conv:alice:bob"));
     }
 
     #[test]
     fn undecodable_welcome_leaves_no_trace() {
-        let (mut bob, _, alice_identity) = welcome_for_bob();
+        let (mut bob, _, alice_identity, _) = welcome_for_bob();
         let before = bob.state_fingerprint().expect("fingerprint");
 
         for payload in ["!!!not base64!!!", "aGVsbG8gd29ybGQ="] {
             let verdict = bob
-                .ingest_message(
-                    "conv:alice:bob",
-                    &alice_identity.device_identity.device_id,
-                    MessageType::MlsWelcome,
-                    payload,
-                )
+                .ingest_welcome("conv:alice:bob", &author(&alice_identity), payload)
                 .expect("an undecodable welcome is discarded, not an error");
             assert!(matches!(verdict, IngestResult::Rejected(_)), "{verdict:?}");
         }
@@ -3160,15 +3283,10 @@ mod tests {
         // rejected. Anyone can read our published KeyPackage hash refs, so
         // without the fork this drains the one-time pool for free — and the
         // legitimate welcome that follows can no longer be joined.
-        let (mut bob, welcome, alice_identity) = welcome_for_bob();
+        let (mut bob, welcome, alice_identity, _) = welcome_for_bob();
 
         let rejected = bob
-            .ingest_message(
-                "conv:alice:mallory",
-                &alice_identity.device_identity.device_id,
-                MessageType::MlsWelcome,
-                &welcome,
-            )
+            .ingest_welcome("conv:alice:mallory", &author(&alice_identity), &welcome)
             .expect("rejected welcome");
         assert!(
             matches!(rejected, IngestResult::Rejected(_)),
@@ -3177,12 +3295,7 @@ mod tests {
 
         // The KeyPackage must have survived, so the real welcome still joins.
         let accepted = bob
-            .ingest_message(
-                "conv:alice:bob",
-                &alice_identity.device_identity.device_id,
-                MessageType::MlsWelcome,
-                &welcome,
-            )
+            .ingest_welcome("conv:alice:bob", &author(&alice_identity), &welcome)
             .expect("legitimate welcome");
         assert!(
             matches!(accepted, IngestResult::AppliedWelcome { .. }),
@@ -3194,22 +3307,15 @@ mod tests {
     fn legitimate_welcome_still_replaces_a_live_group() {
         // The fork must not break rebuild: the peer receiving a rebuild
         // welcome still holds a live group under the same conversation id.
-        let (mut bob, welcome, alice_identity) = welcome_for_bob();
-        bob.ingest_message(
-            "conv:alice:bob",
-            &alice_identity.device_identity.device_id,
-            MessageType::MlsWelcome,
-            &welcome,
-        )
-        .expect("first join");
+        let (mut bob, welcome, alice_identity, bob_identity) = welcome_for_bob();
+        bob.ingest_welcome("conv:alice:bob", &author(&alice_identity), &welcome)
+            .expect("first join");
         let first_epoch = bob
             .export_group_summary("conv:alice:bob")
             .expect("summary")
             .epoch;
 
         // Alice rebuilds the conversation from scratch and re-welcomes Bob.
-        let bob_identity =
-            IdentityManager::create_or_recover(Some(BOB_MNEMONIC), Some("phone")).expect("bob");
         // Must be minted by Bob's own adapter: the private init key has to land
         // in Bob's provider storage, or the welcome is simply not for him.
         let fresh_package = bob.rotate_key_package(test_now_ms()).expect("package");
@@ -3217,20 +3323,14 @@ mod tests {
         let rebuilt = alice_adapter
             .create_conversation(
                 "conv:alice:bob",
-                &[PeerDeviceKeyPackage {
-                    user_id: bob_identity.user_identity.user_id.clone(),
-                    device_id: bob_identity.device_identity.device_id.clone(),
-                    device_public_key: bob_identity.device_identity.device_public_key.clone(),
-                    key_package_b64: fresh_package.key_package_b64,
-                }],
+                &[peer(&bob_identity, fresh_package.key_package_b64)],
             )
             .expect("rebuild conversation");
 
         let verdict = bob
-            .ingest_message(
+            .ingest_welcome(
                 "conv:alice:bob",
-                &alice_identity.device_identity.device_id,
-                MessageType::MlsWelcome,
+                &author(&alice_identity),
                 &rebuilt.welcomes[0].payload_b64,
             )
             .expect("rebuild welcome");
@@ -3250,7 +3350,7 @@ mod tests {
         // (framing/private_message_in.rs:136), so a byte-flipped ciphertext
         // aborts the test process instead of returning `AeadError`. Release
         // builds classify it correctly; the assert is upstream's, not ours.
-        let (mut alice, _bob, _, bob_identity, _) = pair_adapters();
+        let (mut alice, _bob, _, _, _) = pair_adapters();
 
         // An independent conversation between the same two identities.
         let other_identity =
@@ -3276,12 +3376,7 @@ mod tests {
 
         let before = alice.state_fingerprint().expect("fingerprint");
         let verdict = alice
-            .ingest_message(
-                "conv:alice:bob",
-                &bob_identity.device_identity.device_id,
-                MessageType::MlsCommit,
-                &other.commit_b64,
-            )
+            .ingest_message("conv:alice:bob", MessageType::MlsCommit, &other.commit_b64)
             .expect("a foreign frame is discarded, not an error");
 
         // Which reject reason wins depends on which cheap check fires first
@@ -3301,7 +3396,7 @@ mod tests {
 
     #[test]
     fn undecodable_protocol_payload_leaves_no_trace() {
-        let (mut alice, _, _, bob_identity, _) = pair_adapters();
+        let (mut alice, _, _, _, _) = pair_adapters();
         let before = alice.state_fingerprint().expect("fingerprint");
 
         for message_type in [
@@ -3310,12 +3405,7 @@ mod tests {
             MessageType::MlsProposal,
         ] {
             let verdict = alice
-                .ingest_message(
-                    "conv:alice:bob",
-                    &bob_identity.device_identity.device_id,
-                    message_type,
-                    "!!!not base64!!!",
-                )
+                .ingest_message("conv:alice:bob", message_type, "!!!not base64!!!")
                 .expect("an undecodable payload is discarded, not an error");
             assert!(matches!(verdict, IngestResult::Rejected(_)), "{verdict:?}");
         }
@@ -3324,7 +3414,7 @@ mod tests {
 
     #[test]
     fn group_pcs_proposal_then_commit_advances_epoch() {
-        let (mut alice, mut bob, alice_identity, bob_identity, _) = pair_adapters();
+        let (mut alice, mut bob, _, _, _) = pair_adapters();
         let before = alice
             .export_group_summary("conv:alice:bob")
             .expect("summary")
@@ -3333,7 +3423,6 @@ mod tests {
         match alice
             .ingest_message(
                 "conv:alice:bob",
-                &bob_identity.device_identity.device_id,
                 MessageType::MlsProposal,
                 &proposal.payload_b64,
             )
@@ -3366,7 +3455,6 @@ mod tests {
         match bob
             .ingest_message(
                 "conv:alice:bob",
-                &alice_identity.device_identity.device_id,
                 MessageType::MlsCommit,
                 &commit.payload_b64,
             )
@@ -3382,7 +3470,6 @@ mod tests {
         match bob
             .ingest_message(
                 "conv:alice:bob",
-                &alice_identity.device_identity.device_id,
                 MessageType::MlsApplication,
                 &outbound.payload_b64,
             )
@@ -3397,7 +3484,7 @@ mod tests {
 
     #[test]
     fn group_pcs_rejects_remove_proposal_and_keeps_membership() {
-        let (mut alice, mut bob, alice_identity, bob_identity, _) = pair_adapters();
+        let (mut alice, mut bob, alice_identity, _, _) = pair_adapters();
         let members_before = alice
             .export_group_summary("conv:alice:bob")
             .expect("summary")
@@ -3408,7 +3495,6 @@ mod tests {
         match alice
             .ingest_message(
                 "conv:alice:bob",
-                &bob_identity.device_identity.device_id,
                 MessageType::MlsProposal,
                 &remove.payload_b64,
             )
@@ -3431,7 +3517,6 @@ mod tests {
         match bob
             .ingest_message(
                 "conv:alice:bob",
-                &alice_identity.device_identity.device_id,
                 MessageType::MlsCommit,
                 &commit.payload_b64,
             )
@@ -3447,7 +3532,6 @@ mod tests {
         match bob
             .ingest_message(
                 "conv:alice:bob",
-                &alice_identity.device_identity.device_id,
                 MessageType::MlsApplication,
                 &outbound.payload_b64,
             )
@@ -3462,7 +3546,7 @@ mod tests {
 
     #[test]
     fn group_pcs_restore_uses_own_empty_sidecar_not_stale_peer_snapshot() {
-        let (mut alice, mut bob, _, bob_identity, _) = pair_adapters();
+        let (mut alice, mut bob, _, _, _) = pair_adapters();
         alice
             .create_owner_conversation("conv:solo")
             .expect("solo conversation");
@@ -3470,7 +3554,6 @@ mod tests {
         match alice
             .ingest_message(
                 "conv:alice:bob",
-                &bob_identity.device_identity.device_id,
                 MessageType::MlsProposal,
                 &proposal.payload_b64,
             )
@@ -3509,14 +3592,13 @@ mod tests {
 
     #[test]
     fn group_pcs_retains_distinct_updates_per_epoch() {
-        let (mut alice, mut bob, alice_identity, bob_identity, _) = pair_adapters();
+        let (mut alice, mut bob, _, _, _) = pair_adapters();
         let first = bob
             .propose_self_update("conv:alice:bob")
             .expect("first propose");
         match alice
             .ingest_message(
                 "conv:alice:bob",
-                &bob_identity.device_identity.device_id,
                 MessageType::MlsProposal,
                 &first.payload_b64,
             )
@@ -3532,7 +3614,6 @@ mod tests {
         match alice
             .ingest_message(
                 "conv:alice:bob",
-                &bob_identity.device_identity.device_id,
                 MessageType::MlsProposal,
                 &second.payload_b64,
             )
@@ -3548,7 +3629,6 @@ mod tests {
         match bob
             .ingest_message(
                 "conv:alice:bob",
-                &alice_identity.device_identity.device_id,
                 MessageType::MlsCommit,
                 &commit.payload_b64,
             )
@@ -3564,7 +3644,6 @@ mod tests {
         match bob
             .ingest_message(
                 "conv:alice:bob",
-                &alice_identity.device_identity.device_id,
                 MessageType::MlsApplication,
                 &outbound.payload_b64,
             )
@@ -3579,14 +3658,13 @@ mod tests {
 
     #[test]
     fn group_pcs_commit_resolves_referenced_update_after_newer_proposal() {
-        let (mut alice, mut bob, alice_identity, bob_identity, _) = pair_adapters();
+        let (mut alice, mut bob, _, _, _) = pair_adapters();
         let first = bob
             .propose_self_update("conv:alice:bob")
             .expect("first propose");
         match alice
             .ingest_message(
                 "conv:alice:bob",
-                &bob_identity.device_identity.device_id,
                 MessageType::MlsProposal,
                 &first.payload_b64,
             )
@@ -3609,7 +3687,6 @@ mod tests {
         match bob
             .ingest_message(
                 "conv:alice:bob",
-                &alice_identity.device_identity.device_id,
                 MessageType::MlsCommit,
                 &commit.payload_b64,
             )
@@ -3625,7 +3702,6 @@ mod tests {
         match bob
             .ingest_message(
                 "conv:alice:bob",
-                &alice_identity.device_identity.device_id,
                 MessageType::MlsApplication,
                 &outbound.payload_b64,
             )
@@ -3642,7 +3718,7 @@ mod tests {
     /// epoch in one step, with no input from the counterparty.
     #[test]
     fn direct_self_update_advances_the_epoch_immediately() {
-        let (mut alice, mut bob, alice_identity, _, _) = pair_adapters();
+        let (mut alice, mut bob, _, _, _) = pair_adapters();
         let live_epoch = alice
             .export_group_summary("conv:alice:bob")
             .expect("summary")
@@ -3662,7 +3738,6 @@ mod tests {
         match bob
             .ingest_message(
                 "conv:alice:bob",
-                &alice_identity.device_identity.device_id,
                 MessageType::MlsCommit,
                 &rotated.commit_b64,
             )
@@ -3678,7 +3753,6 @@ mod tests {
         match bob
             .ingest_message(
                 "conv:alice:bob",
-                &alice_identity.device_identity.device_id,
                 MessageType::MlsApplication,
                 &outbound.payload_b64,
             )
@@ -3693,7 +3767,7 @@ mod tests {
 
     #[test]
     fn previous_epoch_still_decrypts_after_rotation() {
-        let (mut alice, mut bob, alice_identity, _, _) = pair_adapters();
+        let (mut alice, mut bob, _, _, _) = pair_adapters();
         let stale = alice
             .encrypt_application("conv:alice:bob", b"stale epoch")
             .expect("stale");
@@ -3703,7 +3777,6 @@ mod tests {
         assert!(matches!(
             bob.ingest_message(
                 "conv:alice:bob",
-                &alice_identity.device_identity.device_id,
                 MessageType::MlsCommit,
                 &rotated.commit_b64,
             )
@@ -3713,7 +3786,6 @@ mod tests {
         match bob
             .ingest_message(
                 "conv:alice:bob",
-                &alice_identity.device_identity.device_id,
                 MessageType::MlsApplication,
                 &stale.payload_b64,
             )
@@ -3731,7 +3803,7 @@ mod tests {
     /// must still read both, one as a previous-epoch message.
     #[test]
     fn rotation_keeps_both_adjacent_epochs_decryptable() {
-        let (mut alice, mut bob, alice_identity, _, _) = pair_adapters();
+        let (mut alice, mut bob, _, _, _) = pair_adapters();
         let live_epoch = alice
             .export_group_summary("conv:alice:bob")
             .expect("summary")
@@ -3752,7 +3824,6 @@ mod tests {
         assert!(matches!(
             bob.ingest_message(
                 "conv:alice:bob",
-                &alice_identity.device_identity.device_id,
                 MessageType::MlsCommit,
                 &rotated.commit_b64,
             )
@@ -3762,7 +3833,6 @@ mod tests {
         match bob
             .ingest_message(
                 "conv:alice:bob",
-                &alice_identity.device_identity.device_id,
                 MessageType::MlsApplication,
                 &stale.payload_b64,
             )
@@ -3780,7 +3850,6 @@ mod tests {
         match bob
             .ingest_message(
                 "conv:alice:bob",
-                &alice_identity.device_identity.device_id,
                 MessageType::MlsApplication,
                 &outbound.payload_b64,
             )
@@ -3818,7 +3887,7 @@ mod tests {
 
     #[test]
     fn persisted_live_cannot_rebuild_consumed_next_epoch_keys() {
-        let (mut alice, mut bob, alice_identity, _, _) = pair_adapters();
+        let (mut alice, mut bob, _, _, _) = pair_adapters();
         let late_e = alice
             .encrypt_application("conv:alice:bob", b"late e")
             .expect("late e");
@@ -3828,7 +3897,6 @@ mod tests {
         assert!(matches!(
             bob.ingest_message(
                 "conv:alice:bob",
-                &alice_identity.device_identity.device_id,
                 MessageType::MlsCommit,
                 &rotated.commit_b64,
             )
@@ -3841,7 +3909,6 @@ mod tests {
         match bob
             .ingest_message(
                 "conv:alice:bob",
-                &alice_identity.device_identity.device_id,
                 MessageType::MlsApplication,
                 &consumed.payload_b64,
             )
@@ -3869,7 +3936,6 @@ mod tests {
         match restored
             .ingest_message(
                 "conv:alice:bob",
-                &alice_identity.device_identity.device_id,
                 MessageType::MlsCommit,
                 &rotated.commit_b64,
             )
@@ -3884,7 +3950,6 @@ mod tests {
         match restored
             .ingest_message(
                 "conv:alice:bob",
-                &alice_identity.device_identity.device_id,
                 MessageType::MlsApplication,
                 &consumed.payload_b64,
             )
@@ -3899,7 +3964,6 @@ mod tests {
         match restored
             .ingest_message(
                 "conv:alice:bob",
-                &alice_identity.device_identity.device_id,
                 MessageType::MlsApplication,
                 &late_e.payload_b64,
             )

@@ -286,6 +286,39 @@ impl CoreEngine {
         payload.into_bytes()
     }
 
+    /// The public key of an active device, taken from the bundle this engine
+    /// already trusts for that user — its own, or an established contact's.
+    /// This is the only source a device key may come from when a signature
+    /// or an MLS leaf is checked; never the record being checked.
+    pub(super) fn trusted_device_public_key(
+        &self,
+        user_id: &str,
+        device_id: &str,
+    ) -> CoreResult<String> {
+        let bundle = if self
+            .state
+            .local_identity
+            .as_ref()
+            .is_some_and(|identity| identity.user_identity.user_id == user_id)
+        {
+            self.state.local_bundle.as_ref()
+        } else {
+            self.state
+                .contacts
+                .get(user_id)
+                .map(|contact| &contact.bundle)
+        }
+        .ok_or_else(|| CoreError::invalid_input("signer identity bundle is missing"))?;
+        bundle
+            .devices
+            .iter()
+            .find(|device| {
+                device.device_id == device_id && matches!(device.status, DeviceStatusKind::Active)
+            })
+            .map(|device| device.device_public_key.clone())
+            .ok_or_else(|| CoreError::invalid_input("signer device is not active"))
+    }
+
     pub(super) fn verify_device_signature(
         &self,
         signer_user_id: &str,
@@ -293,29 +326,9 @@ impl CoreEngine {
         payload: &[u8],
         signature_hex: &str,
     ) -> CoreResult<()> {
-        let bundle = if self
-            .state
-            .local_identity
-            .as_ref()
-            .is_some_and(|identity| identity.user_identity.user_id == signer_user_id)
-        {
-            self.state.local_bundle.as_ref()
-        } else {
-            self.state
-                .contacts
-                .get(signer_user_id)
-                .map(|contact| &contact.bundle)
-        }
-        .ok_or_else(|| CoreError::invalid_input("signer identity bundle is missing"))?;
-        let device = bundle
-            .devices
-            .iter()
-            .find(|device| {
-                device.device_id == signer_device_id
-                    && matches!(device.status, DeviceStatusKind::Active)
-            })
-            .ok_or_else(|| CoreError::invalid_input("signer device is not active"))?;
-        let verifying_key = parse_verifying_key(&device.device_public_key)?;
+        let verifying_key = parse_verifying_key(
+            &self.trusted_device_public_key(signer_user_id, signer_device_id)?,
+        )?;
         let signature = parse_signature(signature_hex)?;
         verifying_key
             .verify(payload, &signature)
@@ -598,15 +611,11 @@ impl CoreEngine {
             Some(adapter) => adapter,
             None => return false,
         };
-        let result = match mls.ingest_message(
-            conversation_id,
-            &record.envelope.sender_device_id,
-            MessageType::MlsApplication,
-            ciphertext,
-        ) {
-            Ok(result) => result,
-            Err(_) => return false,
-        };
+        let result =
+            match mls.ingest_message(conversation_id, MessageType::MlsApplication, ciphertext) {
+                Ok(result) => result,
+                Err(_) => return false,
+            };
         let plaintext = match result {
             IngestResult::AppliedApplication(app) => app.plaintext,
             _ => return false,

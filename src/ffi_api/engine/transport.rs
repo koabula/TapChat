@@ -2882,6 +2882,39 @@ impl CoreEngine {
         .map_err(|_| "sender proof is not valid")
     }
 
+    /// Hand an authenticated inbound MLS frame to the adapter.
+    ///
+    /// A Welcome is the one frame that admits a new leaf into our view of a
+    /// conversation, so it alone names the device it must come from — and
+    /// that name is resolved from our own contact state, never read off the
+    /// envelope. Every other frame is authenticated by MLS against a leaf
+    /// admitted earlier.
+    pub(super) fn ingest_inbound_mls(
+        &mut self,
+        conversation_id: &str,
+        envelope: &Envelope,
+        payload_b64: &str,
+    ) -> CoreResult<IngestResult> {
+        let author = (envelope.message_type == MessageType::MlsWelcome)
+            .then(|| {
+                self.trusted_device_public_key(&envelope.sender_user_id, &envelope.sender_device_id)
+                    .map(|device_public_key| WelcomeAuthor {
+                        device_id: envelope.sender_device_id.clone(),
+                        device_public_key,
+                    })
+            })
+            .transpose()?;
+        let adapter = self
+            .state
+            .mls_adapter
+            .as_mut()
+            .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?;
+        match author {
+            Some(author) => adapter.ingest_welcome(conversation_id, &author, payload_b64),
+            None => adapter.ingest_message(conversation_id, envelope.message_type, payload_b64),
+        }
+    }
+
     /// Disposition for every inbound MLS verdict that did not apply.
     ///
     /// `handle_inbox_records_internal` used to carry two near-identical 300
@@ -3208,17 +3241,11 @@ impl CoreEngine {
                     });
                 let mut retention = RecordRetention::Discarded;
                 if !duplicate_delivery {
-                    match self
-                        .state
-                        .mls_adapter
-                        .as_mut()
-                        .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
-                        .ingest_message(
-                            &conversation_id,
-                            &record.envelope.sender_device_id,
-                            record.envelope.message_type,
-                            inline_ciphertext,
-                        )? {
+                    match self.ingest_inbound_mls(
+                        &conversation_id,
+                        &record.envelope,
+                        inline_ciphertext,
+                    )? {
                         IngestResult::AppliedApplication(application) => {
                             log::info!(
                                 "handle_inbox_records: AppliedApplication for message {}, plaintext len={}",
@@ -3449,23 +3476,15 @@ impl CoreEngine {
                         if arbitrated {
                             // Terminal for this record.
                         } else {
-                            match self
-                                .state
-                                .mls_adapter
-                                .as_mut()
-                                .ok_or_else(|| {
-                                    CoreError::invalid_state("mls adapter is not initialized")
-                                })?
-                                .ingest_message(
-                                    &conversation_id,
-                                    &record.envelope.sender_device_id,
-                                    record.envelope.message_type,
-                                    record
-                                        .envelope
-                                        .inline_ciphertext
-                                        .as_deref()
-                                        .unwrap_or_default(),
-                                )? {
+                            match self.ingest_inbound_mls(
+                                &conversation_id,
+                                &record.envelope,
+                                record
+                                    .envelope
+                                    .inline_ciphertext
+                                    .as_deref()
+                                    .unwrap_or_default(),
+                            )? {
                                 IngestResult::AppliedApplication(application) => {
                                     log::info!(
                                         "handle_inbox_records: AppliedApplication for message {}, plaintext len={}",

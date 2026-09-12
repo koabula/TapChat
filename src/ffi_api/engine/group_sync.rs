@@ -1681,7 +1681,6 @@ impl CoreEngine {
                     .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
                     .ingest_message(
                         &conversation_id,
-                        &record.envelope.sender_device_id,
                         message_type,
                         record
                             .envelope
@@ -2070,7 +2069,6 @@ impl CoreEngine {
         if let Some(commit) = commit {
             match staged_mls.ingest_message(
                 &current.conversation_id,
-                &commit.envelope.sender_device_id,
                 MessageType::MlsCommit,
                 commit
                     .envelope
@@ -2089,7 +2087,6 @@ impl CoreEngine {
         }
         let manifest_plaintext = match staged_mls.ingest_message(
             &current.conversation_id,
-            &control.envelope.sender_device_id,
             MessageType::MlsApplication,
             control
                 .envelope
@@ -2128,7 +2125,6 @@ impl CoreEngine {
         }
         let state_event_plaintext = match staged_mls.ingest_message(
             &current.conversation_id,
-            &state_event.envelope.sender_device_id,
             MessageType::MlsApplication,
             state_event
                 .envelope
@@ -3444,12 +3440,18 @@ impl CoreEngine {
             .as_ref()
             .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
             .fork()?;
-        let result = staged_mls.ingest_message(
-            &group_state.conversation_id,
-            &group_state.manifest.signer_device_id,
-            MessageType::MlsWelcome,
-            &welcome_b64,
-        );
+        let result = self
+            .trusted_device_public_key(
+                &group_state.manifest.signer_user_id,
+                &group_state.manifest.signer_device_id,
+            )
+            .and_then(|device_public_key| {
+                let author = WelcomeAuthor {
+                    device_id: group_state.manifest.signer_device_id.clone(),
+                    device_public_key,
+                };
+                staged_mls.ingest_welcome(&group_state.conversation_id, &author, &welcome_b64)
+            });
         let result = match result {
             Ok(result) => result,
             Err(error) => {

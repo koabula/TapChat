@@ -33,7 +33,7 @@ use crate::identity::{parse_signature, parse_verifying_key, IdentityManager};
 use crate::log_sanitize::redact_id;
 use crate::mls_adapter::{
     CreateConversationArtifacts, DecryptedApplicationMessage, DeferReason, IngestResult,
-    MlsAdapter, PeerDeviceKeyPackage, RejectReason, RemoveMembersArtifacts,
+    MlsAdapter, PeerDeviceKeyPackage, RejectReason, RemoveMembersArtifacts, WelcomeAuthor,
 };
 use crate::model::signing::envelope_sender_proof_payload;
 use crate::model::{
@@ -3369,7 +3369,7 @@ mod protected_application_message_tests {
     };
 
     fn sender_identity(user_id: &str, device_id: &str) -> String {
-        format!("{user_id}|{device_id}|pk|sig")
+        format!("{user_id}|{device_id}")
     }
 
     fn sample_record() -> InboxRecord {

@@ -1804,7 +1804,7 @@ impl CoreEngine {
 
     pub(super) fn parse_mls_sender_identity(value: &str) -> Option<ParsedMlsSenderIdentity> {
         let parts = value.split('|').collect::<Vec<_>>();
-        if parts.len() != 4 || parts[0].trim().is_empty() || parts[1].trim().is_empty() {
+        if parts.len() != 2 || parts[0].trim().is_empty() || parts[1].trim().is_empty() {
             return None;
         }
         Some(ParsedMlsSenderIdentity {

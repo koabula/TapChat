@@ -2304,7 +2304,6 @@ mod tests {
             .expect("alice mls")
             .ingest_message(
                 &conversation_id,
-                &carol.bundle.devices[0].device_id,
                 MessageType::MlsProposal,
                 &proposal.payload_b64,
             )
@@ -9279,16 +9278,25 @@ mod tests {
             .map(|item| item.envelope.clone())
             .expect("welcome for laptop");
 
+        let phone = alice
+            .state
+            .local_identity
+            .as_ref()
+            .expect("alice identity")
+            .device_identity
+            .clone();
         let mut restored = CoreEngine::try_from_restored_state(snapshot).expect("restore snapshot");
         let result = restored
             .state
             .mls_adapter
             .as_mut()
             .expect("restored laptop adapter")
-            .ingest_message(
+            .ingest_welcome(
                 &conversation_id,
-                &welcome.sender_device_id,
-                MessageType::MlsWelcome,
+                &crate::mls_adapter::WelcomeAuthor {
+                    device_id: phone.device_id,
+                    device_public_key: phone.device_public_key,
+                },
                 welcome
                     .inline_ciphertext
                     .as_deref()
@@ -11988,12 +11996,7 @@ mod tests {
         .adapter
         .expect("adapter");
         match restored
-            .ingest_message(
-                &conversation_id,
-                &designated_device,
-                MessageType::MlsCommit,
-                &pcs_commit_b64,
-            )
+            .ingest_message(&conversation_id, MessageType::MlsCommit, &pcs_commit_b64)
             .expect("replay C")
         {
             IngestResult::Rejected(_) | IngestResult::Deferred(_) => {}
@@ -12005,7 +12008,6 @@ mod tests {
         match restored
             .ingest_message(
                 &conversation_id,
-                &peer_device,
                 MessageType::MlsApplication,
                 next_epoch.inline_ciphertext.as_deref().unwrap_or_default(),
             )
@@ -12020,7 +12022,6 @@ mod tests {
         match restored
             .ingest_message(
                 &conversation_id,
-                &peer_device,
                 MessageType::MlsApplication,
                 late_e.inline_ciphertext.as_deref().unwrap_or_default(),
             )
