@@ -2055,7 +2055,7 @@ impl CoreEngine {
             self.verify_device_signature(
                 &record.envelope.sender_user_id,
                 &record.envelope.sender_device_id,
-                ciphertext.as_bytes(),
+                Self::group_envelope_sender_proof_payload(ciphertext),
                 &record.envelope.sender_proof.value,
             )?;
         }

@@ -24,17 +24,13 @@ mod tests {
         InboxRecordState, MessageType, SenderProof, StorageBaseInfo, WelcomePickupDescriptor,
         CURRENT_MODEL_VERSION,
     };
-    use crate::persistence::{
-        ContactRelationshipStatus, PersistOp,
-        PersistedPendingWelcomePickup,
-    };
+    use crate::persistence::{ContactRelationshipStatus, PersistOp, PersistedPendingWelcomePickup};
     use crate::transport_contract::{
         GroupJoinDecision, MessageRequestAction, MessageRequestActionResult,
         SealGroupOutboxRequest, SealGroupOutboxResult, SharedStateDocumentKind,
         TransportAuthRequirement,
     };
     use base64::{engine::general_purpose::STANDARD, Engine as _};
-    use ed25519_dalek::Signer;
     use std::collections::{BTreeMap, BTreeSet};
 
     const ALICE_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
@@ -423,32 +419,6 @@ mod tests {
     }
 
     #[test]
-    fn identity_bundle_verification_accepts_legacy_display_name_signature() {
-        let identity = IdentityManager::create_or_recover(Some(ALICE_MNEMONIC), Some("phone"))
-            .expect("identity");
-        let deployment = sample_deployment();
-        let package =
-            MlsAdapter::generate_key_package(&identity, test_now_ms()).expect("key package");
-        let mut bundle = IdentityManager::export_identity_bundle(
-            &identity,
-            &deployment,
-            package.key_package_ref,
-            package.expires_at,
-        )
-        .expect("bundle");
-        bundle.publication_version = 0;
-        bundle.publication_revision = 0;
-        bundle.display_name = Some("Alice".into());
-        bundle.signature = String::new();
-        let signature = identity
-            .user_root_signing_key()
-            .sign(crate::identity::legacy_identity_bundle_payload(&bundle).as_bytes());
-        bundle.signature = crate::identity::encode_hex(&signature.to_bytes());
-
-        IdentityManager::verify_identity_bundle(&bundle).expect("legacy bundle verifies");
-    }
-
-    #[test]
     fn group_core_commands_round_trip_json() {
         let commands = vec![
             CoreCommand::CreateGroupConversation {
@@ -484,6 +454,66 @@ mod tests {
         }
     }
 
+    /// The domains the worker verifies but the group fixture does not reach.
+    ///
+    /// Rust signs these and TypeScript verifies them, so the two framings have
+    /// to agree byte for byte; nothing else in the suite checks that, because
+    /// the only place both languages meet at runtime is the CLI e2e suite,
+    /// which needs a live runtime. The fixture pins the digest instead, and
+    /// `services/cloudflare/test/group-contract-parity.test.ts` asserts the
+    /// same values from the TypeScript side.
+    #[test]
+    fn shared_signing_domain_fixture_matches_the_typescript_framing() {
+        use crate::model::signing::{SignatureDomain, SigningPayload};
+
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../test-fixtures/signing-domains-v1.json"))
+                .expect("signing domain fixture");
+        let expected = &fixture["expected"];
+
+        let capability: crate::model::InboxAppendCapability =
+            serde_json::from_value(fixture["inboxAppendCapability"].clone())
+                .expect("capability fixture");
+        assert_eq!(
+            CoreEngine::signing_payload_sha256(crate::capability::inbox_append_capability_payload(
+                &capability
+            )),
+            expected["inboxAppendCapabilitySha256"]
+                .as_str()
+                .expect("capability digest")
+        );
+
+        let binding: crate::model::DeviceBinding =
+            serde_json::from_value(fixture["deviceBinding"].clone()).expect("binding fixture");
+        assert_eq!(
+            CoreEngine::signing_payload_sha256(crate::identity::device_binding_payload(&binding)),
+            expected["deviceBindingSha256"]
+                .as_str()
+                .expect("binding digest")
+        );
+
+        let challenge: crate::model::DeviceRuntimeRefreshChallenge =
+            serde_json::from_value(fixture["deviceRuntimeChallenge"].clone())
+                .expect("challenge fixture");
+        assert_eq!(
+            CoreEngine::signing_payload_sha256(challenge.signing_payload()),
+            expected["deviceRuntimeChallengeSha256"]
+                .as_str()
+                .expect("challenge digest")
+        );
+
+        // A payload that lost its domain would still be self-consistent, so
+        // assert the domain is actually the first thing in the bytes.
+        let mut bare = SigningPayload::new(SignatureDomain::DeviceBinding);
+        bare.push_str("");
+        assert!(
+            CoreEngine::signing_payload_sha256(bare)
+                != *expected["deviceBindingSha256"]
+                    .as_str()
+                    .expect("binding digest")
+        );
+    }
+
     #[test]
     fn shared_group_protocol_fixture_matches_wire_hash_payload_and_role_matrix() {
         let fixture: serde_json::Value =
@@ -501,12 +531,13 @@ mod tests {
                 .as_str()
                 .expect("expected hash")
         );
+        // The payload is binary once framed, so the fixture pins its digest
+        // rather than its text -- same shape as `manifestSha256` above.
         assert_eq!(
-            String::from_utf8(CoreEngine::membership_proof_payload(&proof))
-                .expect("membership payload utf8"),
-            fixture["expected"]["membershipProofPayload"]
+            CoreEngine::signing_payload_sha256(CoreEngine::membership_proof_payload(&proof)),
+            fixture["expected"]["membershipProofPayloadSha256"]
                 .as_str()
-                .expect("expected payload")
+                .expect("expected payload digest")
         );
         let encoded = serde_json::to_value(&manifest).expect("manifest json");
         assert!(encoded.get("groupId").is_some());
@@ -11419,7 +11450,8 @@ mod tests {
         let mut chat = paired_direct_chat();
         let conversation_id = chat.conversation_id.clone();
         let alice_rotates = !alice_is_designated(&chat);
-        let epoch_before = conversation_epoch(rotator_engine(&chat, alice_rotates), &conversation_id);
+        let epoch_before =
+            conversation_epoch(rotator_engine(&chat, alice_rotates), &conversation_id);
         let leaf_before = rotator_engine(&chat, alice_rotates)
             .state
             .mls_adapter
@@ -11495,7 +11527,8 @@ mod tests {
         let mut chat = paired_direct_chat();
         let conversation_id = chat.conversation_id.clone();
         let alice_rotates = !alice_is_designated(&chat);
-        let epoch_before = conversation_epoch(rotator_engine(&chat, alice_rotates), &conversation_id);
+        let epoch_before =
+            conversation_epoch(rotator_engine(&chat, alice_rotates), &conversation_id);
         set_direct_pcs_debt(
             rotator_engine_mut(&mut chat, alice_rotates),
             &conversation_id,
@@ -11512,10 +11545,12 @@ mod tests {
             epoch_before,
             "the non-designated side must not rotate at a single interval"
         );
-        assert!(rotator_engine(&chat, alice_rotates).state.conversations[&conversation_id]
-            .pcs
-            .own_commit
-            .is_none());
+        assert!(
+            rotator_engine(&chat, alice_rotates).state.conversations[&conversation_id]
+                .pcs
+                .own_commit
+                .is_none()
+        );
     }
 
     /// A peer's commit rotates the group secret but not our leaf key, so it
@@ -11531,10 +11566,8 @@ mod tests {
         let conversation_id = chat.conversation_id.clone();
         prime_direct_pcs_debt(&mut chat, DIRECT_PCS_COMMIT_INTERVAL - 1);
         let alice_rotated = trigger_direct_pcs_from_designated(&mut chat);
-        let epoch_after_first = conversation_epoch(
-            rotator_engine(&chat, alice_rotated),
-            &conversation_id,
-        );
+        let epoch_after_first =
+            conversation_epoch(rotator_engine(&chat, alice_rotated), &conversation_id);
         let peer_leaf_before = peer_engine(&chat, alice_rotated)
             .state
             .mls_adapter
@@ -11639,10 +11672,8 @@ mod tests {
             .expect("winner adapter")
             .state_fingerprint()
             .expect("winner fingerprint");
-        let winner_epoch = conversation_epoch(
-            rotator_engine(&chat, alice_is_winner),
-            &conversation_id,
-        );
+        let winner_epoch =
+            conversation_epoch(rotator_engine(&chat, alice_is_winner), &conversation_id);
         deliver_inbox_envelope(
             rotator_engine_mut(&mut chat, alice_is_winner),
             &winner_device,
@@ -11677,10 +11708,7 @@ mod tests {
             winner_commit,
             50_001,
         );
-        simulate_pending_key_package_claims(
-            peer_engine_mut(&mut chat, alice_is_winner),
-            output,
-        );
+        simulate_pending_key_package_claims(peer_engine_mut(&mut chat, alice_is_winner), output);
         // Escalation drives the rebuild and the repair in one turn, so the
         // PcsCommitRace context is already gone by the time the turn ends —
         // which is the point: the user never sees a dead conversation.
@@ -11740,10 +11768,7 @@ mod tests {
             &conversation_id,
             DIRECT_PCS_COMMIT_INTERVAL * 2,
         );
-        let epoch_before = conversation_epoch(
-            peer_engine(&chat, alice_rotated),
-            &conversation_id,
-        );
+        let epoch_before = conversation_epoch(peer_engine(&chat, alice_rotated), &conversation_id);
 
         complete_direct_pcs_rotation(&mut chat, alice_rotated);
 
@@ -11961,12 +11986,7 @@ mod tests {
             &designated_device,
         );
         let designated = rotator_engine_mut(&mut chat, alice_rotated);
-        deliver_inbox_envelope(
-            designated,
-            &designated_device,
-            next_epoch.clone(),
-            40_000,
-        );
+        deliver_inbox_envelope(designated, &designated_device, next_epoch.clone(), 40_000);
         let designated = rotator_engine(&chat, alice_rotated);
         assert!(conversation_has_plaintext(
             designated,
@@ -12159,9 +12179,9 @@ mod tests {
             .pending_outbox
             .iter()
             .any(|item| {
-            item.envelope.conversation_id == conversation_id
-                && item.envelope.message_type == MessageType::MlsCommit
-        }));
+                item.envelope.conversation_id == conversation_id
+                    && item.envelope.message_type == MessageType::MlsCommit
+            }));
     }
 
     #[test]
@@ -12213,11 +12233,10 @@ mod tests {
             persist_index < http_index,
             "conversation/mls/outbox persist must precede HTTP flush"
         );
-        let restored =
-            CoreEngine::try_from_restored_state(
-                rotator_engine(&chat, alice_rotates).refresh_snapshot(),
-            )
-                .expect("restore after attachment stage");
+        let restored = CoreEngine::try_from_restored_state(
+            rotator_engine(&chat, alice_rotates).refresh_snapshot(),
+        )
+        .expect("restore after attachment stage");
         assert!(restored
             .state
             .conversations
@@ -12863,8 +12882,8 @@ mod tests {
             .as_ref()
             .expect("signer identity")
             .clone();
-        envelope.sender_proof.value = identity.sign_sender_proof(
-            &crate::model::signing::envelope_sender_proof_payload(envelope),
+        envelope.sender_proof.value = identity.sign_payload(
+            crate::model::signing::envelope_sender_proof_payload(envelope),
         );
     }
 
@@ -12909,8 +12928,8 @@ mod tests {
             &sender_identity.device_identity.device_id,
             message_type,
         );
-        record.envelope.sender_proof.value = sender_identity.sign_sender_proof(
-            &crate::model::signing::envelope_sender_proof_payload(&record.envelope),
+        record.envelope.sender_proof.value = sender_identity.sign_payload(
+            crate::model::signing::envelope_sender_proof_payload(&record.envelope),
         );
         record
     }

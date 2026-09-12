@@ -2283,11 +2283,7 @@ fn device_signer(local_identity: &LocalIdentityState) -> SignatureKeyPair {
     SignatureKeyPair::from_raw(
         DEFAULT_CIPHERSUITE.signature_algorithm(),
         local_identity.device_signing_key_bytes().to_vec(),
-        local_identity
-            .device_signing_key()
-            .verifying_key()
-            .to_bytes()
-            .to_vec(),
+        local_identity.device_verifying_key().to_bytes().to_vec(),
     )
 }
 

@@ -2798,7 +2798,7 @@ impl CoreEngine {
         self.verify_device_signature(
             &envelope.sender_user_id,
             &envelope.sender_device_id,
-            &envelope_sender_proof_payload(envelope),
+            envelope_sender_proof_payload(envelope),
             &envelope.sender_proof.value,
         )?;
         let payload = STANDARD.decode(payload_b64).map_err(|error| {
@@ -2911,7 +2911,7 @@ impl CoreEngine {
         self.verify_device_signature(
             &envelope.sender_user_id,
             &envelope.sender_device_id,
-            &envelope_sender_proof_payload(envelope),
+            envelope_sender_proof_payload(envelope),
             &envelope.sender_proof.value,
         )?;
         let payload = STANDARD.decode(payload_b64).map_err(|error| {
@@ -3406,7 +3406,8 @@ impl CoreEngine {
                     RecoveryEscalationReason::PcsCommitRace,
                     "direct PCS commit lost a same-epoch race with the peer",
                 )?;
-                let rebuilt = self.reconcile_conversation_membership(conversation_id.to_string())?;
+                let rebuilt =
+                    self.reconcile_conversation_membership(conversation_id.to_string())?;
                 Ok(Some(merge_outputs(torn_down, rebuilt)))
             }
         }
@@ -3432,5 +3433,4 @@ impl CoreEngine {
         }));
         ops
     }
-
 }

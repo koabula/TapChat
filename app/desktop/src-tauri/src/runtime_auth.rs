@@ -181,7 +181,7 @@ async fn request_runtime_credential(
         return Err(runtime_error("runtime_mismatch"));
     }
     let proof = DeviceRuntimeRefreshProof {
-        signature: identity.sign_sender_proof(challenge.signing_payload().as_bytes()),
+        signature: identity.sign_payload(challenge.signing_payload()),
         challenge,
     };
     let (endpoint, body) = match (purpose, device) {

@@ -1718,17 +1718,22 @@ pub struct DeviceRuntimeRefreshChallenge {
 }
 
 impl DeviceRuntimeRefreshChallenge {
-    pub fn signing_payload(&self) -> String {
-        [
-            "tapchat.device_runtime_auth.v2".to_string(),
-            format!("purpose={}", self.purpose),
-            format!("runtime_id={}", self.runtime_id),
-            format!("user_id={}", self.user_id),
-            format!("device_id={}", self.device_id),
-            format!("nonce={}", self.nonce),
-            format!("expires_at={}", self.expires_at),
-        ]
-        .join("\n")
+    /// The domain used to be the first line of this string; it now comes from
+    /// [`signing::SignatureDomain`], so exactly one place names it.
+    pub fn signing_payload(&self) -> signing::SigningPayload {
+        let mut payload = signing::SigningPayload::new(signing::SignatureDomain::DeviceRuntimeAuth);
+        payload.push_str(
+            &[
+                format!("purpose={}", self.purpose),
+                format!("runtime_id={}", self.runtime_id),
+                format!("user_id={}", self.user_id),
+                format!("device_id={}", self.device_id),
+                format!("nonce={}", self.nonce),
+                format!("expires_at={}", self.expires_at),
+            ]
+            .join("\n"),
+        );
+        payload
     }
 }
 

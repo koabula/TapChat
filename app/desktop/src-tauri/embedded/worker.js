@@ -2025,6 +2025,48 @@ async function verifySharingPayload(secret, token, now) {
   return payload;
 }
 
+// src/auth/signing-payload.ts
+var SIGNATURE_DOMAIN = {
+  groupManifest: "tapchat.group_manifest.v1",
+  groupMembershipProof: "tapchat.group.membership.v1",
+  groupCapability: "tapchat.group_capability.v2",
+  inboxAppendCapability: "tapchat.inbox_append_capability.v1",
+  deviceRuntimeAuth: "tapchat.device_runtime_auth.v2",
+  deviceBinding: "tapchat.device_binding.v1",
+  identityBundle: "tapchat.identity_bundle.v1"
+};
+var encoder2 = new TextEncoder();
+var SigningPayload = class {
+  chunks = [];
+  constructor(domain) {
+    this.pushStr(domain);
+  }
+  /** A length-prefixed string: `u32` big-endian length, then UTF-8 bytes. */
+  pushStr(value) {
+    return this.pushBytes(encoder2.encode(value));
+  }
+  /** A length-prefixed byte string. */
+  pushBytes(value) {
+    const length = new Uint8Array(4);
+    new DataView(length.buffer).setUint32(0, value.length, false);
+    this.chunks.push(length, value);
+    return this;
+  }
+  bytes() {
+    const total = this.chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+    const out = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of this.chunks) {
+      out.set(chunk, offset);
+      offset += chunk.length;
+    }
+    return out;
+  }
+};
+function signingPayload(domain) {
+  return new SigningPayload(domain);
+}
+
 // src/auth/capability.ts
 var HttpError = class extends Error {
   status;
@@ -2139,6 +2181,9 @@ async function validateAppendAuthorization(request, deviceId, body, now, loadAut
 var APPEND_AUTH_CONTEXT_HEADER = "X-Tapchat-Append-Auth";
 var APPEND_AUTH_REASON_HEADER = "X-Tapchat-Append-Auth-Reason";
 function capabilityPayload(capability) {
+  return signingPayload(SIGNATURE_DOMAIN.inboxAppendCapability).pushStr(capabilityBody(capability)).bytes();
+}
+function capabilityBody(capability) {
   const constraints = capability.constraints ? `${capability.constraints.maxBytes ?? ""}:${capability.constraints.maxOpsPerMinute ?? ""}` : "";
   return [
     capability.version,
@@ -2159,17 +2204,20 @@ function rustCapabilityOperationsDebug(operations) {
   return `[${operations.map((operation) => operation === "append" ? "Append" : operation).join(", ")}]`;
 }
 function bindingPayload(binding) {
-  return `${CURRENT_MODEL_VERSION}:${binding.userId}:${binding.deviceId}:${binding.devicePublicKey}:${binding.createdAt}`;
+  return signingPayload(SIGNATURE_DOMAIN.deviceBinding).pushStr(
+    `${CURRENT_MODEL_VERSION}:${binding.userId}:${binding.deviceId}:${binding.devicePublicKey}:${binding.createdAt}`
+  ).bytes();
 }
-function identityBundlePayload(bundle, includeDisplayName) {
+function identityBundlePayload(bundle) {
+  return signingPayload(SIGNATURE_DOMAIN.identityBundle).pushStr(identityBundleBody(bundle)).bytes();
+}
+function identityBundleBody(bundle) {
   const parts = [bundle.version, bundle.userId, bundle.userPublicKey];
   if ((bundle.publicationVersion ?? 0) > 0) {
     parts.push(String(bundle.publicationVersion));
     parts.push(String(bundle.publicationRevision ?? 0));
   }
-  if (includeDisplayName) {
-    parts.push(bundle.displayName ?? "");
-  }
+  parts.push(bundle.displayName ?? "");
   parts.push(
     String(bundle.updatedAt),
     bundle.bundleShareId ?? "",
@@ -2205,7 +2253,7 @@ function verifyIdentityBundle(bundle) {
   if (bundle.version !== CURRENT_MODEL_VERSION) {
     return false;
   }
-  return verifyEd25519(bundle.userPublicKey, bundle.signature, identityBundlePayload(bundle, true)) || (bundle.publicationVersion ?? 0) === 0 && verifyEd25519(bundle.userPublicKey, bundle.signature, identityBundlePayload(bundle, false));
+  return verifyEd25519(bundle.userPublicKey, bundle.signature, identityBundlePayload(bundle));
 }
 function verifyDeviceBinding(userPublicKey, binding) {
   if (binding.version !== CURRENT_MODEL_VERSION) {
@@ -2218,16 +2266,14 @@ function verifyInboxAppendCapability(capability, devicePublicKey) {
 }
 function verifyEd25519(publicKeyHex, signatureHex, payload) {
   try {
-    const encoded = typeof payload === "string" ? new TextEncoder().encode(payload) : payload;
-    return ed25519.verify(hexToBytes2(signatureHex), encoded, hexToBytes2(publicKeyHex));
+    return ed25519.verify(hexToBytes2(signatureHex), payload, hexToBytes2(publicKeyHex));
   } catch {
     return false;
   }
 }
 function groupCapabilitySigningPayload(capability) {
   const operations = Array.from(new Set(capability.operations)).sort().join(",");
-  return [
-    "tapchat.group_capability.v2",
+  const body = [
     `version=${capability.version}`,
     `service=${capability.service}`,
     `group_id=${capability.groupId}`,
@@ -2237,6 +2283,7 @@ function groupCapabilitySigningPayload(capability) {
     `operations=${operations}`,
     `expires_at=${capability.expiresAt}`
   ].join("\n");
+  return signingPayload(SIGNATURE_DOMAIN.groupCapability).pushStr(body).bytes();
 }
 function unsignedGroupManifest(manifest) {
   return {
@@ -2273,17 +2320,14 @@ function unsignedGroupManifest(manifest) {
     signature: ""
   };
 }
+function unsignedGroupManifestJson(manifest) {
+  return new TextEncoder().encode(JSON.stringify(unsignedGroupManifest(manifest)));
+}
 function groupManifestSigningPayload(manifest) {
-  const prefix = new TextEncoder().encode("tapchat.group_manifest.v1\n");
-  const body = new TextEncoder().encode(JSON.stringify(unsignedGroupManifest(manifest)));
-  const payload = new Uint8Array(prefix.length + body.length);
-  payload.set(prefix);
-  payload.set(body, prefix.length);
-  return payload;
+  return signingPayload(SIGNATURE_DOMAIN.groupManifest).pushBytes(unsignedGroupManifestJson(manifest)).bytes();
 }
 function groupMembershipProofSigningPayload(proof) {
   const fields = [
-    "tapchat.group.membership.v1",
     `proof_type=${proof.type}`,
     `operation=${proof.operation}`,
     `signer_user_id=${proof.signerUserId}`,
@@ -2298,11 +2342,10 @@ function groupMembershipProofSigningPayload(proof) {
   if (proof.stateEventMessageId) {
     fields.push(`state_event_message_id=${proof.stateEventMessageId}`);
   }
-  return fields.join("\n");
+  return signingPayload(SIGNATURE_DOMAIN.groupMembershipProof).pushStr(fields.join("\n")).bytes();
 }
 async function groupManifestSha256(manifest) {
-  const body = new TextEncoder().encode(JSON.stringify(unsignedGroupManifest(manifest)));
-  const digest = await crypto.subtle.digest("SHA-256", body);
+  const digest = await crypto.subtle.digest("SHA-256", unsignedGroupManifestJson(manifest));
   return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 function hexToBytes2(input) {
@@ -2596,8 +2639,7 @@ async function readJsonLimited(request, maxBytes) {
 
 // src/auth/runtime-auth.ts
 function deviceRuntimeSigningPayload(challenge) {
-  return [
-    "tapchat.device_runtime_auth.v2",
+  const body = [
     `purpose=${challenge.purpose}`,
     `runtime_id=${challenge.runtimeId}`,
     `user_id=${challenge.userId}`,
@@ -2605,6 +2647,7 @@ function deviceRuntimeSigningPayload(challenge) {
     `nonce=${challenge.nonce}`,
     `expires_at=${challenge.expiresAt}`
   ].join("\n");
+  return signingPayload(SIGNATURE_DOMAIN.deviceRuntimeAuth).pushStr(body).bytes();
 }
 
 // src/error-codes.generated.ts

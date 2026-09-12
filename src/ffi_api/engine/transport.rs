@@ -2876,7 +2876,7 @@ impl CoreEngine {
         self.verify_device_signature(
             &record.envelope.sender_user_id,
             &record.envelope.sender_device_id,
-            &envelope_sender_proof_payload(&record.envelope),
+            envelope_sender_proof_payload(&record.envelope),
             &record.envelope.sender_proof.value,
         )
         .map_err(|_| "sender proof is not valid")

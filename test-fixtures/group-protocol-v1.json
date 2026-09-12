@@ -53,7 +53,7 @@
   },
   "expected": {
     "manifestSha256": "d76e4c085c8be2da751ceb9325f8e300102afceea92848df7e9988ff952e2d52",
-    "membershipProofPayload": "tapchat.group.membership.v1\nproof_type=membership_signature\noperation=remove_member\nsigner_user_id=user:alice\nsigner_device_id=device:alice:laptop\nprevious_roster_version=1\nnew_roster_version=2\nprevious_commit_message_id=message:commit:1\ncommit_message_id=message:commit:2\ncontrol_message_id=message:control:2\nnew_manifest_sha256=fixture-next-manifest-hash\nstate_event_message_id=message:event:2"
+    "membershipProofPayloadSha256": "379f0b3b09878631140284d60049ba65e9cce312337b0ec81f67d5c93ebea6d8"
   },
   "roleOperations": {
     "owner": ["read", "subscribe", "append_application", "append_control", "append_membership", "manage_invites", "approve_join", "remove_member", "update_group_metadata", "seal_group"],

@@ -975,7 +975,7 @@ mod tests {
 
         let ledger = Ledger::load();
         let base_request = maximal_append_request();
-        let base_payload = envelope_sender_proof_payload(&base_request.envelope);
+        let base_payload = envelope_sender_proof_payload(&base_request.envelope).into_bytes();
         let mut checked = 0usize;
         let mut unprobeable: Vec<String> = Vec::new();
 
@@ -1000,7 +1000,7 @@ mod tests {
                 unprobeable.push(field_path.to_string());
                 continue;
             };
-            let changed = envelope_sender_proof_payload(&mutated) != base_payload;
+            let changed = envelope_sender_proof_payload(&mutated).into_bytes() != base_payload;
             assert_eq!(
                 changed,
                 entry.signed,

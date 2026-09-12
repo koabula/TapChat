@@ -69,7 +69,7 @@ impl CoreEngine {
         };
         // Signed last, over the finished envelope.
         envelope.sender_proof.value =
-            identity.sign_sender_proof(&envelope_sender_proof_payload(&envelope));
+            identity.sign_payload(envelope_sender_proof_payload(&envelope));
         Ok(envelope)
     }
 
@@ -127,8 +127,7 @@ impl CoreEngine {
             signer_device_id: identity.device_identity.device_id.clone(),
             signature: String::new(),
         };
-        manifest.signature =
-            identity.sign_sender_proof(&Self::manifest_signing_payload(&manifest)?);
+        manifest.signature = identity.sign_payload(Self::manifest_signing_payload(&manifest)?);
         Ok(manifest)
     }
 
@@ -148,7 +147,8 @@ impl CoreEngine {
             .clone();
         let message_nonce = self.next_message_nonce();
         let created_at = current_unix_millis(message_nonce);
-        let sender_proof = identity.sign_sender_proof(payload_b64.as_bytes());
+        let sender_proof =
+            identity.sign_payload(Self::group_envelope_sender_proof_payload(&payload_b64));
         let message_id = format!(
             "msg:{conversation_id}:{}:{message_nonce}:group",
             identity.device_identity.device_id
@@ -240,34 +240,61 @@ impl CoreEngine {
             .as_ref()
             .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))?
             .clone();
-        Ok(identity.sign_sender_proof(&Self::manifest_signing_payload(manifest)?))
+        Ok(identity.sign_payload(Self::manifest_signing_payload(manifest)?))
     }
 
-    pub(super) fn manifest_signing_payload(manifest: &GroupManifest) -> CoreResult<Vec<u8>> {
+    /// The digest of a finished signing payload. Test-only: fixtures pin the
+    /// bytes a domain produces, and those bytes are binary once framed.
+    #[cfg(test)]
+    pub(crate) fn signing_payload_sha256(payload: SigningPayload) -> String {
+        hex_lower(&Sha256::digest(payload.into_bytes()))
+    }
+
+    /// What a group envelope's `sender_proof` signs.
+    ///
+    /// The ciphertext alone -- not `message_id`, `message_type`, `visibility`
+    /// or `storage_refs`. This is the pre-R2 shape: R2 replaced it with a
+    /// canonical encoding of the whole header for the 1:1 path
+    /// ([`crate::model::signing::envelope_sender_proof_payload`]) and never
+    /// reached the group path, so a legitimately signed group ciphertext can
+    /// still be re-presented under a different header. Widening the coverage
+    /// is R2b; commit 1 only puts a domain in front of it, so that this
+    /// signature cannot be confused with one from another domain.
+    pub(crate) fn group_envelope_sender_proof_payload(payload_b64: &str) -> SigningPayload {
+        let mut payload = SigningPayload::new(SignatureDomain::GroupEnvelopeSenderProof);
+        payload.push_str(payload_b64);
+        payload
+    }
+
+    /// The JSON both the signature and the hash are taken over: the manifest
+    /// with its own signature cleared.
+    fn unsigned_manifest_json(manifest: &GroupManifest) -> CoreResult<Vec<u8>> {
         let mut unsigned = manifest.clone();
         unsigned.signature.clear();
-        let encoded = serde_json::to_vec(&unsigned).map_err(|error| {
-            CoreError::invalid_input(format!(
-                "failed to encode manifest signing payload: {error}"
-            ))
-        })?;
-        let mut payload = b"tapchat.group_manifest.v1\n".to_vec();
-        payload.extend(encoded);
+        serde_json::to_vec(&unsigned).map_err(|error| {
+            CoreError::invalid_input(format!("failed to encode unsigned manifest: {error}"))
+        })
+    }
+
+    pub(super) fn manifest_signing_payload(manifest: &GroupManifest) -> CoreResult<SigningPayload> {
+        let mut payload = SigningPayload::new(SignatureDomain::GroupManifest);
+        payload.push_bytes(&Self::unsigned_manifest_json(manifest)?);
         Ok(payload)
     }
 
+    /// Deliberately hashes the bare JSON, without the signing domain. This
+    /// digest travels as `GroupMembershipProof::new_manifest_sha256`, so it is
+    /// itself inside a signature; moving it would invalidate every membership
+    /// proof and change the shared fixture's `manifestSha256`.
     pub(crate) fn manifest_sha256(manifest: &GroupManifest) -> CoreResult<String> {
-        let mut unsigned = manifest.clone();
-        unsigned.signature.clear();
-        let encoded = serde_json::to_vec(&unsigned).map_err(|error| {
-            CoreError::invalid_input(format!("failed to encode manifest hash payload: {error}"))
-        })?;
-        Ok(hex_lower(&Sha256::digest(encoded)))
+        Ok(hex_lower(&Sha256::digest(Self::unsigned_manifest_json(
+            manifest,
+        )?)))
     }
 
-    pub(crate) fn membership_proof_payload(proof: &GroupMembershipProof) -> Vec<u8> {
-        let mut payload = format!(
-            "tapchat.group.membership.v1\nproof_type={}\noperation={}\nsigner_user_id={}\nsigner_device_id={}\nprevious_roster_version={}\nnew_roster_version={}\nprevious_commit_message_id={}\ncommit_message_id={}\ncontrol_message_id={}\nnew_manifest_sha256={}",
+    pub(crate) fn membership_proof_payload(proof: &GroupMembershipProof) -> SigningPayload {
+        let mut body = format!(
+            "proof_type={}\noperation={}\nsigner_user_id={}\nsigner_device_id={}\nprevious_roster_version={}\nnew_roster_version={}\nprevious_commit_message_id={}\ncommit_message_id={}\ncontrol_message_id={}\nnew_manifest_sha256={}",
             proof.proof_type,
             proof.operation,
             proof.signer_user_id,
@@ -280,10 +307,12 @@ impl CoreEngine {
             proof.new_manifest_sha256,
         );
         if let Some(message_id) = &proof.state_event_message_id {
-            payload.push_str("\nstate_event_message_id=");
-            payload.push_str(message_id);
+            body.push_str("\nstate_event_message_id=");
+            body.push_str(message_id);
         }
-        payload.into_bytes()
+        let mut payload = SigningPayload::new(SignatureDomain::GroupMembershipProof);
+        payload.push_str(&body);
+        payload
     }
 
     /// The public key of an active device, taken from the bundle this engine
@@ -323,23 +352,21 @@ impl CoreEngine {
         &self,
         signer_user_id: &str,
         signer_device_id: &str,
-        payload: &[u8],
+        payload: SigningPayload,
         signature_hex: &str,
     ) -> CoreResult<()> {
-        let verifying_key = parse_verifying_key(
+        crate::identity::verify_device_payload_signature(
             &self.trusted_device_public_key(signer_user_id, signer_device_id)?,
-        )?;
-        let signature = parse_signature(signature_hex)?;
-        verifying_key
-            .verify(payload, &signature)
-            .map_err(|_| CoreError::invalid_input("device signature mismatch"))
+            payload,
+            signature_hex,
+        )
     }
 
     pub(super) fn verify_manifest_signature(&self, manifest: &GroupManifest) -> CoreResult<()> {
         self.verify_device_signature(
             &manifest.signer_user_id,
             &manifest.signer_device_id,
-            &Self::manifest_signing_payload(manifest)?,
+            Self::manifest_signing_payload(manifest)?,
             &manifest.signature,
         )
     }
@@ -393,7 +420,7 @@ impl CoreEngine {
             new_manifest_sha256: Self::manifest_sha256(updated)?,
             signature: String::new(),
         };
-        proof.signature = identity.sign_sender_proof(&Self::membership_proof_payload(&proof));
+        proof.signature = identity.sign_payload(Self::membership_proof_payload(&proof));
         proof.validate()?;
         Ok(proof)
     }
@@ -506,7 +533,7 @@ impl CoreEngine {
         self.verify_device_signature(
             &proof.signer_user_id,
             &proof.signer_device_id,
-            &Self::membership_proof_payload(proof),
+            Self::membership_proof_payload(proof),
             &proof.signature,
         )?;
         if !Self::manifest_has_active_device(
@@ -1221,9 +1248,9 @@ impl CoreEngine {
             group_id,
             device_id
         );
-        let capability = identity.sign_sender_proof(
-            format!("welcome_pickup:{group_id}:{device_id}:{expires_at}").as_bytes(),
-        );
+        let mut capability_payload = SigningPayload::new(SignatureDomain::WelcomePickupToken);
+        capability_payload.push_str(&format!("{group_id}:{device_id}:{expires_at}"));
+        let capability = identity.sign_payload(capability_payload);
         Ok(WelcomePickupDescriptor {
             group_id: group_id.to_string(),
             device_id: device_id.to_string(),
@@ -1261,8 +1288,7 @@ impl CoreEngine {
             expires_at,
             signature: String::new(),
         };
-        capability.signature =
-            identity.sign_sender_proof(group_capability_signing_payload(&capability).as_bytes());
+        capability.signature = identity.sign_payload(group_capability_signing_payload(&capability));
         Ok(capability)
     }
 

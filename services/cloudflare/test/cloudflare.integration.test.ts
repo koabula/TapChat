@@ -19,10 +19,14 @@ import {
   type PrepareBlobUploadRequest
 } from "../src/types/contracts";
 import {
+  bindingPayload,
+  capabilityPayload,
   groupCapabilitySigningPayload,
   groupManifestSigningPayload,
+  identityBundlePayload,
   verifyIdentityBundle
 } from "../src/auth/capability";
+import { deviceRuntimeSigningPayload } from "../src/auth/runtime-auth";
 import { signSharingPayload } from "../src/storage/sharing";
 
 const ROOT = path.resolve(import.meta.dirname, "..");
@@ -119,15 +123,7 @@ async function issueDeviceBundle(mf: Miniflare, userId = "user:bob", deviceId = 
     body: JSON.stringify({
       challenge,
       device: fixture.bundle.devices[0],
-      signature: signHex(fixture.deviceSecret, [
-        "tapchat.device_runtime_auth.v2",
-        `purpose=${challenge.purpose}`,
-        `runtime_id=${challenge.runtimeId}`,
-        `user_id=${challenge.userId}`,
-        `device_id=${challenge.deviceId}`,
-        `nonce=${challenge.nonce}`,
-        `expires_at=${challenge.expiresAt}`
-      ].join("\n"))
+      signature: signHex(fixture.deviceSecret, deviceRuntimeSigningPayload(challenge))
     })
   });
   assert.equal(enrollmentResponse.status, 200);
@@ -207,7 +203,7 @@ function signedIdentityFixture(userId: string, deviceId: string): {
     createdAt: now,
     signature: ""
   };
-  binding.signature = signHex(userSecret, `${CURRENT_MODEL_VERSION}:${userId}:${deviceId}:${devicePublicKey}:${now}`);
+  binding.signature = signHex(userSecret, bindingPayload(binding));
   const bundle: IdentityBundle = {
     version: CURRENT_MODEL_VERSION,
     publicationVersion: 1,
@@ -242,51 +238,8 @@ function signedIdentityFixture(userId: string, deviceId: string): {
   return { bundle, capability, userSecret, deviceSecret };
 }
 
-function capabilityPayload(capability: InboxAppendCapability): string {
-  return [
-    capability.version,
-    "Inbox",
-    capability.userId,
-    capability.targetDeviceId,
-    capability.endpoint,
-    "[Append]",
-    (capability.conversationScope ?? []).join(","),
-    String(capability.expiresAt),
-    ""
-  ].join("|");
-}
-
-function identityBundlePayload(bundle: IdentityBundle): string {
-  const parts = [
-    bundle.version,
-    bundle.userId,
-    bundle.userPublicKey,
-    String(bundle.publicationVersion),
-    String(bundle.publicationRevision),
-    "",
-    String(bundle.updatedAt),
-    bundle.bundleShareId ?? "",
-    bundle.identityBundleRef ?? "",
-    bundle.deviceStatusRef ?? "",
-    bundle.storageProfile?.baseUrl ?? "",
-    bundle.storageProfile?.profileRef ?? ""
-  ];
-  for (const device of bundle.devices) {
-    parts.push(device.deviceId, device.devicePublicKey, device.binding.signature, device.inboxAppendCapability!.signature);
-    parts.push(
-      String(device.keypackageRef!.lifecycleVersion),
-      device.keypackageRef!.ref,
-      String(device.keypackageRef!.notBefore),
-      String(device.keypackageRef!.createdAt),
-      String(device.keypackageRef!.expiresAt)
-    );
-  }
-  return parts.join("|");
-}
-
-function signHex(secret: Uint8Array, payload: string | Uint8Array): string {
-  const encoded = typeof payload === "string" ? new TextEncoder().encode(payload) : payload;
-  return bytesToHex(ed25519.sign(encoded, secret));
+function signHex(secret: Uint8Array, payload: Uint8Array): string {
+  return bytesToHex(ed25519.sign(payload, secret));
 }
 
 test("identity publication enforces lifecycle CAS and atomically revokes the previous share link", async () => {

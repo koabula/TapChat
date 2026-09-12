@@ -45,10 +45,13 @@ import type {
 } from "./runtime-types";
 import { signSharingPayload } from "../src/storage/sharing";
 import {
+  bindingPayload,
+  capabilityPayload,
   groupCapabilitySigningPayload,
   groupManifestSha256,
   groupManifestSigningPayload,
-  groupMembershipProofSigningPayload
+  groupMembershipProofSigningPayload,
+  identityBundlePayload
 } from "../src/auth/capability";
 import { GroupAuthorizationService } from "../src/group-outbox/authorization";
 
@@ -94,39 +97,6 @@ test("observability route families never include stable path identifiers", () =>
   assert.equal(
     routeFamilyForObservability("https://worker.example/v1/contact-share/capability-secret"),
     "contact_share"
-  );
-});
-
-test("group membership proof payload matches the Rust canonical field order", () => {
-  const proof: GroupMembershipProof = {
-    type: "membership_signature",
-    operation: "create",
-    signerUserId: "user:owner",
-    signerDeviceId: "device:owner",
-    previousRosterVersion: 0,
-    newRosterVersion: 1,
-    commitMessageId: "msg:commit",
-    controlMessageId: "msg:control",
-    stateEventMessageId: "msg:event",
-    newManifestSha256: "manifest-hash",
-    signature: "signature"
-  };
-  assert.equal(
-    groupMembershipProofSigningPayload(proof),
-    [
-      "tapchat.group.membership.v1",
-      "proof_type=membership_signature",
-      "operation=create",
-      "signer_user_id=user:owner",
-      "signer_device_id=device:owner",
-      "previous_roster_version=0",
-      "new_roster_version=1",
-      "previous_commit_message_id=",
-      "commit_message_id=msg:commit",
-      "control_message_id=msg:control",
-      "new_manifest_sha256=manifest-hash",
-      "state_event_message_id=msg:event"
-    ].join("\n")
   );
 });
 
@@ -759,58 +729,12 @@ function signedIdentityFixture(options?: {
     ],
     signature: ""
   };
-  bundle.signature = signHex(userSecret, identityBundlePayload(bundle, true));
+  bundle.signature = signHex(userSecret, identityBundlePayload(bundle));
   return { bundle, capability, deviceId, userId, deviceSecret, userSecret };
 }
 
-function capabilityPayload(capability: InboxAppendCapability): string {
-  const constraints = capability.constraints
-    ? `${capability.constraints.maxBytes ?? ""}:${capability.constraints.maxOpsPerMinute ?? ""}`
-    : "";
-  return [
-    capability.version,
-    "Inbox",
-    capability.userId,
-    capability.targetDeviceId,
-    capability.endpoint,
-    `[${capability.operations.map((operation) => (operation === "append" ? "Append" : operation)).join(", ")}]`,
-    (capability.conversationScope ?? []).join(","),
-    String(capability.expiresAt),
-    constraints
-  ].join("|");
-}
-
-function bindingPayload(binding: DeviceBinding): string {
-  return `${CURRENT_MODEL_VERSION}:${binding.userId}:${binding.deviceId}:${binding.devicePublicKey}:${binding.createdAt}`;
-}
-
-function identityBundlePayload(bundle: IdentityBundle, includeDisplayName: boolean): string {
-  const parts = [bundle.version, bundle.userId, bundle.userPublicKey];
-  if (includeDisplayName) {
-    parts.push(bundle.displayName ?? "");
-  }
-  parts.push(
-    String(bundle.updatedAt),
-    bundle.bundleShareId ?? "",
-    bundle.identityBundleRef ?? "",
-    bundle.deviceStatusRef ?? "",
-    bundle.storageProfile?.baseUrl ?? "",
-    bundle.storageProfile?.profileRef ?? ""
-  );
-  for (const device of bundle.devices) {
-    parts.push(device.deviceId);
-    parts.push(device.devicePublicKey);
-    parts.push(device.binding.signature);
-    parts.push(device.inboxAppendCapability!.signature);
-    parts.push(device.keypackageRef!.ref);
-    parts.push(String(device.keypackageRef!.expiresAt));
-  }
-  return parts.join("|");
-}
-
-function signHex(secretKey: Uint8Array, payload: string | Uint8Array): string {
-  const encoded = typeof payload === "string" ? new TextEncoder().encode(payload) : payload;
-  return bytesToHex(ed25519.sign(encoded, secretKey));
+function signHex(secretKey: Uint8Array, payload: Uint8Array): string {
+  return bytesToHex(ed25519.sign(payload, secretKey));
 }
 
 function bytesToHex(input: Uint8Array): string {
@@ -1098,7 +1022,7 @@ function groupIdentity(userId: string, deviceId: string, userByte: number, devic
     }],
     signature: ""
   };
-  bundle.signature = signHex(userSecret, identityBundlePayload(bundle, true));
+  bundle.signature = signHex(userSecret, identityBundlePayload(bundle));
   return { userId, deviceId, userSecret, deviceSecret, bundle };
 }
 

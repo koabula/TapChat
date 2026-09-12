@@ -18,6 +18,7 @@ import type {
 } from "../types/contracts";
 import { CURRENT_MODEL_VERSION } from "../types/contracts";
 import { verifySharingPayload } from "../storage/sharing";
+import { SIGNATURE_DOMAIN, signingPayload } from "./signing-payload";
 import type { RotatingSecretSet } from "./runtime-security";
 
 export class HttpError extends Error {
@@ -156,7 +157,11 @@ export async function validateAppendAuthorization(
 export const APPEND_AUTH_CONTEXT_HEADER = "X-Tapchat-Append-Auth";
 export const APPEND_AUTH_REASON_HEADER = "X-Tapchat-Append-Auth-Reason";
 
-function capabilityPayload(capability: InboxAppendCapability): string {
+export function capabilityPayload(capability: InboxAppendCapability) {
+  return signingPayload(SIGNATURE_DOMAIN.inboxAppendCapability).pushStr(capabilityBody(capability)).bytes();
+}
+
+function capabilityBody(capability: InboxAppendCapability): string {
   const constraints = capability.constraints
     ? `${capability.constraints.maxBytes ?? ""}:${capability.constraints.maxOpsPerMinute ?? ""}`
     : "";
@@ -181,19 +186,25 @@ function rustCapabilityOperationsDebug(operations: string[]): string {
   return `[${operations.map((operation) => (operation === "append" ? "Append" : operation)).join(", ")}]`;
 }
 
-function bindingPayload(binding: DeviceBinding): string {
-  return `${CURRENT_MODEL_VERSION}:${binding.userId}:${binding.deviceId}:${binding.devicePublicKey}:${binding.createdAt}`;
+export function bindingPayload(binding: DeviceBinding) {
+  return signingPayload(SIGNATURE_DOMAIN.deviceBinding)
+    .pushStr(
+      `${CURRENT_MODEL_VERSION}:${binding.userId}:${binding.deviceId}:${binding.devicePublicKey}:${binding.createdAt}`
+    )
+    .bytes();
 }
 
-function identityBundlePayload(bundle: IdentityBundle, includeDisplayName: boolean): string {
+export function identityBundlePayload(bundle: IdentityBundle) {
+  return signingPayload(SIGNATURE_DOMAIN.identityBundle).pushStr(identityBundleBody(bundle)).bytes();
+}
+
+function identityBundleBody(bundle: IdentityBundle): string {
   const parts = [bundle.version, bundle.userId, bundle.userPublicKey];
   if ((bundle.publicationVersion ?? 0) > 0) {
     parts.push(String(bundle.publicationVersion));
     parts.push(String(bundle.publicationRevision ?? 0));
   }
-  if (includeDisplayName) {
-    parts.push(bundle.displayName ?? "");
-  }
+  parts.push(bundle.displayName ?? "");
   parts.push(
     String(bundle.updatedAt),
     bundle.bundleShareId ?? "",
@@ -231,11 +242,7 @@ export function verifyIdentityBundle(bundle: IdentityBundle): boolean {
   if (bundle.version !== CURRENT_MODEL_VERSION) {
     return false;
   }
-  return (
-    verifyEd25519(bundle.userPublicKey, bundle.signature, identityBundlePayload(bundle, true)) ||
-    ((bundle.publicationVersion ?? 0) === 0 &&
-      verifyEd25519(bundle.userPublicKey, bundle.signature, identityBundlePayload(bundle, false)))
-  );
+  return verifyEd25519(bundle.userPublicKey, bundle.signature, identityBundlePayload(bundle));
 }
 
 export function verifyDeviceBinding(userPublicKey: string, binding: DeviceBinding): boolean {
@@ -249,19 +256,21 @@ function verifyInboxAppendCapability(capability: InboxAppendCapability, devicePu
   return verifyEd25519(devicePublicKey, capability.signature, capabilityPayload(capability));
 }
 
-export function verifyEd25519(publicKeyHex: string, signatureHex: string, payload: string | Uint8Array): boolean {
+/**
+ * Bytes only. A `string` overload would let a caller verify a payload it
+ * assembled itself, which is the thing the domain framing exists to prevent.
+ */
+export function verifyEd25519(publicKeyHex: string, signatureHex: string, payload: Uint8Array): boolean {
   try {
-    const encoded = typeof payload === "string" ? new TextEncoder().encode(payload) : payload;
-    return ed25519.verify(hexToBytes(signatureHex), encoded, hexToBytes(publicKeyHex));
+    return ed25519.verify(hexToBytes(signatureHex), payload, hexToBytes(publicKeyHex));
   } catch {
     return false;
   }
 }
 
-export function groupCapabilitySigningPayload(capability: GroupCapability): string {
+export function groupCapabilitySigningPayload(capability: GroupCapability) {
   const operations = Array.from(new Set(capability.operations)).sort().join(",");
-  return [
-    "tapchat.group_capability.v2",
+  const body = [
     `version=${capability.version}`,
     `service=${capability.service}`,
     `group_id=${capability.groupId}`,
@@ -271,6 +280,7 @@ export function groupCapabilitySigningPayload(capability: GroupCapability): stri
     `operations=${operations}`,
     `expires_at=${capability.expiresAt}`
   ].join("\n");
+  return signingPayload(SIGNATURE_DOMAIN.groupCapability).pushStr(body).bytes();
 }
 
 function unsignedGroupManifest(manifest: GroupManifest): Record<string, unknown> {
@@ -313,18 +323,19 @@ function unsignedGroupManifest(manifest: GroupManifest): Record<string, unknown>
   };
 }
 
-export function groupManifestSigningPayload(manifest: GroupManifest): Uint8Array {
-  const prefix = new TextEncoder().encode("tapchat.group_manifest.v1\n");
-  const body = new TextEncoder().encode(JSON.stringify(unsignedGroupManifest(manifest)));
-  const payload = new Uint8Array(prefix.length + body.length);
-  payload.set(prefix);
-  payload.set(body, prefix.length);
-  return payload;
+/** The JSON both the signature and the hash are taken over. */
+function unsignedGroupManifestJson(manifest: GroupManifest) {
+  return new TextEncoder().encode(JSON.stringify(unsignedGroupManifest(manifest)));
 }
 
-export function groupMembershipProofSigningPayload(proof: GroupMembershipProof): string {
+export function groupManifestSigningPayload(manifest: GroupManifest) {
+  return signingPayload(SIGNATURE_DOMAIN.groupManifest)
+    .pushBytes(unsignedGroupManifestJson(manifest))
+    .bytes();
+}
+
+export function groupMembershipProofSigningPayload(proof: GroupMembershipProof) {
   const fields = [
-    "tapchat.group.membership.v1",
     `proof_type=${proof.type}`,
     `operation=${proof.operation}`,
     `signer_user_id=${proof.signerUserId}`,
@@ -339,12 +350,16 @@ export function groupMembershipProofSigningPayload(proof: GroupMembershipProof):
   if (proof.stateEventMessageId) {
     fields.push(`state_event_message_id=${proof.stateEventMessageId}`);
   }
-  return fields.join("\n");
+  return signingPayload(SIGNATURE_DOMAIN.groupMembershipProof).pushStr(fields.join("\n")).bytes();
 }
 
+/**
+ * Deliberately hashes the bare JSON, without the signing domain: this digest
+ * travels as `GroupMembershipProof.newManifestSha256`, so it is itself inside
+ * a signature, and the Rust `manifest_sha256` must agree byte for byte.
+ */
 export async function groupManifestSha256(manifest: GroupManifest): Promise<string> {
-  const body = new TextEncoder().encode(JSON.stringify(unsignedGroupManifest(manifest)));
-  const digest = await crypto.subtle.digest("SHA-256", body);
+  const digest = await crypto.subtle.digest("SHA-256", unsignedGroupManifestJson(manifest));
   return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 

@@ -7,6 +7,7 @@ use sha2::{Digest, Sha256, Sha512};
 
 use crate::capability::CapabilityManager;
 use crate::error::{CoreError, CoreResult};
+use crate::model::signing::{SignatureDomain, SigningPayload};
 use crate::model::{
     DeploymentBundle, DeviceBinding, DeviceIdentity, DeviceStatus, DeviceStatusKind,
     IdentityBundle, StorageProfile, UserIdentity, Validate, CURRENT_MODEL_VERSION,
@@ -40,20 +41,40 @@ pub struct LocalIdentityState {
 }
 
 impl LocalIdentityState {
-    pub fn user_root_signing_key(&self) -> SigningKey {
+    /// Private, and it must stay private. A `SigningKey` in a caller's hands
+    /// is a signature over bytes of the caller's choosing, which is exactly
+    /// the thing [`SigningPayload`] exists to prevent.
+    fn user_root_signing_key(&self) -> SigningKey {
         SigningKey::from_bytes(&self.user_root_signing_key)
     }
 
-    pub fn device_signing_key(&self) -> SigningKey {
+    fn device_signing_key(&self) -> SigningKey {
         SigningKey::from_bytes(&self.device_signing_key)
     }
 
-    pub fn device_signing_key_bytes(&self) -> [u8; 32] {
+    pub fn device_verifying_key(&self) -> VerifyingKey {
+        self.device_signing_key().verifying_key()
+    }
+
+    /// The one place raw device key material leaves this module: the MLS
+    /// adapter builds its `SignatureKeyPair` from it, so that a KeyPackage is
+    /// signed by the key the counterparty's root-signed bundle vouches for.
+    /// MLS signs under RFC 9420 `SignWithLabel`, which is its own domain.
+    pub(crate) fn device_signing_key_bytes(&self) -> [u8; 32] {
         self.device_signing_key
     }
 
-    pub fn sign_sender_proof(&self, payload: &[u8]) -> String {
-        let signature = self.device_signing_key().sign(payload);
+    /// Sign with the device key. Takes a [`SigningPayload`] rather than bytes,
+    /// so the domain is not something a call site can forget.
+    pub fn sign_payload(&self, payload: SigningPayload) -> String {
+        let signature = self.device_signing_key().sign(&payload.into_bytes());
+        encode_hex(&signature.to_bytes())
+    }
+
+    /// Sign with the user root key. Used only for the device binding and the
+    /// identity bundle — the two statements only the root may make.
+    pub fn sign_payload_with_root(&self, payload: SigningPayload) -> String {
+        let signature = self.user_root_signing_key().sign(&payload.into_bytes());
         encode_hex(&signature.to_bytes())
     }
 }
@@ -66,7 +87,7 @@ pub struct RecoveredUserRoot {
 }
 
 impl RecoveredUserRoot {
-    pub fn user_root_signing_key(&self) -> SigningKey {
+    fn user_root_signing_key(&self) -> SigningKey {
         SigningKey::from_bytes(&self.user_root_signing_key)
     }
 }
@@ -195,16 +216,7 @@ impl IdentityManager {
         }
         let signature = parse_signature(&binding.signature)?;
         verifying_key
-            .verify(
-                build_binding_payload(
-                    &binding.user_id,
-                    &binding.device_id,
-                    &binding.device_public_key,
-                    binding.created_at,
-                )
-                .as_bytes(),
-                &signature,
-            )
+            .verify(&device_binding_payload(binding).into_bytes(), &signature)
             .map_err(|_| CoreError::invalid_input("device binding signature mismatch"))?;
         Ok(())
     }
@@ -222,17 +234,10 @@ impl IdentityManager {
             ));
         }
         let signature = parse_signature(&bundle.signature)?;
-        let verified = verifying_key
-            .verify(identity_bundle_payload(bundle).as_bytes(), &signature)
-            .is_ok()
-            || (bundle.publication_version == 0
-                && verifying_key
-                    .verify(
-                        legacy_identity_bundle_payload(bundle).as_bytes(),
-                        &signature,
-                    )
-                    .is_ok());
-        if !verified {
+        if verifying_key
+            .verify(&identity_bundle_payload(bundle).into_bytes(), &signature)
+            .is_err()
+        {
             return Err(CoreError::invalid_input(
                 "identity bundle signature mismatch",
             ));
@@ -317,11 +322,8 @@ impl IdentityManager {
             updated_at: local_identity.device_status.updated_at,
             signature: String::new(),
         };
-        let signature = local_identity
-            .user_root_signing_key()
-            .sign(identity_bundle_payload(&unsigned).as_bytes());
         Ok(IdentityBundle {
-            signature: encode_hex(&signature.to_bytes()),
+            signature: local_identity.sign_payload_with_root(identity_bundle_payload(&unsigned)),
             ..unsigned
         })
     }
@@ -334,30 +336,32 @@ fn build_device_binding(
     device_public_key: &str,
     created_at: u64,
 ) -> DeviceBinding {
-    DeviceBinding {
+    let unsigned = DeviceBinding {
         version: CURRENT_MODEL_VERSION.to_string(),
         user_id: user_id.to_string(),
         device_id: device_id.to_string(),
         device_public_key: device_public_key.to_string(),
         created_at,
-        signature: encode_hex(
-            &user_root_key
-                .sign(
-                    build_binding_payload(user_id, device_id, device_public_key, created_at)
-                        .as_bytes(),
-                )
-                .to_bytes(),
-        ),
+        signature: String::new(),
+    };
+    let signature = user_root_key.sign(&device_binding_payload(&unsigned).into_bytes());
+    DeviceBinding {
+        signature: encode_hex(&signature.to_bytes()),
+        ..unsigned
     }
 }
 
-fn build_binding_payload(
-    user_id: &str,
-    device_id: &str,
-    device_public_key: &str,
-    created_at: u64,
-) -> String {
-    format!("{CURRENT_MODEL_VERSION}:{user_id}:{device_id}:{device_public_key}:{created_at}")
+/// The body is still a `:`-joined string. Every field in it has a constrained
+/// shape (`user:<hex>`, `device:<hex>:<hex>`, hex, an integer), so it cannot
+/// shift its own frame; making it injective belongs with A5, which moves the
+/// root key anyway. The domain is what commit 1 is for.
+pub fn device_binding_payload(binding: &DeviceBinding) -> SigningPayload {
+    let mut payload = SigningPayload::new(SignatureDomain::DeviceBinding);
+    payload.push_str(&format!(
+        "{CURRENT_MODEL_VERSION}:{}:{}:{}:{}",
+        binding.user_id, binding.device_id, binding.device_public_key, binding.created_at
+    ));
+    payload
 }
 
 fn parse_mnemonic(mnemonic: &str) -> CoreResult<Mnemonic> {
@@ -408,18 +412,17 @@ fn derive_slip10_ed25519_key(seed: &[u8], path: &[u32]) -> CoreResult<[u8; 32]> 
     Ok(secret)
 }
 
-pub fn identity_bundle_payload(bundle: &IdentityBundle) -> String {
-    identity_bundle_payload_with_display_name(bundle, true)
+/// The body is still a `|`-joined string, and it is still not injective:
+/// `display_name` is free text and the device list carries no count. That is
+/// deliberate scope — commit 1 gives every payload a domain, and the framing
+/// of this one is A5's, which relocates the root key regardless.
+pub fn identity_bundle_payload(bundle: &IdentityBundle) -> SigningPayload {
+    let mut payload = SigningPayload::new(SignatureDomain::IdentityBundle);
+    payload.push_str(&identity_bundle_body(bundle));
+    payload
 }
 
-pub fn legacy_identity_bundle_payload(bundle: &IdentityBundle) -> String {
-    identity_bundle_payload_with_display_name(bundle, false)
-}
-
-fn identity_bundle_payload_with_display_name(
-    bundle: &IdentityBundle,
-    include_display_name: bool,
-) -> String {
+fn identity_bundle_body(bundle: &IdentityBundle) -> String {
     let mut parts = vec![
         bundle.version.clone(),
         bundle.user_id.clone(),
@@ -429,9 +432,7 @@ fn identity_bundle_payload_with_display_name(
         parts.push(bundle.publication_version.to_string());
         parts.push(bundle.publication_revision.to_string());
     }
-    if include_display_name {
-        parts.push(bundle.display_name.clone().unwrap_or_default());
-    }
+    parts.push(bundle.display_name.clone().unwrap_or_default());
     parts.extend([
         bundle.updated_at.to_string(),
         bundle.bundle_share_id.clone().unwrap_or_default(),
@@ -543,13 +544,13 @@ pub fn parse_signature(input: &str) -> CoreResult<Signature> {
 
 pub fn verify_device_payload_signature(
     device_public_key: &str,
-    payload: &[u8],
+    payload: SigningPayload,
     signature_hex: &str,
 ) -> CoreResult<()> {
     let verifying_key = parse_verifying_key(device_public_key)?;
     let signature = parse_signature(signature_hex)?;
     verifying_key
-        .verify(payload, &signature)
+        .verify(&payload.into_bytes(), &signature)
         .map_err(|_| CoreError::invalid_input("device signature mismatch"))
 }
 

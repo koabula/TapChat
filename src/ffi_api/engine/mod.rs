@@ -29,13 +29,13 @@ use crate::conversation::{
 use crate::direct_pcs::{commit_hash_from_b64, designated_committer, OwnCommit};
 use crate::error::{CoreError, CoreResult};
 use crate::ffi_api::types::*;
-use crate::identity::{parse_signature, parse_verifying_key, IdentityManager};
+use crate::identity::IdentityManager;
 use crate::log_sanitize::redact_id;
 use crate::mls_adapter::{
     CreateConversationArtifacts, DecryptedApplicationMessage, DeferReason, IngestResult,
     MlsAdapter, PeerDeviceKeyPackage, RejectReason, RemoveMembersArtifacts, WelcomeAuthor,
 };
-use crate::model::signing::envelope_sender_proof_payload;
+use crate::model::signing::{envelope_sender_proof_payload, SignatureDomain, SigningPayload};
 use crate::model::{
     Ack, CapabilityService, Conversation, ConversationKind, ConversationMember, ConversationState,
     DeliveryClass, DeviceStatusKind, Envelope, GroupCapability, GroupCursor, GroupEnvelope,
@@ -80,7 +80,6 @@ use crate::transport_contract::{
     SubmitGroupJoinRequest, SubmitGroupLeaveRequest, TransportAuthRequirement,
 };
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use ed25519_dalek::Verifier;
 use log;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1011,10 +1010,11 @@ impl CoreEngine {
             .local_identity
             .as_ref()
             .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))?;
-        event_envelope.sender_proof.value =
-            identity.sign_sender_proof(encrypted_event.payload_b64.as_bytes());
+        event_envelope.sender_proof.value = identity.sign_payload(
+            Self::group_envelope_sender_proof_payload(&encrypted_event.payload_b64),
+        );
         proof.state_event_message_id = Some(event_envelope.message_id.clone());
-        proof.signature = identity.sign_sender_proof(&Self::membership_proof_payload(&proof));
+        proof.signature = identity.sign_payload(Self::membership_proof_payload(&proof));
         proof.validate()?;
         for item in &mut self.state.pending_group_outbox[pending_start..] {
             if item.envelope.membership_proof.is_some() {
@@ -1937,13 +1937,12 @@ impl CoreEngine {
                 let nonce = self.next_message_nonce();
                 let request_id = self.stable_scoped_id("group-join", &invite.invite_id, nonce);
                 let requested_at = current_unix_millis(self.state.message_nonce);
-                let request_capability = local.sign_sender_proof(
-                    format!(
-                        "group_join_request_capability:{}:{request_id}",
-                        invite.group_id
-                    )
-                    .as_bytes(),
-                );
+                let request_capability = local.sign_payload({
+                    let mut payload =
+                        SigningPayload::new(SignatureDomain::GroupJoinRequestToken);
+                    payload.push_str(&format!("{}:{request_id}", invite.group_id));
+                    payload
+                });
                 let request = GroupJoinRequest {
                     version: crate::model::CURRENT_MODEL_VERSION.to_string(),
                     request_id: request_id.clone(),
@@ -1954,9 +1953,12 @@ impl CoreEngine {
                     joiner_contact_share_url: contact_share,
                     requested_at,
                     request_capability,
-                    signature: local.sign_sender_proof(
-                        format!("group_join_request:{}:{request_id}", invite.group_id).as_bytes(),
-                    ),
+                    signature: local.sign_payload({
+                        let mut payload =
+                            SigningPayload::new(SignatureDomain::GroupJoinRequestSignature);
+                        payload.push_str(&format!("{}:{request_id}", invite.group_id));
+                        payload
+                    }),
                     status: if invite.join_policy == GroupJoinPolicy::OpenByInvite {
                         GroupJoinRequestStatus::WaitingForGroupCommit
                     } else {
@@ -2576,7 +2578,7 @@ fn hex_nibble(value: u8) -> char {
     }
 }
 
-fn group_capability_signing_payload(capability: &GroupCapability) -> String {
+fn group_capability_signing_payload(capability: &GroupCapability) -> SigningPayload {
     let mut operations = capability
         .operations
         .iter()
@@ -2599,8 +2601,9 @@ fn group_capability_signing_payload(capability: &GroupCapability) -> String {
         GroupRole::Admin => "admin",
         GroupRole::Member => "member",
     };
-    format!(
-        "tapchat.group_capability.v2\nversion={}\nservice=group_outbox\ngroup_id={}\nuser_id={}\ndevice_id={}\nrole={}\noperations={}\nexpires_at={}",
+    let mut payload = SigningPayload::new(SignatureDomain::GroupCapability);
+    payload.push_str(&format!(
+        "version={}\nservice=group_outbox\ngroup_id={}\nuser_id={}\ndevice_id={}\nrole={}\noperations={}\nexpires_at={}",
         capability.version,
         capability.group_id,
         capability.user_id,
@@ -2608,7 +2611,8 @@ fn group_capability_signing_payload(capability: &GroupCapability) -> String {
         role,
         operations.join(","),
         capability.expires_at
-    )
+    ));
+    payload
 }
 
 fn hex_lower(bytes: &[u8]) -> String {

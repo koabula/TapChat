@@ -710,7 +710,7 @@ async fn request_device_runtime_credential_v2(
         bail!("runtime_auth_error:challenge:runtime_mismatch");
     }
     let proof = DeviceRuntimeRefreshProof {
-        signature: identity.sign_sender_proof(challenge.signing_payload().as_bytes()),
+        signature: identity.sign_payload(challenge.signing_payload()),
         challenge,
     };
     let (endpoint, body) = match (purpose, device) {

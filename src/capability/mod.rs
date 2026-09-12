@@ -1,7 +1,6 @@
-use ed25519_dalek::{Signer, Verifier};
-
 use crate::error::{CoreError, CoreResult};
-use crate::identity::{encode_hex, parse_verifying_key, LocalIdentityState};
+use crate::identity::LocalIdentityState;
+use crate::model::signing::{SignatureDomain, SigningPayload};
 use crate::model::{
     CapabilityConstraints, CapabilityOperation, CapabilityService, DeploymentBundle,
     DeviceContactProfile, InboxAppendCapability, KeyPackageRef, Validate, CURRENT_MODEL_VERSION,
@@ -48,11 +47,8 @@ impl CapabilityManager {
             }),
             signature: String::new(),
         };
-        let signature = local_identity
-            .device_signing_key()
-            .sign(capability_payload(&unsigned).as_bytes());
         Ok(InboxAppendCapability {
-            signature: encode_hex(&signature.to_bytes()),
+            signature: local_identity.sign_payload(inbox_append_capability_payload(&unsigned)),
             ..unsigned
         })
     }
@@ -154,12 +150,12 @@ impl CapabilityManager {
         device_public_key: &str,
     ) -> CoreResult<()> {
         capability.validate()?;
-        let signature_bytes = crate::identity::parse_signature(&capability.signature)?;
-        let verifying_key = parse_verifying_key(device_public_key)?;
-        verifying_key
-            .verify(capability_payload(capability).as_bytes(), &signature_bytes)
-            .map_err(|_| CoreError::invalid_input("capability signature mismatch"))?;
-        Ok(())
+        crate::identity::verify_device_payload_signature(
+            device_public_key,
+            inbox_append_capability_payload(capability),
+            &capability.signature,
+        )
+        .map_err(|_| CoreError::invalid_input("capability signature mismatch"))
     }
 
     pub fn verify_device_contact_profile(profile: &DeviceContactProfile) -> CoreResult<()> {
@@ -187,7 +183,16 @@ impl CapabilityManager {
     }
 }
 
-fn capability_payload(capability: &InboxAppendCapability) -> String {
+/// The body is still `|`-joined and still derived from `{:?}`. Commit 2
+/// replaces it with structured pushes; commit 1 only puts the domain in
+/// front, so the two changes stay reviewable apart.
+pub fn inbox_append_capability_payload(capability: &InboxAppendCapability) -> SigningPayload {
+    let mut payload = SigningPayload::new(SignatureDomain::InboxAppendCapability);
+    payload.push_str(&capability_body(capability));
+    payload
+}
+
+fn capability_body(capability: &InboxAppendCapability) -> String {
     let constraints = capability
         .constraints
         .as_ref()

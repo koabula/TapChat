@@ -312,11 +312,12 @@ impl CoreEngine {
             .local_identity
             .as_ref()
             .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))?;
-        state_event.sender_proof.value =
-            identity.sign_sender_proof(protected_state_event.payload_b64.as_bytes());
+        state_event.sender_proof.value = identity.sign_payload(
+            Self::group_envelope_sender_proof_payload(&protected_state_event.payload_b64),
+        );
         membership_proof.state_event_message_id = Some(state_event.message_id.clone());
         membership_proof.signature =
-            identity.sign_sender_proof(&Self::membership_proof_payload(&membership_proof));
+            identity.sign_payload(Self::membership_proof_payload(&membership_proof));
         commit.transition_id = Some(transition_id.clone());
         control.transition_id = Some(transition_id.clone());
         commit.membership_proof = Some(membership_proof.clone());
@@ -572,9 +573,11 @@ impl CoreEngine {
             created_at: now,
             expires_at,
             max_uses,
-            signature: identity.sign_sender_proof(
-                format!("group_invite:{group_id}:{invite_id}:{expires_at}").as_bytes(),
-            ),
+            signature: identity.sign_payload({
+                let mut payload = SigningPayload::new(SignatureDomain::GroupInviteToken);
+                payload.push_str(&format!("{group_id}:{invite_id}:{expires_at}"));
+                payload
+            }),
         };
         document.validate()?;
         let capability = self.group_capability(&group_id, role)?;
@@ -1738,8 +1741,11 @@ impl CoreEngine {
                 local_identity.user_identity.user_id,
                 local_identity.device_identity.device_id
             );
-            let request_capability = local_identity
-                .sign_sender_proof(format!("group_leave_request:{request_id}").as_bytes());
+            let request_capability = local_identity.sign_payload({
+                let mut payload = SigningPayload::new(SignatureDomain::GroupLeaveRequestToken);
+                payload.push_str(&request_id);
+                payload
+            });
             let signature_payload = format!(
                 "{}\n{}\n{}\n{}\n{}\n{}",
                 crate::model::CURRENT_MODEL_VERSION,
@@ -1757,7 +1763,12 @@ impl CoreEngine {
                 leaver_device_id: local_identity.device_identity.device_id.clone(),
                 requested_at,
                 request_capability,
-                signature: local_identity.sign_sender_proof(signature_payload.as_bytes()),
+                signature: local_identity.sign_payload({
+                    let mut payload =
+                        SigningPayload::new(SignatureDomain::GroupLeaveRequestSignature);
+                    payload.push_str(&signature_payload);
+                    payload
+                }),
                 status: GroupLeaveRequestStatus::WaitingForGroupCommit,
             }
         };
