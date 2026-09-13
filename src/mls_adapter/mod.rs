@@ -117,6 +117,7 @@ pub struct WelcomeInspection {
     pub conversation_id: String,
     pub author_user_id: String,
     pub author_device_id: String,
+    pub identity_bundle_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -821,14 +822,22 @@ impl MlsAdapter {
     }
 
     pub const REPLY_LANE_EXTENSION_TYPE: u16 = 0xF0A1;
+    pub const IDENTITY_BUNDLE_REF_EXTENSION_TYPE: u16 = 0xF0A2;
 
     fn reply_lane_extension_type() -> ExtensionType {
         ExtensionType::Unknown(Self::REPLY_LANE_EXTENSION_TYPE)
     }
 
+    fn identity_bundle_ref_extension_type() -> ExtensionType {
+        ExtensionType::Unknown(Self::IDENTITY_BUNDLE_REF_EXTENSION_TYPE)
+    }
+
     fn capabilities_with_reply_lane() -> Capabilities {
         Capabilities::builder()
-            .extensions(vec![Self::reply_lane_extension_type()])
+            .extensions(vec![
+                Self::reply_lane_extension_type(),
+                Self::identity_bundle_ref_extension_type(),
+            ])
             .credentials(vec![CredentialType::Basic])
             .build()
     }
@@ -842,6 +851,7 @@ impl MlsAdapter {
             conversation_id,
             peer_devices_with_keypackages,
             None,
+            None,
         )
     }
 
@@ -850,6 +860,7 @@ impl MlsAdapter {
         conversation_id: &str,
         peer_devices_with_keypackages: &[PeerDeviceKeyPackage],
         reply_lane: Option<&str>,
+        identity_bundle_ref: Option<&str>,
     ) -> CoreResult<CreateConversationArtifacts> {
         if conversation_id.trim().is_empty() {
             return Err(CoreError::invalid_input(
@@ -886,20 +897,32 @@ impl MlsAdapter {
         let mut builder = MlsGroupCreateConfig::builder()
             .use_ratchet_tree_extension(true)
             .max_past_epochs(1);
-        if let Some(lane) = reply_lane {
-            let extensions = Extensions::try_from(vec![
-                Extension::RequiredCapabilities(RequiredCapabilitiesExtension::new(
-                    &[Self::reply_lane_extension_type()],
-                    &[],
-                    &[CredentialType::Basic],
-                )),
-                Extension::Unknown(
+        if reply_lane.is_some() || identity_bundle_ref.is_some_and(|value| !value.trim().is_empty())
+        {
+            let mut extensions = Vec::new();
+            if reply_lane.is_some() {
+                extensions.push(Extension::RequiredCapabilities(
+                    RequiredCapabilitiesExtension::new(
+                        &[Self::reply_lane_extension_type()],
+                        &[],
+                        &[CredentialType::Basic],
+                    ),
+                ));
+            }
+            if let Some(lane) = reply_lane {
+                extensions.push(Extension::Unknown(
                     Self::REPLY_LANE_EXTENSION_TYPE,
                     UnknownExtension(lane.as_bytes().to_vec()),
-                ),
-            ])
-            .map_err(|error| {
-                CoreError::invalid_input(format!("reply lane extension is invalid: {error}"))
+                ));
+            }
+            if let Some(reference) = identity_bundle_ref.filter(|value| !value.trim().is_empty()) {
+                extensions.push(Extension::Unknown(
+                    Self::IDENTITY_BUNDLE_REF_EXTENSION_TYPE,
+                    UnknownExtension(reference.as_bytes().to_vec()),
+                ));
+            }
+            let extensions = Extensions::try_from(extensions).map_err(|error| {
+                CoreError::invalid_input(format!("group context extension is invalid: {error}"))
             })?;
             builder = builder
                 .with_group_context_extensions(extensions)
@@ -1428,9 +1451,10 @@ impl MlsAdapter {
         conversation_id: &str,
         dir: u8,
     ) -> CoreResult<[u8; crate::lane_wrap::WRAP_KEY_LEN]> {
-        let state = self.groups.get(conversation_id).ok_or_else(|| {
-            CoreError::invalid_input("conversation MLS state does not exist")
-        })?;
+        let state = self
+            .groups
+            .get(conversation_id)
+            .ok_or_else(|| CoreError::invalid_input("conversation MLS state does not exist"))?;
         let secret = state
             .group
             .export_secret(
@@ -1456,7 +1480,8 @@ impl MlsAdapter {
             .use_ratchet_tree_extension(true)
             .max_past_epochs(1)
             .build();
-        let staged = StagedWelcome::new_from_welcome(&fork.provider, &config, welcome, None).ok()?;
+        let staged =
+            StagedWelcome::new_from_welcome(&fork.provider, &config, welcome, None).ok()?;
         let conversation_id =
             String::from_utf8(staged.group_context().group_id().as_slice().to_vec()).ok()?;
         if !crate::model::is_opaque_id(&conversation_id) {
@@ -1470,10 +1495,17 @@ impl MlsAdapter {
         if parts.next().is_some() || author_user_id.is_empty() || author_device_id.is_empty() {
             return None;
         }
+        let identity_bundle_ref = staged
+            .group_context()
+            .extensions()
+            .unknown(Self::IDENTITY_BUNDLE_REF_EXTENSION_TYPE)
+            .and_then(|extension| String::from_utf8(extension.0.clone()).ok())
+            .filter(|value| !value.trim().is_empty());
         Some(WelcomeInspection {
             conversation_id,
             author_user_id,
             author_device_id,
+            identity_bundle_ref,
         })
     }
 
@@ -2756,6 +2788,34 @@ mod tests {
             device_public_key: identity.device_identity.device_public_key.clone(),
             key_package_b64,
         }
+    }
+
+    #[test]
+    fn inspect_welcome_reads_identity_bundle_ref() {
+        let alice = identity(ALICE_MNEMONIC);
+        let bob = identity(BOB_MNEMONIC);
+        let (mut alice_adapter, _) = MlsAdapter::bootstrap(&alice).expect("alice adapter");
+        let (bob_adapter, bob_package) = MlsAdapter::bootstrap(&bob).expect("bob adapter");
+        let conversation_id = crate::model::random_opaque_id();
+        let reply_lane = crate::model::random_opaque_id();
+        let artifacts = alice_adapter
+            .create_conversation_with_reply_lane(
+                &conversation_id,
+                &[peer(&bob, bob_package.key_package_b64)],
+                Some(&reply_lane),
+                Some("https://example.test/v1/contact-share/alice"),
+            )
+            .expect("create");
+        let inspection = bob_adapter
+            .inspect_welcome(&artifacts.welcomes[0].payload_b64)
+            .expect("inspect");
+        assert_eq!(inspection.conversation_id, conversation_id);
+        assert_eq!(inspection.author_user_id, alice.user_identity.user_id);
+        assert_eq!(inspection.author_device_id, alice.device_identity.device_id);
+        assert_eq!(
+            inspection.identity_bundle_ref.as_deref(),
+            Some("https://example.test/v1/contact-share/alice")
+        );
     }
 
     #[test]

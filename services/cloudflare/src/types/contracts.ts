@@ -600,9 +600,6 @@ export interface AppendEnvelopeRequest {
   version: string;
   recipientDeviceId: string;
   envelope: Envelope;
-  senderBundleShareUrl?: string;
-  senderBundleHash?: string;
-  senderDisplayName?: string;
 }
 
 export interface AppendEnvelopeResult {
@@ -928,6 +925,7 @@ export interface MessageRequestItem {
   messageCount: number;
   lastMessageId: string;
   lastConversationId?: string;
+  welcomeBytes?: string;
   requestKind?: "direct" | "group_invite";
   groupId?: string;
   groupTitle?: string;

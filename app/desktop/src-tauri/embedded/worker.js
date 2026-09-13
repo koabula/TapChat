@@ -5762,9 +5762,6 @@ var InboxService = class {
       recipientDeviceId: this.deviceId,
       lane,
       senderUserId: "",
-      senderBundleShareUrl: input.senderBundleShareUrl,
-      senderBundleHash: input.senderBundleHash,
-      senderDisplayName: input.senderDisplayName,
       firstSeenAt: now,
       lastSeenAt: now,
       messageCount: 0,
@@ -5773,9 +5770,6 @@ var InboxService = class {
       byteSize: 0,
       expiresAt: now + (limits.messageRequestTtlSeconds ?? 7 * 24 * 60 * 60) * 1e3
     };
-    entry.senderBundleShareUrl ??= input.senderBundleShareUrl;
-    entry.senderBundleHash ??= input.senderBundleHash;
-    entry.senderDisplayName ??= input.senderDisplayName;
     entry.lastSeenAt = now;
     entry.messageCount += 1;
     entry.lastMessageId = input.envelope.mid;
@@ -6036,6 +6030,7 @@ var InboxService = class {
       lastSeenAt: entry.lastSeenAt,
       messageCount: entry.messageCount,
       lastMessageId: entry.lastMessageId,
+      welcomeBytes: entry.pendingRequests[0]?.envelope.bytes,
       requestKind: "direct"
     };
   }

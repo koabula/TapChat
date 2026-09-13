@@ -215,6 +215,9 @@ pub enum CoreCommand {
         user_id: String,
     },
     ListMessageRequests,
+    PreviewWelcome {
+        welcome_bytes: String,
+    },
     ActOnMessageRequest {
         request_id: String,
         action: MessageRequestAction,
@@ -1087,6 +1090,15 @@ pub struct SystemBanner {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WelcomePreview {
+    pub conversation_id: String,
+    pub author_user_id: String,
+    pub author_device_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_bundle_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessageRequestActionSummary {
     pub accepted: bool,
     pub request_id: String,
@@ -1133,6 +1145,8 @@ pub struct CoreViewModel {
     pub banners: Vec<SystemBanner>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub message_requests: Vec<MessageRequestItem>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub welcome_preview: Option<WelcomePreview>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revoked_contact_user_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

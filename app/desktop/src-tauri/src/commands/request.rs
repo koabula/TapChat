@@ -79,35 +79,51 @@ async fn act_on_message_request_impl(
             ensure_fresh_device_runtime_auth_for_state(state.inner())
                 .await
                 .map_err(|error| error.to_string())?;
-            let sender_bundle_share_url = match sender_bundle_share_url {
-                Some(url) if !url.trim().is_empty() => url,
-                _ => {
-                    let output = drive_core_with_handle(
-                        &app,
-                        CoreInput::Command(CoreCommand::ListMessageRequests),
-                    )
+            let listed =
+                drive_core_with_handle(&app, CoreInput::Command(CoreCommand::ListMessageRequests))
                     .await
                     .map_err(|e| e.to_string())?;
-                    output
-                        .view_model
-                        .and_then(|vm| {
-                            vm.message_requests
-                                .into_iter()
-                                .find(|request| request.request_id == request_id)
-                        })
-                        .and_then(|request| request.sender_bundle_share_url)
-                        .ok_or_else(|| {
-                            "sender bundle share url is missing; cannot safely accept this request"
-                                .to_string()
-                        })?
-                }
-            };
+            let request = listed
+                .view_model
+                .and_then(|vm| {
+                    vm.message_requests
+                        .into_iter()
+                        .find(|request| request.request_id == request_id)
+                })
+                .ok_or_else(|| "message request not found".to_string())?;
+            let welcome_bytes = request.welcome_bytes.clone().ok_or_else(|| {
+                "message request is missing the Welcome that names the sender".to_string()
+            })?;
+            let preview = drive_core_with_handle(
+                &app,
+                CoreInput::Command(CoreCommand::PreviewWelcome { welcome_bytes }),
+            )
+            .await
+            .map_err(|e| e.to_string())?
+            .view_model
+            .and_then(|vm| vm.welcome_preview)
+            .ok_or_else(|| "welcome preview was not returned by core".to_string())?;
+            let sender_bundle_share_url = preview
+                .identity_bundle_ref
+                .clone()
+                .filter(|value| !value.trim().is_empty())
+                .or(sender_bundle_share_url.filter(|url| !url.trim().is_empty()))
+                .or(request.sender_bundle_share_url)
+                .ok_or_else(|| {
+                    "sender bundle share url is missing; cannot safely accept this request"
+                        .to_string()
+                })?;
 
             let sender_bundle = tapchat_core::contact_workflows::fetch_identity_bundle_from_url(
                 &sender_bundle_share_url,
             )
             .await
             .map_err(|error| error.to_string())?;
+            if sender_bundle.user_id != preview.author_user_id {
+                return Err(
+                    "fetched identity bundle user_id does not match the Welcome author".to_string(),
+                );
+            }
             let imported_sender_user_id = sender_bundle.user_id.clone();
 
             drive_core_with_handle(

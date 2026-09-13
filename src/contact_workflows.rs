@@ -44,13 +44,30 @@ pub async fn accept_message_request_with_bundle_import(
         .into_iter()
         .find(|item| item.request_id == request_id)
         .ok_or_else(|| anyhow!("message request not found"))?;
-    let sender_bundle_share_url = request.sender_bundle_share_url.clone().ok_or_else(|| {
-        anyhow!(
-            "sender bundle share url is missing; the request did not include an importable identity bundle"
-        )
-    })?;
+    let welcome_bytes = request
+        .welcome_bytes
+        .clone()
+        .ok_or_else(|| anyhow!("message request is missing the Welcome that names the sender"))?;
+    let preview = driver
+        .run_command_until_idle(CoreCommand::PreviewWelcome { welcome_bytes })
+        .await?;
+    let preview = preview
+        .view_model
+        .as_ref()
+        .and_then(|view| view.welcome_preview.clone())
+        .ok_or_else(|| anyhow!("welcome preview was not returned by core"))?;
+    let sender_bundle_share_url = preview
+        .identity_bundle_ref
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .or(request.sender_bundle_share_url.clone())
+        .ok_or_else(|| {
+            anyhow!(
+                "sender bundle share url is missing; the Welcome did not include an importable identity bundle"
+            )
+        })?;
     let bundle = fetch_identity_bundle_from_url(&sender_bundle_share_url).await?;
-    ensure_fetched_bundle_matches_expected_sender(&bundle, &request.sender_user_id)?;
+    ensure_fetched_bundle_matches_expected_sender(&bundle, &preview.author_user_id)?;
     import_identity_bundle_into_profile(profile, driver, bundle).await?;
     let output = driver
         .run_command_until_idle(CoreCommand::ActOnMessageRequest {

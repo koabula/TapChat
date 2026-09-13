@@ -36,9 +36,7 @@ use crate::mls_adapter::{
     CreateConversationArtifacts, DecryptedApplicationMessage, DeferReason, IngestResult,
     MlsAdapter, PeerDeviceKeyPackage, RejectReason, RemoveMembersArtifacts, WelcomeAuthor,
 };
-use crate::model::signing::{
-    group_envelope_sender_proof_payload, SignatureDomain, SigningPayload,
-};
+use crate::model::signing::{group_envelope_sender_proof_payload, SignatureDomain, SigningPayload};
 use crate::model::{
     Ack, CapabilityService, Conversation, ConversationKind, ConversationMember, ConversationState,
     DeliveryClass, DeviceStatusKind, Envelope, GroupCapability, GroupCursor, GroupEnvelope,
@@ -64,23 +62,23 @@ use crate::persistence::{
 };
 use crate::sync_engine::{SyncDecision, SyncEngine};
 use crate::transport_contract::{
-    AckRequest, AckResult, AppendDeliveryDisposition, AppendEnvelopeRequest,
-    AppendEnvelopeResult, AppendGroupEnvelopeRequest, AppendGroupEnvelopeResult,
-    AppendGroupTransitionRequest, BlobDownloadRequest, BlobUploadRequest, ClaimGroupJoinRequest,
-    ClaimGroupLeaveRequest, CompleteGroupJoinRequest, CreateGroupInviteRequest,
-    DecideGroupJoinRequest, DeviceStatusDocument, DeviceStatusRecord, RegisterAcceptedLaneRequest,
-    FetchGroupInviteRequest, FetchGroupOutboxRequest, FetchGroupOutboxResult,
-    FetchIdentityBundleRequest, FetchMessageRequestsRequest, FetchMessagesRequest,
-    FetchMessagesResult, FetchWelcomePickupRequest, FetchWelcomePickupResult,
+    AckRequest, AckResult, AppendDeliveryDisposition, AppendEnvelopeRequest, AppendEnvelopeResult,
+    AppendGroupEnvelopeRequest, AppendGroupEnvelopeResult, AppendGroupTransitionRequest,
+    BlobDownloadRequest, BlobUploadRequest, ClaimGroupJoinRequest, ClaimGroupLeaveRequest,
+    CompleteGroupJoinRequest, CreateGroupInviteRequest, DecideGroupJoinRequest,
+    DeviceStatusDocument, DeviceStatusRecord, FetchGroupInviteRequest, FetchGroupOutboxRequest,
+    FetchGroupOutboxResult, FetchIdentityBundleRequest, FetchMessageRequestsRequest,
+    FetchMessagesRequest, FetchMessagesResult, FetchWelcomePickupRequest, FetchWelcomePickupResult,
     GetGroupAuthorizationStateRequest, GetGroupJoinRequestStatusRequest, GetGroupOutboxHeadRequest,
     GetHeadResult, GroupAuthorizationUpdate, GroupJoinDecision,
     InitializeGroupAuthorizationRequest, ListGroupInvitesRequest, ListGroupJoinRequestsRequest,
     ListGroupLeaveRequestsRequest, MessageRequestAction, MessageRequestActionRequest,
     MessageRequestActionResult, MessageRequestItem, PrepareBlobUploadRequest,
     PrepareBlobUploadResult, PublishSharedStateRequest, PutWelcomePickupRequest,
-    PutWelcomePickupResult, RealtimeSubscriptionRequest, RevokeAcceptedLanesRequest,
-    RevokeGroupInviteRequest, SealGroupOutboxRequest, SharedStateDocumentKind,
-    SubmitGroupJoinRequest, SubmitGroupLeaveRequest, TransportAuthRequirement,
+    PutWelcomePickupResult, RealtimeSubscriptionRequest, RegisterAcceptedLaneRequest,
+    RevokeAcceptedLanesRequest, RevokeGroupInviteRequest, SealGroupOutboxRequest,
+    SharedStateDocumentKind, SubmitGroupJoinRequest, SubmitGroupLeaveRequest,
+    TransportAuthRequirement,
 };
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use log;
@@ -232,6 +230,10 @@ enum ApplicationPlaintextDecision {
     Accepted {
         plaintext: String,
         app_message_id: Option<String>,
+    },
+    LaneRotation {
+        identity_bundle_ref: String,
+        app_message_id: String,
     },
     DuplicateAppMessage {
         app_message_id: String,
@@ -1269,6 +1271,7 @@ impl CoreEngine {
             CoreCommand::SyncInbox { device_id, reason } => self.sync_inbox(device_id, reason),
             CoreCommand::RefreshIdentityState { user_id } => self.refresh_identity_state(user_id),
             CoreCommand::ListMessageRequests => self.list_message_requests(),
+            CoreCommand::PreviewWelcome { welcome_bytes } => self.preview_welcome(welcome_bytes),
             CoreCommand::ActOnMessageRequest { request_id, action } => {
                 self.act_on_message_request(request_id, action)
             }
@@ -3340,6 +3343,9 @@ fn merge_outputs(mut base: CoreOutput, mut next: CoreOutput) -> CoreOutput {
             }
             if next_view.append_result.is_some() {
                 base_view.append_result = next_view.append_result.take();
+            }
+            if next_view.welcome_preview.is_some() {
+                base_view.welcome_preview = next_view.welcome_preview.take();
             }
             if next_view.group_sync_results.is_some() {
                 base_view.group_sync_results = next_view.group_sync_results.take();

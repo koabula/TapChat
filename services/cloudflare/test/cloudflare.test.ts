@@ -1715,6 +1715,7 @@ test("message requests stay out of inbox until accepted", async () => {
   const requests = (await list.json()) as MessageRequestListResult & { version: string };
   assert.equal(requests.requests.length, 1);
   assert.equal(requests.requests[0].messageCount, 2);
+  assert.equal(requests.requests[0].welcomeBytes, "cipher");
 
   const accept = await handleRequest(
     new Request(`https://example.com/v1/inbox/device:bob:phone/message-requests/${encodeURIComponent(requests.requests[0].requestId)}/accept`, {

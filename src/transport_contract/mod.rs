@@ -15,12 +15,6 @@ pub struct AppendEnvelopeRequest {
     pub version: String,
     pub recipient_device_id: String,
     pub envelope: Envelope,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sender_bundle_share_url: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sender_bundle_hash: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sender_display_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -643,7 +637,10 @@ pub struct MessageRequestItem {
     pub last_seen_at: u64,
     pub message_count: u64,
     pub last_message_id: String,
+    #[serde(default)]
     pub last_conversation_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub welcome_bytes: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_kind: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -783,9 +780,6 @@ mod tests {
                 "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
                 "cipher",
             ),
-            sender_bundle_share_url: None,
-            sender_bundle_hash: None,
-            sender_display_name: None,
         };
         let json = serde_json::to_string(&append).expect("serialize");
         assert!(!json.contains("cloudflare"));
@@ -829,7 +823,8 @@ mod tests {
         assert!(!json.contains("cloudflare"));
         assert!(!json.contains("durable"));
 
-        let decoded: RegisterAcceptedLaneRequest = serde_json::from_str(&json).expect("deserialize");
+        let decoded: RegisterAcceptedLaneRequest =
+            serde_json::from_str(&json).expect("deserialize");
         assert_eq!(decoded.lane, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
     }
 

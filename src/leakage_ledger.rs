@@ -532,11 +532,6 @@ pub(crate) fn maximal_append_request() -> crate::transport_contract::AppendEnvel
         version: CURRENT_MODEL_VERSION.to_string(),
         recipient_device_id: envelope.recipient_device_id.clone(),
         envelope,
-        sender_bundle_share_url: Some(
-            "https://runtime.example/v1/contact-share/abcdef".to_string(),
-        ),
-        sender_bundle_hash: Some("f".repeat(64)),
-        sender_display_name: Some(sentinel::DISPLAY_NAME.to_string()),
     }
 }
 
@@ -980,7 +975,9 @@ mod tests {
         let signed: Vec<&str> = ledger
             .entries
             .iter()
-            .filter(|entry| entry.surface == "append_request" && entry.path.starts_with("envelope."))
+            .filter(|entry| {
+                entry.surface == "append_request" && entry.path.starts_with("envelope.")
+            })
             .filter(|entry| entry.signed)
             .map(|entry| entry.path.as_str())
             .collect();

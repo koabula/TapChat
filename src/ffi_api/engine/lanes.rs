@@ -337,6 +337,30 @@ impl CoreEngine {
             device_public_key,
         })
     }
+
+    pub(super) fn preview_welcome(&self, welcome_bytes: String) -> CoreResult<CoreOutput> {
+        let adapter = self
+            .state
+            .mls_adapter
+            .as_ref()
+            .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?;
+        let inspection = adapter
+            .inspect_welcome(&welcome_bytes)
+            .ok_or_else(|| CoreError::invalid_input("welcome could not be inspected"))?;
+        Ok(CoreOutput {
+            state_update: CoreStateUpdate::default(),
+            effects: Vec::new(),
+            view_model: Some(CoreViewModel {
+                welcome_preview: Some(crate::ffi_api::WelcomePreview {
+                    conversation_id: inspection.conversation_id,
+                    author_user_id: inspection.author_user_id,
+                    author_device_id: inspection.author_device_id,
+                    identity_bundle_ref: inspection.identity_bundle_ref,
+                }),
+                ..CoreViewModel::default()
+            }),
+        })
+    }
 }
 
 pub(super) struct ResolvedInbound {

@@ -1012,7 +1012,15 @@ impl CoreEngine {
             .mls_adapter
             .as_mut()
             .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
-            .create_conversation_with_reply_lane(&conversation_id, &peer_keypackages, Some(&c2))?;
+            .create_conversation_with_reply_lane(
+                &conversation_id,
+                &peer_keypackages,
+                Some(&c2),
+                self.state
+                    .local_bundle
+                    .as_ref()
+                    .and_then(|bundle| bundle.identity_bundle_ref.as_deref()),
+            )?;
         let summary = self
             .state
             .mls_adapter
@@ -1030,14 +1038,6 @@ impl CoreEngine {
         let register_c2 = self.register_accepted_lane(c2)?;
 
         let mut generated = Vec::new();
-        for device_id in &peer_device_ids {
-            generated.push(self.build_envelope(
-                &conversation_id,
-                device_id,
-                MessageType::MlsCommit,
-                artifacts.commit_b64.clone(),
-            )?);
-        }
         for welcome in &artifacts.welcomes {
             generated.push(self.build_envelope(
                 &conversation_id,
@@ -1077,7 +1077,7 @@ impl CoreEngine {
                         group_role: None,
                         group_cursor: None,
                         last_message_preview: None,
-                        last_message_type: Some(MessageType::MlsCommit),
+                        last_message_type: Some(MessageType::MlsWelcome),
                         message_count: None,
                         recovery: None,
                     }],
@@ -1798,17 +1798,6 @@ impl CoreEngine {
                         reason: "local device is not in protected audience".into(),
                     };
                 }
-                if protected.payload_kind == ProtectedPayloadKind::LaneRotation {
-                    return ApplicationPlaintextDecision::Accepted {
-                        plaintext: String::new(),
-                        app_message_id: Some(protected.app_message_id),
-                    };
-                }
-                if protected.payload_kind != ProtectedPayloadKind::Text {
-                    return ApplicationPlaintextDecision::RejectedProtocol {
-                        reason: "unsupported protected payload kind".into(),
-                    };
-                }
                 let app_prefix = format!("app:{}:", protected.conversation_id);
                 let app_suffix = format!(":{}", protected.sender_device_id);
                 if !protected.app_message_id.starts_with(&app_prefix)
@@ -1824,9 +1813,37 @@ impl CoreEngine {
                         app_message_id: protected.app_message_id,
                     };
                 }
-                ApplicationPlaintextDecision::Accepted {
-                    plaintext: protected.body,
-                    app_message_id: Some(protected.app_message_id),
+                match protected.payload_kind {
+                    ProtectedPayloadKind::LaneRotation => {
+                        let body: crate::model::LaneRotationBody =
+                            match serde_json::from_str(&protected.body) {
+                                Ok(body) => body,
+                                Err(_) => {
+                                    return ApplicationPlaintextDecision::RejectedProtocol {
+                                        reason: "lane rotation body is malformed".into(),
+                                    };
+                                }
+                            };
+                        let registered_outbound = self
+                            .state
+                            .conversations
+                            .get(&conversation_id)
+                            .and_then(|conversation| conversation.lanes.as_ref())
+                            .map(|lanes| lanes.outbound_lane.as_str());
+                        if registered_outbound != Some(body.inbound_lane.as_str()) {
+                            log::info!(
+                                "lane rotation inbound_lane does not match the registered outbound lane; ignoring lane change"
+                            );
+                        }
+                        ApplicationPlaintextDecision::LaneRotation {
+                            identity_bundle_ref: body.identity_bundle_ref,
+                            app_message_id: protected.app_message_id,
+                        }
+                    }
+                    ProtectedPayloadKind::Text => ApplicationPlaintextDecision::Accepted {
+                        plaintext: protected.body,
+                        app_message_id: Some(protected.app_message_id),
+                    },
                 }
             }
             Err(error) => {
@@ -1957,6 +1974,50 @@ impl CoreEngine {
         });
         state.last_message_type = Some(MessageType::MlsApplication);
         state.conversation.updated_at = created_at;
+        Ok(true)
+    }
+
+    pub(super) fn remember_app_message_id(
+        &mut self,
+        record: &InboxRecord,
+        app_message_id: String,
+        mls_ciphertext_sha256: String,
+    ) -> CoreResult<bool> {
+        let conversation_id = self
+            .conversation_id_for_lane(&record.envelope.lane)
+            .ok_or_else(|| CoreError::invalid_input("conversation does not exist"))?;
+        let peer_user_id = self
+            .state
+            .conversations
+            .get(&conversation_id)
+            .map(|conversation| conversation.peer_user_id.clone())
+            .ok_or_else(|| CoreError::invalid_input("conversation does not exist"))?;
+        let state = self
+            .state
+            .conversations
+            .get_mut(&conversation_id)
+            .ok_or_else(|| CoreError::invalid_input("conversation does not exist"))?;
+        let duplicate = state.messages.iter().any(|message| {
+            message.message_id == record.message_id
+                || message.app_message_id.as_deref() == Some(app_message_id.as_str())
+        });
+        if duplicate {
+            return Ok(false);
+        }
+        state.messages.push(StoredMessage {
+            message_id: record.message_id.clone(),
+            app_message_id: Some(app_message_id),
+            mls_ciphertext_sha256: Some(mls_ciphertext_sha256),
+            sender_user_id: Some(peer_user_id),
+            sender_device_id: String::new(),
+            recipient_device_id: record.envelope.recipient_device_id.clone(),
+            message_type: MessageType::MlsApplication,
+            created_at: current_unix_millis(record.seq),
+            plaintext: None,
+            storage_refs: Vec::new(),
+            delivery_state: None,
+            message_request_id: None,
+        });
         Ok(true)
     }
 
@@ -3105,62 +3166,99 @@ impl CoreEngine {
             envelopes.push(envelope);
         }
         self.enqueue_envelopes(peer_user_id.clone(), envelopes);
-        let rotation_lanes = self
+        self.enqueue_lane_rotation(conversation_id, &peer_user_id, &recipient_device_ids)?;
+        Ok(true)
+    }
+
+    fn enqueue_lane_rotation(
+        &mut self,
+        conversation_id: &str,
+        peer_user_id: &str,
+        recipient_device_ids: &[String],
+    ) -> CoreResult<()> {
+        let Some(reference) = self
+            .state
+            .local_bundle
+            .as_ref()
+            .and_then(|bundle| bundle.identity_bundle_ref.clone())
+            .filter(|value| !value.trim().is_empty())
+        else {
+            log::info!("skipping lane rotation: local identity_bundle_ref is missing");
+            return Ok(());
+        };
+        let Some(inbound_lane) = self
             .state
             .conversations
             .get(conversation_id)
-            .and_then(|conversation| conversation.lanes.clone());
-        let rotation_identity = self.state.local_identity.clone();
-        let rotation_bundle = self.state.local_bundle.clone();
-        if let (Some(lanes), Some(identity), Some(bundle)) =
-            (rotation_lanes, rotation_identity, rotation_bundle)
-        {
-            let nonce = self.next_message_nonce();
-            let sent_at = current_unix_millis(nonce);
-            let rotation = crate::model::ProtectedAppMessage::new_lane_rotation(
-                self.next_app_message_id(
-                    conversation_id,
-                    &identity.device_identity.device_id,
-                    nonce,
-                ),
-                conversation_id.to_string(),
-                identity.user_identity.user_id.clone(),
-                identity.device_identity.device_id.clone(),
-                peer_user_id.clone(),
-                recipient_device_ids.clone(),
-                lanes.inbound_lane,
-                bundle.identity_bundle_ref.clone().unwrap_or_default(),
-                sent_at,
-            );
-            if let Ok(rotation) = rotation {
-                if let Ok(bytes) = rotation.to_json_bytes() {
-                    if let Ok(payload) = self
-                        .state
-                        .mls_adapter
-                        .as_mut()
-                        .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))
-                        .and_then(|adapter| adapter.encrypt_application(conversation_id, &bytes))
-                    {
-                        let mut rotation_envelopes = Vec::new();
-                        for device_id in &recipient_device_ids {
-                            rotation_envelopes.push(self.build_envelope(
-                                conversation_id,
-                                device_id,
-                                MessageType::MlsApplication,
-                                payload.payload_b64.clone(),
-                            )?);
-                        }
-                        self.enqueue_envelopes_with_plaintext(
-                            peer_user_id,
-                            rotation_envelopes,
-                            String::new(),
-                            Some(rotation.app_message_id.clone()),
-                        );
-                    }
-                }
-            }
+            .and_then(|conversation| conversation.lanes.as_ref())
+            .map(|lanes| lanes.inbound_lane.clone())
+        else {
+            return Ok(());
+        };
+        let (sender_user_id, sender_device_id) = self
+            .state
+            .local_identity
+            .as_ref()
+            .map(|identity| {
+                (
+                    identity.user_identity.user_id.clone(),
+                    identity.device_identity.device_id.clone(),
+                )
+            })
+            .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))?;
+        let nonce = self.next_message_nonce();
+        let sent_at = current_unix_millis(nonce);
+        let rotation = crate::model::ProtectedAppMessage::new_lane_rotation(
+            self.next_app_message_id(conversation_id, &sender_device_id, nonce),
+            conversation_id.to_string(),
+            sender_user_id,
+            sender_device_id,
+            peer_user_id.to_string(),
+            recipient_device_ids.to_vec(),
+            inbound_lane,
+            reference,
+            sent_at,
+        )?;
+        let bytes = rotation.to_json_bytes()?;
+        let payload = self
+            .state
+            .mls_adapter
+            .as_mut()
+            .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
+            .encrypt_application(conversation_id, &bytes)?;
+        let mut rotation_envelopes = Vec::new();
+        for device_id in recipient_device_ids {
+            rotation_envelopes.push(self.build_envelope(
+                conversation_id,
+                device_id,
+                MessageType::MlsApplication,
+                payload.payload_b64.clone(),
+            )?);
         }
-        Ok(true)
+        self.enqueue_envelopes_with_plaintext(
+            peer_user_id.to_string(),
+            rotation_envelopes,
+            String::new(),
+            Some(rotation.app_message_id),
+        );
+        Ok(())
+    }
+
+    pub(super) fn fetch_peer_identity_bundle(
+        &self,
+        user_id: String,
+        reference: String,
+    ) -> CoreOutput {
+        CoreOutput {
+            state_update: CoreStateUpdate::default(),
+            effects: vec![CoreEffect::FetchIdentityBundle {
+                fetch: FetchIdentityBundleRequest {
+                    user_id,
+                    reference: Some(reference),
+                },
+            }],
+            view_model: None,
+        }
     }
 
     /// Arbitrate an inbound commit against our own commit for the same base

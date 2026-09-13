@@ -478,9 +478,6 @@ export class InboxService {
       recipientDeviceId: this.deviceId,
       lane,
       senderUserId: "",
-      senderBundleShareUrl: input.senderBundleShareUrl,
-      senderBundleHash: input.senderBundleHash,
-      senderDisplayName: input.senderDisplayName,
       firstSeenAt: now,
       lastSeenAt: now,
       messageCount: 0,
@@ -489,9 +486,6 @@ export class InboxService {
       byteSize: 0,
       expiresAt: now + (limits.messageRequestTtlSeconds ?? 7 * 24 * 60 * 60) * 1000
     };
-    entry.senderBundleShareUrl ??= input.senderBundleShareUrl;
-    entry.senderBundleHash ??= input.senderBundleHash;
-    entry.senderDisplayName ??= input.senderDisplayName;
     entry.lastSeenAt = now;
     entry.messageCount += 1;
     entry.lastMessageId = input.envelope.mid;
@@ -774,6 +768,7 @@ export class InboxService {
       lastSeenAt: entry.lastSeenAt,
       messageCount: entry.messageCount,
       lastMessageId: entry.lastMessageId,
+      welcomeBytes: entry.pendingRequests[0]?.envelope.bytes,
       requestKind: "direct"
     };
   }

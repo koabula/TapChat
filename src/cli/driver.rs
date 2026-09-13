@@ -43,10 +43,9 @@ use crate::transport_contract::{
     ListGroupLeaveRequestsResult, MessageRequestActionRequest, PrepareBlobUploadRequest,
     PublishSharedStateRequest, PutWelcomePickupRequest, PutWelcomePickupResult,
     RealtimeSubscriptionRequest, RegisterAcceptedLaneRequest, RevokeAcceptedLanesRequest,
-    RevokeGroupInviteRequest,
-    RevokeGroupInviteResult, SealGroupOutboxRequest, SealGroupOutboxResult, SubmitGroupJoinRequest,
-    SubmitGroupJoinResult, SubmitGroupLeaveRequest, SubmitGroupLeaveResult,
-    TransportAuthRequirement,
+    RevokeGroupInviteRequest, RevokeGroupInviteResult, SealGroupOutboxRequest,
+    SealGroupOutboxResult, SubmitGroupJoinRequest, SubmitGroupJoinResult, SubmitGroupLeaveRequest,
+    SubmitGroupLeaveResult, TransportAuthRequirement,
 };
 
 use super::util::{
@@ -290,15 +289,18 @@ impl CoreDriver {
     pub fn pending_mls_artifacts(&self, conversation_id: &str) -> PendingMlsArtifacts {
         let mut artifacts = PendingMlsArtifacts::default();
         let matches_conversation = |envelope: &Envelope| {
-            self.runtime.latest_snapshot.as_ref().is_some_and(|snapshot| {
-                snapshot.conversations.iter().any(|persisted| {
-                    persisted.conversation_id == conversation_id
-                        && persisted.state.lanes.as_ref().is_some_and(|lanes| {
-                            lanes.outbound_lane == envelope.lane
-                                || lanes.inbound_lane == envelope.lane
-                        })
+            self.runtime
+                .latest_snapshot
+                .as_ref()
+                .is_some_and(|snapshot| {
+                    snapshot.conversations.iter().any(|persisted| {
+                        persisted.conversation_id == conversation_id
+                            && persisted.state.lanes.as_ref().is_some_and(|lanes| {
+                                lanes.outbound_lane == envelope.lane
+                                    || lanes.inbound_lane == envelope.lane
+                            })
+                    })
                 })
-            })
         };
         let count = |envelope: &Envelope, artifacts: &mut PendingMlsArtifacts| {
             if crate::mls_adapter::MlsAdapter::payload_is_welcome(
@@ -528,16 +530,7 @@ impl CoreDriver {
         }
         if let Some(body) = request.body.as_deref() {
             if request.url.contains("/messages") {
-                let mut append_request: AppendEnvelopeRequest = serde_json::from_str(body)?;
-                if append_request.sender_bundle_share_url.is_none() {
-                    append_request.sender_bundle_share_url = self.runtime.contact_share_url.clone();
-                }
-                if append_request.sender_bundle_hash.is_none() {
-                    append_request.sender_bundle_hash = self
-                        .engine
-                        .local_bundle()
-                        .map(|bundle| bundle.signature.clone());
-                }
+                let append_request: AppendEnvelopeRequest = serde_json::from_str(body)?;
                 self.runtime
                     .recent_appends
                     .push(append_request.envelope.clone());

@@ -7,52 +7,29 @@
 % noticed the format!.
 
 % --- sender_identity: tab:inbox, Social graph rows
-append\_request & envelope.senderDeviceId & sender\_device, sender\_user \\
-append\_request & envelope.senderUserId & sender\_user \\
-append\_request & senderBundleHash & --- \\
-append\_request & senderBundleShareUrl & --- \\
-append\_request & senderDisplayName & display\_name \\
-inbox\_do\_key & message-request:{senderUserId} & sender\_user \\
-inbox\_do\_key & rate-limit:{senderUserId} & sender\_user \\
 message\_request\_action\_request & requestId & sender\_user \\
-realtime\_event & requestId & sender\_user \\
+realtime\_event & requestId & --- \\
 realtime\_event & senderUserId & sender\_user \\
-replace\_allowlist\_request & document.allowedSenderUserIds[] & sender\_user \\
-replace\_allowlist\_request & document.rejectedSenderUserIds[] & recipient\_user \\
 \addlinespace
 
 % --- message_index: tab:inbox, Linkability rows
-ack\_request & ack.ackedMessageIds[] & message\_nonce, recipient\_device, recipient\_user, sender\_user \\
-append\_request & envelope.conversationId & recipient\_user, sender\_user \\
-append\_request & envelope.messageId & message\_nonce, recipient\_device, recipient\_user, sender\_user \\
-inbox\_do\_key & append-result:{messageId} & message\_nonce, recipient\_device, recipient\_user, sender\_user \\
-inbox\_do\_key & idempotency:{messageId} & message\_nonce, recipient\_device, recipient\_user, sender\_user \\
-prepare\_blob\_upload\_request & conversationId & recipient\_user, sender\_user \\
-prepare\_blob\_upload\_request & messageId & message\_nonce, recipient\_device, recipient\_user, sender\_user \\
+append\_request & envelope.lane & --- \\
+append\_request & envelope.mid & --- \\
+inbox\_do\_key & append-result:{mid} & --- \\
+inbox\_do\_key & idempotency:{mid} & --- \\
+prepare\_blob\_upload\_request & conversationId & --- \\
+prepare\_blob\_upload\_request & messageId & message\_nonce, recipient\_device, recipient\_user \\
 \addlinespace
 
 % --- envelope_metadata: tab:inbox, Timing and Traffic type rows
-append\_request & envelope.createdAt & --- \\
-append\_request & envelope.deliveryClass (constant: normal) & --- \\
-append\_request & envelope.inlineCiphertext & recipient\_user, sender\_user \\
-append\_request & envelope.messageType & --- \\
-append\_request & envelope.version (constant: 0.1) & --- \\
+append\_request & envelope.bytes & --- \\
 append\_request & version (constant: 0.1) & --- \\
 message\_request\_action\_request & action & --- \\
 \addlinespace
 
 % --- attachment_refs: tab:inbox, storage-ref rows (new; not in the table as published)
-append\_request & envelope.storageRefs[].expiresAt & --- \\
-append\_request & envelope.storageRefs[].fileName (never populated) & attachment\_file\_name \\
-append\_request & envelope.storageRefs[].kind & --- \\
-append\_request & envelope.storageRefs[].mimeType (constant: application/octet-stream) & --- \\
-append\_request & envelope.storageRefs[].ref & sender\_device, sender\_user \\
-append\_request & envelope.storageRefs[].sizeBytes & --- \\
-\addlinespace
-
-% --- non_repudiation: tab:inbox, Non-repudiation row
-append\_request & envelope.senderProof.type (constant: signature) & --- \\
-append\_request & envelope.senderProof.value & --- \\
+append\_request & envelope.storageRef.ref & sender\_device, sender\_user \\
+append\_request & envelope.storageRef.size & --- \\
 \addlinespace
 
 % --- transport_addressing: L_net, request-line addressing
@@ -72,11 +49,11 @@ message\_request\_action\_request & endpoint & --- \\
 prepare\_blob\_upload\_request & auth.deviceId & recipient\_device, recipient\_user \\
 prepare\_blob\_upload\_request & auth.runtimeId & --- \\
 prepare\_blob\_upload\_request & auth.type (constant: device\_runtime) & --- \\
-replace\_allowlist\_request & auth.deviceId & recipient\_device, recipient\_user \\
-replace\_allowlist\_request & auth.runtimeId & --- \\
-replace\_allowlist\_request & auth.type (constant: device\_runtime) & --- \\
-replace\_allowlist\_request & deviceId & recipient\_device, recipient\_user \\
-replace\_allowlist\_request & endpoint & recipient\_device, recipient\_user \\
+register\_accepted\_lane\_request & auth.deviceId & recipient\_device, recipient\_user \\
+register\_accepted\_lane\_request & auth.runtimeId & --- \\
+register\_accepted\_lane\_request & auth.type (constant: device\_runtime) & --- \\
+register\_accepted\_lane\_request & deviceId & recipient\_device, recipient\_user \\
+register\_accepted\_lane\_request & endpoint & recipient\_device, recipient\_user \\
 \addlinespace
 
 % --- storage_namespaces: L_stg, object key namespaces
@@ -94,19 +71,24 @@ r2\_key & welcome-pickup/{groupId}/{deviceId}/{requestId}.json & recipient\_devi
 \addlinespace
 
 % --- inbox_state_keys: tab:inbox, inbox-side state keys (new; not in the table as published)
-inbox\_do\_key & allowlist & --- \\
+inbox\_do\_key & accepted-lane:{lane} & --- \\
+inbox\_do\_key & lane-seq:{lane} & --- \\
+inbox\_do\_key & message-request:{lane} & --- \\
 inbox\_do\_key & message-request:index & --- \\
 inbox\_do\_key & message-request:meta & --- \\
 inbox\_do\_key & message-request:rate-limit & --- \\
 inbox\_do\_key & meta & --- \\
+inbox\_do\_key & rate-limit:{lane} & --- \\
+inbox\_do\_key & rate-limit:first-contact & --- \\
 inbox\_do\_key & record:{seq} & --- \\
+register\_accepted\_lane\_request & lane & --- \\
 \addlinespace
 
 % --- realtime_push: tab:inbox, Receiver behaviour rows
 realtime\_event & change & --- \\
 realtime\_event & deviceId & recipient\_device, recipient\_user \\
 realtime\_event & event & --- \\
-realtime\_event & record & attachment\_file\_name, message\_nonce, recipient\_device, recipient\_user, sender\_device, sender\_user \\
+realtime\_event & record & recipient\_device, recipient\_user \\
 realtime\_event & seq & --- \\
 \addlinespace
 

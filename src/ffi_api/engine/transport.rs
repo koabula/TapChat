@@ -1436,18 +1436,10 @@ impl CoreEngine {
                 peer_user_id: item.peer_user_id.clone(),
             },
         );
-        let sender_bundle_share_url = self
-            .state
-            .local_bundle
-            .as_ref()
-            .and_then(|bundle| bundle.identity_bundle_ref.clone());
         let body = AppendEnvelopeRequest {
             version: crate::model::CURRENT_MODEL_VERSION.to_string(),
             recipient_device_id: item.envelope.recipient_device_id.clone(),
             envelope: item.envelope.clone(),
-            sender_bundle_share_url,
-            sender_bundle_hash: None,
-            sender_display_name: self.local_display_name(),
         };
         let mut headers = BTreeMap::new();
         let capability = device_profile
@@ -3248,6 +3240,44 @@ impl CoreEngine {
                                         );
                                     }
                                     self.observe_direct_application(&conversation_id);
+                                }
+                                ApplicationPlaintextDecision::LaneRotation {
+                                    identity_bundle_ref,
+                                    app_message_id,
+                                } => {
+                                    self.remember_app_message_id(
+                                        &record,
+                                        app_message_id,
+                                        ciphertext_sha256.clone(),
+                                    )?;
+                                    self.observe_direct_application(&conversation_id);
+                                    if identity_bundle_ref.trim().is_empty() {
+                                        log::info!(
+                                            "lane rotation identity_bundle_ref is empty; skipping fetch"
+                                        );
+                                    } else {
+                                        let already_current = self
+                                            .state
+                                            .contacts
+                                            .get(&inbound_peer_user_id)
+                                            .and_then(|contact| {
+                                                contact.bundle.identity_bundle_ref.as_deref()
+                                            })
+                                            == Some(identity_bundle_ref.as_str());
+                                        if already_current {
+                                            log::info!(
+                                                "lane rotation identity_bundle_ref matches the stored contact; skipping fetch"
+                                            );
+                                        } else {
+                                            output = merge_outputs(
+                                                output,
+                                                self.fetch_peer_identity_bundle(
+                                                    inbound_peer_user_id.clone(),
+                                                    identity_bundle_ref,
+                                                ),
+                                            );
+                                        }
+                                    }
                                 }
                                 ApplicationPlaintextDecision::DuplicateAppMessage {
                                     app_message_id,

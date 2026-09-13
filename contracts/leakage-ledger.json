@@ -176,32 +176,6 @@
     },
     {
       "surface": "append_request",
-      "path": "senderBundleHash",
-      "bits": "inhabited",
-      "carries": [],
-      "signed": false,
-      "table": "sender_identity"
-    },
-    {
-      "surface": "append_request",
-      "path": "senderBundleShareUrl",
-      "bits": "inhabited",
-      "carries": [],
-      "signed": false,
-      "table": "sender_identity"
-    },
-    {
-      "surface": "append_request",
-      "path": "senderDisplayName",
-      "bits": "inhabited",
-      "carries": [
-        "display_name"
-      ],
-      "signed": false,
-      "table": "sender_identity"
-    },
-    {
-      "surface": "append_request",
       "path": "version",
       "bits": "constant",
       "value": "0.1",

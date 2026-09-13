@@ -292,7 +292,7 @@ mod tests {
     }
 
     #[test]
-    fn append_request_includes_sender_display_name() {
+    fn append_request_omits_sender_identity_fields() {
         let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
         let mut alice = local_engine(ALICE_MNEMONIC, "phone");
         alice
@@ -325,7 +325,21 @@ mod tests {
         let body = append_body.expect("append request body");
         let request: crate::transport_contract::AppendEnvelopeRequest =
             serde_json::from_str(body).expect("append request json");
-        assert_eq!(request.sender_display_name.as_deref(), Some("Alice"));
+        let value: serde_json::Value = serde_json::from_str(body).expect("append json");
+        assert!(request.envelope.recipient_device_id.starts_with("device:"));
+        for forbidden in [
+            "sender_bundle_share_url",
+            "sender_bundle_hash",
+            "sender_display_name",
+            "senderBundleShareUrl",
+            "senderBundleHash",
+            "senderDisplayName",
+        ] {
+            assert!(
+                value.get(forbidden).is_none(),
+                "append request must not name the sender via {forbidden}"
+            );
+        }
     }
 
     #[test]
@@ -3798,6 +3812,114 @@ mod tests {
     }
 
     #[test]
+    fn create_conversation_enqueues_only_welcome_for_joiner() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = local_engine(ALICE_MNEMONIC, "phone");
+        alice
+            .handle_command(CoreCommand::ImportIdentityBundle {
+                bundle: bob_bundle.clone(),
+            })
+            .expect("import bob");
+        let output = alice
+            .handle_command(CoreCommand::CreateConversation {
+                peer_user_id: bob_bundle.user_id.clone(),
+                conversation_kind: ConversationKind::Direct,
+            })
+            .expect("create");
+        let output = simulate_pending_key_package_claims(&mut alice, output);
+        let messages = &output.view_model.as_ref().expect("view").messages;
+        assert!(
+            !messages.is_empty(),
+            "create must enqueue a Welcome for the joiner"
+        );
+        assert!(
+            messages
+                .iter()
+                .all(|message| message.message_type == MessageType::MlsWelcome),
+            "create must not send the initiator's already-merged commit"
+        );
+        assert!(alice.state.pending_outbox.iter().all(|item| {
+            crate::mls_adapter::MlsAdapter::payload_is_welcome(
+                item.envelope.payload_b64().unwrap_or_default(),
+            )
+        }));
+        assert_eq!(
+            output.view_model.as_ref().expect("view").conversations[0].last_message_type,
+            Some(MessageType::MlsWelcome)
+        );
+    }
+
+    #[test]
+    fn preview_welcome_reads_identity_bundle_ref_without_adopting() {
+        let mut chat = unjoined_direct_chat();
+        let expected_ref = chat
+            .alice
+            .state
+            .local_bundle
+            .as_ref()
+            .and_then(|bundle| bundle.identity_bundle_ref.clone());
+        let welcome_bytes = chat
+            .alice
+            .state
+            .pending_outbox
+            .iter()
+            .find_map(|item| {
+                let payload = item.envelope.payload_b64()?;
+                crate::mls_adapter::MlsAdapter::payload_is_welcome(payload)
+                    .then(|| payload.to_string())
+            })
+            .expect("alice queued a Welcome");
+        let before = chat
+            .bob
+            .state
+            .mls_adapter
+            .as_ref()
+            .expect("bob adapter")
+            .state_fingerprint()
+            .expect("fingerprint");
+        let preview = chat
+            .bob
+            .handle_command(CoreCommand::PreviewWelcome {
+                welcome_bytes: welcome_bytes.clone(),
+            })
+            .expect("preview")
+            .view_model
+            .and_then(|view| view.welcome_preview)
+            .expect("welcome preview");
+        assert_eq!(preview.conversation_id, chat.conversation_id);
+        assert_eq!(
+            preview.author_user_id,
+            chat.alice
+                .state
+                .local_identity
+                .as_ref()
+                .expect("alice identity")
+                .user_identity
+                .user_id
+        );
+        assert_eq!(preview.identity_bundle_ref, expected_ref);
+        assert_eq!(
+            chat.bob
+                .state
+                .mls_adapter
+                .as_ref()
+                .expect("bob adapter")
+                .state_fingerprint()
+                .expect("fingerprint after preview"),
+            before,
+            "preview must not adopt the Welcome or consume a KeyPackage"
+        );
+        assert!(
+            !chat
+                .bob
+                .state
+                .conversations
+                .contains_key(&chat.conversation_id),
+            "preview must not create the conversation"
+        );
+    }
+
+    #[test]
     fn create_direct_conversation_is_idempotent_for_existing_peer() {
         let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
@@ -5325,33 +5447,18 @@ mod tests {
         })
         .expect("bob imports alice as pending outbound");
         let _conversation_id = create_direct_conversation(&mut bob, alice_bundle.user_id.clone());
-        let alice_device_id = alice.local_device_id().expect("alice device").to_string();
-        let commit = first_pending_envelope(&bob, &alice_device_id, MessageType::MlsCommit);
-
-        alice
-            .handle_event(CoreEvent::InboxRecordsFetched {
-                device_id: alice_device_id.clone(),
-                to_seq: 1,
-                records: vec![InboxRecord {
-                    seq: 1,
-                    recipient_device_id: alice_device_id.clone(),
-                    message_id: commit.mid.clone(),
-                    received_at: 1,
-                    expires_at: None,
-                    state: InboxRecordState::Available,
-                    envelope: commit,
-                }],
-            })
-            .expect("commit before welcome is quarantined");
+        assert!(bob
+            .state
+            .pending_outbox
+            .iter()
+            .any(|item| outbox_item_matches_type(item, MessageType::MlsWelcome)));
+        assert!(bob
+            .state
+            .pending_outbox
+            .iter()
+            .all(|item| { !outbox_item_matches_type(item, MessageType::MlsCommit) }));
 
         assert!(alice.state.conversations.is_empty());
-        assert!(alice
-            .state
-            .sync_states
-            .get(&alice_device_id)
-            .expect("sync state")
-            .quarantine
-            .contains_key(&1));
         let send_err = alice
             .handle_command(CoreCommand::SendTextMessage {
                 conversation_id: "ffffffffffffffffffffffffffffffff".into(),
@@ -5373,7 +5480,11 @@ mod tests {
         link_contact(&mut bob, &alice);
         let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
 
-        let commit = first_pending_envelope(&alice, &bob_device_id, MessageType::MlsCommit);
+        assert!(alice
+            .state
+            .pending_outbox
+            .iter()
+            .all(|item| { !outbox_item_matches_type(item, MessageType::MlsCommit) }));
         let welcome = first_pending_envelope(&alice, &bob_device_id, MessageType::MlsWelcome);
 
         bob.handle_event(CoreEvent::InboxRecordsFetched {
@@ -5382,59 +5493,8 @@ mod tests {
             records: vec![InboxRecord {
                 seq: 1,
                 recipient_device_id: bob_device_id.clone(),
-                message_id: commit.mid.clone(),
-                received_at: 1,
-                expires_at: None,
-                state: InboxRecordState::Available,
-                envelope: commit.clone(),
-            }],
-        })
-        .expect("commit pending retry");
-        assert!(
-            bob.state.conversations.get(&conversation_id).is_none(),
-            "a wrapped commit cannot open a conversation before Welcome"
-        );
-        bob.state
-            .sync_states
-            .get_mut(&bob_device_id)
-            .expect("sync state")
-            .quarantine
-            .insert(
-                1,
-                InboxRecord {
-                    seq: 1,
-                    recipient_device_id: bob_device_id.clone(),
-                    message_id: commit.mid.clone(),
-                    received_at: 1,
-                    expires_at: None,
-                    state: InboxRecordState::Available,
-                    envelope: commit,
-                },
-            );
-        {
-            let sync_state = bob
-                .state
-                .sync_states
-                .get_mut(&bob_device_id)
-                .expect("sync state");
-            assert!(sync_state.quarantine.contains_key(&1));
-        }
-        assert!(bob
-            .state
-            .sync_states
-            .get(&bob_device_id)
-            .expect("sync state")
-            .quarantine
-            .contains_key(&1));
-
-        bob.handle_event(CoreEvent::InboxRecordsFetched {
-            device_id: bob_device_id.clone(),
-            to_seq: 2,
-            records: vec![InboxRecord {
-                seq: 2,
-                recipient_device_id: bob_device_id.clone(),
                 message_id: welcome.mid.clone(),
-                received_at: 2,
+                received_at: 1,
                 expires_at: None,
                 state: InboxRecordState::Available,
                 envelope: welcome,
@@ -11486,6 +11546,103 @@ mod tests {
                 .expect("acknowledge welcome pickup");
         }
         output
+    }
+
+    #[test]
+    fn lane_rotation_refreshes_peer_bundle_reference() {
+        let mut chat = paired_direct_chat();
+        let bob_user_id = chat
+            .bob
+            .state
+            .local_identity
+            .as_ref()
+            .expect("bob identity")
+            .user_identity
+            .user_id
+            .clone();
+        let previous = chat
+            .alice
+            .state
+            .contacts
+            .get(&bob_user_id)
+            .expect("alice holds bob")
+            .bundle
+            .clone();
+        let mut rotated = chat
+            .bob
+            .state
+            .local_bundle
+            .clone()
+            .expect("bob local bundle");
+        rotated.identity_bundle_ref =
+            Some("https://example.test/v1/contact-share/bob-rotated".into());
+        rotated.publication_revision = rotated.publication_revision.saturating_add(1);
+        rotated.signature = chat
+            .bob
+            .state
+            .local_identity
+            .as_ref()
+            .expect("bob identity")
+            .sign_payload_with_root(crate::identity::identity_bundle_payload(&rotated));
+        chat.bob.state.local_bundle = Some(rotated.clone());
+
+        set_direct_pcs_debt(
+            &mut chat.bob,
+            &chat.conversation_id,
+            DIRECT_PCS_COMMIT_INTERVAL * 2,
+        );
+        chat.bob
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: chat.conversation_id.clone(),
+                plaintext: "pcs trigger".into(),
+            })
+            .expect("bob pcs");
+
+        let inbound =
+            deliver_pending_outbox_to_device(&mut chat.alice, &chat.bob, &chat.alice_device_id);
+        assert!(inbound.effects.iter().any(|effect| matches!(
+            effect,
+            CoreEffect::FetchIdentityBundle { fetch }
+                if fetch.user_id == bob_user_id
+                    && fetch.reference.as_deref()
+                        == Some("https://example.test/v1/contact-share/bob-rotated")
+        )));
+        assert!(
+            !chat
+                .alice
+                .state
+                .conversations
+                .get(&chat.conversation_id)
+                .expect("conversation")
+                .messages
+                .iter()
+                .any(|message| message.plaintext.as_deref() == Some("")),
+            "lane rotation must not become a visible chat message"
+        );
+
+        chat.alice
+            .handle_event(CoreEvent::IdentityBundleFetched {
+                user_id: bob_user_id.clone(),
+                bundle: rotated.clone(),
+            })
+            .expect("alice imports rotated bob bundle");
+        assert_eq!(
+            chat.alice
+                .state
+                .contacts
+                .get(&bob_user_id)
+                .expect("bob contact")
+                .bundle
+                .identity_bundle_ref
+                .as_deref(),
+            Some("https://example.test/v1/contact-share/bob-rotated")
+        );
+
+        let error = chat
+            .alice
+            .handle_command(CoreCommand::ApplyIdentityBundleUpdate { bundle: previous })
+            .expect_err("older revision");
+        assert_eq!(error.code(), "identity_bundle_rolled_back");
     }
 
     /// **Remark 2 / R1.** The decision test: a party completes a rotation with

@@ -221,6 +221,8 @@ pub struct MessageRequestItemView {
     pub message_count: u64,
     pub last_message_id: String,
     pub last_conversation_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub welcome_bytes: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1217,7 +1219,10 @@ pub async fn message_request_reject(
     ))
 }
 
-pub async fn revoke_contact(profile_path: impl AsRef<Path>, user_id: &str) -> Result<RevokeContactView> {
+pub async fn revoke_contact(
+    profile_path: impl AsRef<Path>,
+    user_id: &str,
+) -> Result<RevokeContactView> {
     let mut profile = Profile::open(profile_path)?;
     let mut driver = load_driver(&profile)?;
     let output = driver
@@ -2444,6 +2449,7 @@ fn map_message_request(item: MessageRequestItem) -> MessageRequestItemView {
         message_count: item.message_count,
         last_message_id: item.last_message_id,
         last_conversation_id: item.last_conversation_id,
+        welcome_bytes: item.welcome_bytes,
     }
 }
 
@@ -2463,7 +2469,6 @@ fn map_message_request_action(
         sender_bundle_share_url: None,
     }
 }
-
 
 fn map_message(
     conversation_id: &str,
@@ -2557,7 +2562,6 @@ fn annotate_peer_bundle_error(
     }
     error
 }
-
 
 fn message_preview(message: &StoredMessage) -> Option<String> {
     if let Some(text) = message.plaintext.as_deref() {

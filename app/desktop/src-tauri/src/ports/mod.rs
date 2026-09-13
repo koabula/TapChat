@@ -13,7 +13,7 @@ use tapchat_core::external_fetch::{
     fetch_external_json, validate_group_invite_transport_binding, ExternalResourceKind,
 };
 use tapchat_core::ffi_api::{
-    CacheUploadedAttachmentEffect, CoreEvent, DeleteBlobRequest, HttpMethod, HttpRequestEffect,
+    CacheUploadedAttachmentEffect, CoreEvent, DeleteBlobRequest, HttpRequestEffect,
     PersistStateEffect, ReadAttachmentBytesEffect, UserNotificationEffect,
     WriteDownloadedAttachmentEffect,
 };
@@ -25,12 +25,11 @@ use tapchat_core::transport_contract::json_case::{
     to_camel_case_json_string, to_snake_case_json_string,
 };
 use tapchat_core::transport_contract::{
-    AppendEnvelopeRequest, AppendGroupEnvelopeRequest, AppendGroupEnvelopeResult,
-    AppendGroupTransitionRequest, AppendGroupTransitionResult, BlobDownloadRequest,
-    BlobUploadRequest, ClaimGroupJoinRequest, ClaimGroupJoinResult, ClaimGroupLeaveRequest,
-    ClaimGroupLeaveResult, CompleteGroupJoinRequest, CompleteGroupJoinResult,
-    CreateGroupInviteRequest, CreateGroupInviteResult, DecideGroupJoinRequest,
-    DecideGroupJoinResult, FetchGroupInviteRequest, FetchGroupInviteResult,
+    AppendGroupEnvelopeRequest, AppendGroupEnvelopeResult, AppendGroupTransitionRequest,
+    AppendGroupTransitionResult, BlobDownloadRequest, BlobUploadRequest, ClaimGroupJoinRequest,
+    ClaimGroupJoinResult, ClaimGroupLeaveRequest, ClaimGroupLeaveResult, CompleteGroupJoinRequest,
+    CompleteGroupJoinResult, CreateGroupInviteRequest, CreateGroupInviteResult,
+    DecideGroupJoinRequest, DecideGroupJoinResult, FetchGroupInviteRequest, FetchGroupInviteResult,
     FetchGroupOutboxRequest, FetchGroupOutboxResult, FetchIdentityBundleRequest,
     FetchMessageRequestsRequest, FetchWelcomePickupRequest, FetchWelcomePickupResult,
     GetGroupAuthorizationStateRequest, GetGroupAuthorizationStateResult,
@@ -42,9 +41,9 @@ use tapchat_core::transport_contract::{
     MessageRequestActionRequest, PrepareBlobUploadRequest, PublishSharedStateRequest,
     PutWelcomePickupRequest, PutWelcomePickupResult, RealtimeSubscriptionRequest,
     RegisterAcceptedLaneRequest, RevokeAcceptedLanesRequest, RevokeGroupInviteRequest,
-    RevokeGroupInviteResult,
-    SealGroupOutboxRequest, SealGroupOutboxResult, SubmitGroupJoinRequest, SubmitGroupJoinResult,
-    SubmitGroupLeaveRequest, SubmitGroupLeaveResult, TransportAuthRequirement,
+    RevokeGroupInviteResult, SealGroupOutboxRequest, SealGroupOutboxResult, SubmitGroupJoinRequest,
+    SubmitGroupJoinResult, SubmitGroupLeaveRequest, SubmitGroupLeaveResult,
+    TransportAuthRequirement,
 };
 use tauri::{AppHandle, Emitter};
 use tokio::sync::RwLock;
@@ -309,71 +308,6 @@ impl TransportPort for DesktopPlatformPorts {
         &mut self,
         mut request: HttpRequestEffect,
     ) -> Result<Vec<CoreEvent>> {
-        // Intercept append envelope requests to inject correct sender_bundle_share_url
-        if request.method == HttpMethod::Post && request.url.contains("/messages") {
-            log::info!("[TransportPort] Intercepting /messages POST request");
-            if let Some(body) = &request.body {
-                // Try to parse as AppendEnvelopeRequest
-                if let Ok(mut append_request) = serde_json::from_str::<AppendEnvelopeRequest>(body)
-                {
-                    log::info!("[TransportPort] Parsed AppendEnvelopeRequest successfully");
-                    log::info!(
-                        "[TransportPort] sender_bundle_share_url={}",
-                        summarize_share_url(append_request.sender_bundle_share_url.as_deref())
-                    );
-
-                    // Check if sender_bundle_share_url needs to be replaced
-                    // It should be a contact-share URL, not identity_bundle_ref
-                    let needs_contact_share_url = append_request.sender_bundle_share_url.is_none()
-                        || append_request
-                            .sender_bundle_share_url
-                            .as_ref()
-                            .map(|url| !url.contains("/v1/contact-share/"))
-                            .unwrap_or(true);
-
-                    log::info!(
-                        "[TransportPort] needs_contact_share_url: {}",
-                        needs_contact_share_url
-                    );
-
-                    if needs_contact_share_url {
-                        // Generate correct contact share URL from runtime metadata
-                        let contact_share_url = match self.build_contact_share_url().await {
-                            Ok(url) => url,
-                            Err(_) => {
-                                return Ok(vec![CoreEvent::HttpRequestFailed {
-                                    request_id: request.request_id.clone(),
-                                    failure: tapchat_core::AppErrorV1::from_registered_code(
-                                        "contact_share_offline",
-                                    ),
-                                }]);
-                            }
-                        };
-                        log::info!(
-                            "[TransportPort] generated_contact_share_url={}",
-                            summarize_share_url(contact_share_url.as_deref())
-                        );
-
-                        if let Some(url) = contact_share_url {
-                            log::info!(
-                                "[TransportPort] Injecting contact-share URL for outbound request"
-                            );
-                            append_request.sender_bundle_share_url = Some(url);
-                            // Rebuild the request with modified body
-                            let modified_body = serde_json::to_string(&append_request)?;
-                            request.body = Some(modified_body);
-                        } else {
-                            log::warn!(
-                                "[TransportPort] Failed to generate contact_share_url, sending original request"
-                            );
-                        }
-                    }
-                } else {
-                    log::warn!("[TransportPort] Failed to parse body as AppendEnvelopeRequest");
-                }
-            }
-        }
-
         let original = request.clone();
         if let Err(error) = self
             .inject_runtime_authorization(&mut request.headers, request.auth.as_ref(), false)
