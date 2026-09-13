@@ -232,7 +232,7 @@ impl DesktopTransport {
         request: AppendEnvelopeRequest,
     ) -> Result<AppendEnvelopeResult> {
         let start = std::time::Instant::now();
-        let msg_id = request.envelope.message_id.clone();
+        let msg_id = request.envelope.mid.clone();
         let msg_ref = redact_id("msg", &msg_id);
         let base_url = self
             .get_base_url()

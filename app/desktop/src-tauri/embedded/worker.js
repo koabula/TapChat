@@ -2167,9 +2167,6 @@ async function validateAppendAuthorization(request, deviceId, body, now, loadAut
   if (capability.endpoint !== `${requestUrl.origin}${requestUrl.pathname}`) {
     throw new HttpError(403, "invalid_capability", "capability endpoint does not match request path");
   }
-  if (capability.conversationScope?.length && !capability.conversationScope.includes(body.envelope.conversationId)) {
-    throw new HttpError(403, "invalid_capability", "conversation is outside capability scope");
-  }
   const size = new TextEncoder().encode(JSON.stringify(body.envelope)).byteLength;
   if (capability.constraints?.maxBytes !== void 0 && size > capability.constraints.maxBytes) {
     throw new HttpError(413, "payload_too_large", "envelope exceeds capability size limit");
@@ -2214,11 +2211,6 @@ function capabilityPayload(capability) {
   const payload = signingPayload(SIGNATURE_DOMAIN.inboxAppendCapability).pushStr(capability.version).pushStr(wireName(CAPABILITY_SERVICES, capability.service, "capability service")).pushStr(capability.userId).pushStr(capability.targetDeviceId).pushStr(capability.endpoint).pushU32(capability.operations.length);
   for (const operation of capability.operations) {
     payload.pushStr(wireName(CAPABILITY_OPERATIONS, operation, "capability operation"));
-  }
-  const scope = capability.conversationScope ?? [];
-  payload.pushU32(scope.length);
-  for (const conversationId of scope) {
-    payload.pushStr(conversationId);
   }
   payload.pushU64(capability.expiresAt);
   if (capability.constraints) {
@@ -5384,6 +5376,20 @@ var ManagedSession = class {
 function segment(value) {
   return value.replace(/[^A-Za-z0-9:_-]/g, "_");
 }
+var INBOX_DO_KEYS = {
+  meta: "meta",
+  acceptedLane: (lane) => `accepted-lane:${lane}`,
+  laneSeq: (lane) => `lane-seq:${lane}`,
+  record: (seq) => `record:${seq}`,
+  idempotency: (mid) => `idempotency:${mid}`,
+  appendResult: (mid) => `append-result:${mid}`,
+  messageRequest: (lane) => `message-request:${lane}`,
+  messageRequestIndex: "message-request:index",
+  messageRequestMeta: "message-request:meta",
+  messageRequestRateLimit: "message-request:rate-limit",
+  rateLimit: (lane) => `rate-limit:${lane}`,
+  rateLimitFirstContact: "rate-limit:first-contact"
+};
 var R2_KEYS = {
   blob: (input) => [
     "blobs",
@@ -5403,15 +5409,8 @@ var R2_KEYS = {
 };
 
 // src/inbox/service.ts
-var META_KEY2 = "meta";
-var IDEMPOTENCY_PREFIX2 = "idempotency:";
-var APPEND_RESULT_PREFIX = "append-result:";
-var RECORD_PREFIX2 = "record:";
-var ALLOWLIST_KEY = "allowlist";
-var MESSAGE_REQUEST_PREFIX = "message-request:";
-var RATE_LIMIT_PREFIX = "rate-limit:";
-var MESSAGE_REQUEST_META_KEY = `${MESSAGE_REQUEST_PREFIX}meta`;
-var MESSAGE_REQUEST_RATE_LIMIT_KEY = `${MESSAGE_REQUEST_PREFIX}rate-limit`;
+var OPAQUE_ID = /^[0-9a-f]{32}$/;
+var ENVELOPE_MAX_BYTES = 256 * 1024;
 var CLEANUP_BATCH_SIZE2 = 128;
 var InboxService = class {
   deviceId;
@@ -5428,33 +5427,26 @@ var InboxService = class {
   }
   async appendEnvelope(input, now, authContext = { mode: "verified" }) {
     this.validateAppendRequest(input);
-    const existingResult = await this.state.get(`${APPEND_RESULT_PREFIX}${input.envelope.messageId}`);
+    const existingResult = await this.state.get(
+      INBOX_DO_KEYS.appendResult(input.envelope.mid)
+    );
     if (existingResult) {
       return existingResult;
-    }
-    await this.enforceRateLimit(input.envelope.senderUserId, now);
-    const allowlist = await this.getAllowlist(now);
-    if (allowlist.rejectedSenderUserIds.includes(input.envelope.senderUserId)) {
-      const rejected = {
-        accepted: true,
-        seq: 0,
-        deliveredTo: "rejected",
-        queuedAsRequest: false
-      };
-      await this.state.put(`${APPEND_RESULT_PREFIX}${input.envelope.messageId}`, rejected);
-      return rejected;
     }
     if (authContext.mode !== "verified") {
       throw new HttpError(426, "upgrade_required", "verified append authorization is required");
     }
-    if (allowlist.allowedSenderUserIds.includes(input.envelope.senderUserId)) {
+    const accepted = await this.isAcceptedLane(input.envelope.lane);
+    if (accepted) {
+      await this.enforceRateLimit(INBOX_DO_KEYS.rateLimit(input.envelope.lane), now);
       const delivered = await this.deliverEnvelope(input, now);
-      await this.state.put(`${APPEND_RESULT_PREFIX}${input.envelope.messageId}`, delivered);
+      await this.state.put(INBOX_DO_KEYS.appendResult(input.envelope.mid), delivered);
       return delivered;
     }
-    const request = await this.queueMessageRequestWithLimit(input, now);
-    await this.state.put(`${APPEND_RESULT_PREFIX}${input.envelope.messageId}`, request);
-    return request;
+    await this.enforceRateLimit(INBOX_DO_KEYS.rateLimitFirstContact, now);
+    const queued = await this.queueMessageRequestWithLimit(input, now);
+    await this.state.put(INBOX_DO_KEYS.appendResult(input.envelope.mid), queued);
+    return queued;
   }
   async fetchMessages(input) {
     if (input.deviceId !== this.deviceId) {
@@ -5469,7 +5461,7 @@ var InboxService = class {
     const records = [];
     const upper = Math.min(meta.headSeq, start + input.limit - 1);
     for (let seq = start; seq <= upper; seq += 1) {
-      const index = await this.state.get(`${RECORD_PREFIX2}${seq}`);
+      const index = await this.state.get(INBOX_DO_KEYS.record(seq));
       if (!index) {
         if (seq <= meta.ackedSeq) {
           continue;
@@ -5477,25 +5469,7 @@ var InboxService = class {
         throw new HttpError(500, "storage_integrity_error", `inbox record index is missing at seq ${seq}`);
       }
       this.validateStoredRecordIndex(index, seq);
-      if (index.inlineRecord) {
-        this.validateMaterializedRecord(index.inlineRecord, index, seq);
-        records.push(index.inlineRecord);
-        continue;
-      }
-      if (!index.payloadRef) {
-        throw new HttpError(500, "storage_integrity_error", `inbox record payload reference is missing at seq ${seq}`);
-      }
-      let record;
-      try {
-        record = await this.spillStore.getJson(index.payloadRef);
-      } catch {
-        throw new HttpError(500, "storage_integrity_error", `inbox spill payload is invalid at seq ${seq}`);
-      }
-      if (!record) {
-        throw new HttpError(500, "storage_integrity_error", `inbox spill payload is missing at seq ${seq}`);
-      }
-      this.validateMaterializedRecord(record, index, seq);
-      records.push(record);
+      records.push(await this.materializeRecord(index, seq));
     }
     return {
       toSeq: records.length > 0 ? records[records.length - 1].seq : Math.max(historyFloorSeq, meta.ackedSeq, Math.min(meta.headSeq, start - 1)),
@@ -5519,7 +5493,7 @@ var InboxService = class {
     }
     const ackSeq = input.ack.ackSeq;
     if (ackSeq > meta.ackedSeq || (meta.historyFloorSeq ?? 0) > 0) {
-      await this.state.put(META_KEY2, {
+      await this.state.put(INBOX_DO_KEYS.meta, {
         ...meta,
         ackedSeq: ackSeq,
         historyFloorSeq: ackSeq >= (meta.historyFloorSeq ?? 0) ? void 0 : meta.historyFloorSeq
@@ -5532,42 +5506,32 @@ var InboxService = class {
     const meta = await this.getMeta();
     return { headSeq: meta.headSeq };
   }
-  async getAllowlist(now = Date.now()) {
-    return await this.state.get(ALLOWLIST_KEY) ?? {
-      version: "0.1",
-      deviceId: this.deviceId,
-      updatedAt: now,
-      allowedSenderUserIds: [],
-      rejectedSenderUserIds: []
-    };
+  async registerAcceptedLane(lane, now) {
+    this.assertOpaqueId(lane, "lane");
+    await this.state.put(INBOX_DO_KEYS.acceptedLane(lane), { registeredAt: now });
+    return { accepted: true, lane };
   }
-  async replaceAllowlist(allowedSenderUserIds, rejectedSenderUserIds, now) {
-    const document = {
-      version: "0.1",
-      deviceId: this.deviceId,
-      updatedAt: now,
-      allowedSenderUserIds: Array.from(new Set(allowedSenderUserIds)).sort(),
-      rejectedSenderUserIds: Array.from(new Set(rejectedSenderUserIds.filter((userId) => !allowedSenderUserIds.includes(userId)))).sort()
-    };
-    await this.state.put(ALLOWLIST_KEY, document);
-    return document;
+  async revokeAcceptedLane(lane) {
+    this.assertOpaqueId(lane, "lane");
+    await this.state.delete(INBOX_DO_KEYS.acceptedLane(lane));
+    return { accepted: true, lane };
   }
   async listMessageRequests(now = Date.now()) {
     await this.pruneExpiredMessageRequests(now);
     await this.scheduleNextAlarm(now);
-    const requests = await this.state.get(this.messageRequestIndexKey());
+    const requests = await this.state.get(INBOX_DO_KEYS.messageRequestIndex);
     if (!requests?.length) {
       return [];
     }
     const items = [];
-    for (const senderUserId of requests) {
-      const entry = await this.state.get(this.messageRequestKey(senderUserId));
+    for (const lane of requests) {
+      const entry = await this.state.get(INBOX_DO_KEYS.messageRequest(lane));
       if (!entry) {
         continue;
       }
       items.push(this.toMessageRequestItem(entry));
     }
-    items.sort((left, right) => left.firstSeenAt - right.firstSeenAt || left.senderUserId.localeCompare(right.senderUserId));
+    items.sort((left, right) => left.firstSeenAt - right.firstSeenAt || left.requestId.localeCompare(right.requestId));
     return items;
   }
   async acceptMessageRequest(requestId, now) {
@@ -5575,36 +5539,14 @@ var InboxService = class {
     if (!entry) {
       throw new HttpError(404, "not_found", "message request not found");
     }
-    const allowlist = await this.getAllowlist(now);
-    await this.replaceAllowlist(
-      [...allowlist.allowedSenderUserIds, entry.senderUserId],
-      allowlist.rejectedSenderUserIds.filter((userId) => userId !== entry.senderUserId),
-      now
-    );
-    const requestsToPromote = this.messageRequestsToPromote(entry);
-    const promotedMessageIds = new Set(
-      requestsToPromote.map((request) => request.envelope.messageId)
-    );
-    for (const request of entry.pendingRequests) {
-      if (promotedMessageIds.has(request.envelope.messageId)) {
-        continue;
-      }
-      await this.state.put(
-        `${APPEND_RESULT_PREFIX}${request.envelope.messageId}`,
-        this.supersededMessageRequestResult()
-      );
-    }
+    await this.registerAcceptedLane(entry.lane, now);
     let promotedCount = 0;
-    const promotedConversationIds = /* @__PURE__ */ new Set();
-    for (const request of requestsToPromote) {
+    for (const request of entry.pendingRequests) {
       const delivered = await this.deliverEnvelope(request, now);
-      await this.state.put(`${APPEND_RESULT_PREFIX}${request.envelope.messageId}`, delivered);
-      if (delivered.deliveredTo === "inbox") {
-        promotedCount += 1;
-        promotedConversationIds.add(request.envelope.conversationId);
-      }
+      await this.state.put(INBOX_DO_KEYS.appendResult(request.envelope.mid), delivered);
+      promotedCount += 1;
     }
-    await this.deleteMessageRequest(entry.senderUserId, "accepted");
+    await this.deleteMessageRequest(entry.lane, "accepted");
     await this.scheduleNextAlarm(now);
     return {
       accepted: true,
@@ -5614,7 +5556,7 @@ var InboxService = class {
       senderBundleHash: entry.senderBundleHash,
       senderDisplayName: entry.senderDisplayName,
       promotedCount,
-      promotedConversationIds: [...promotedConversationIds].sort()
+      promotedConversationIds: []
     };
   }
   async rejectMessageRequest(requestId, now) {
@@ -5622,13 +5564,7 @@ var InboxService = class {
     if (!entry) {
       throw new HttpError(404, "not_found", "message request not found");
     }
-    const allowlist = await this.getAllowlist(now);
-    await this.replaceAllowlist(
-      allowlist.allowedSenderUserIds.filter((userId) => userId !== entry.senderUserId),
-      [...allowlist.rejectedSenderUserIds, entry.senderUserId],
-      now
-    );
-    await this.deleteMessageRequest(entry.senderUserId, "rejected");
+    await this.deleteMessageRequest(entry.lane, "rejected");
     await this.scheduleNextAlarm(now);
     return {
       accepted: true,
@@ -5644,7 +5580,7 @@ var InboxService = class {
   async cleanExpiredRecords(now) {
     await this.pruneExpiredMessageRequests(now);
     const meta = await this.getMeta();
-    const stored = await this.state.list({ prefix: RECORD_PREFIX2 });
+    const stored = await this.state.list({ prefix: "record:" });
     const eligible = Array.from(stored.entries()).filter(([, index]) => index.expiresAt !== void 0 && index.expiresAt <= now).sort((left, right) => left[1].seq - right[1].seq);
     const expired = eligible.slice(0, CLEANUP_BATCH_SIZE2);
     const deleteKeys = [];
@@ -5654,8 +5590,8 @@ var InboxService = class {
       }
       deleteKeys.push(
         key,
-        `${IDEMPOTENCY_PREFIX2}${index.messageId}`,
-        `${APPEND_RESULT_PREFIX}${index.messageId}`
+        INBOX_DO_KEYS.idempotency(index.messageId),
+        INBOX_DO_KEYS.appendResult(index.messageId)
       );
     }
     if (expired.length > 0) {
@@ -5664,7 +5600,7 @@ var InboxService = class {
         ...expired.map(([, index]) => index.seq)
       );
       await this.state.mutateEntries(
-        { [META_KEY2]: { ...meta, historyFloorSeq } },
+        { [INBOX_DO_KEYS.meta]: { ...meta, historyFloorSeq } },
         deleteKeys
       );
     }
@@ -5679,34 +5615,73 @@ var InboxService = class {
       throw new HttpError(500, "storage_integrity_error", `inbox record index does not match seq ${seq}`);
     }
   }
-  validateMaterializedRecord(record, index, seq) {
-    if (record.seq !== seq || record.seq !== index.seq || record.messageId !== index.messageId || record.recipientDeviceId !== this.deviceId || record.recipientDeviceId !== index.recipientDeviceId) {
-      throw new HttpError(500, "storage_integrity_error", `inbox record payload does not match index at seq ${seq}`);
+  async materializeRecord(index, seq) {
+    let bytes = index.inlineBytes;
+    if (!bytes && index.payloadRef) {
+      let spilled;
+      try {
+        spilled = await this.spillStore.getBytes(index.payloadRef);
+      } catch {
+        throw new HttpError(500, "storage_integrity_error", `inbox spill payload is invalid at seq ${seq}`);
+      }
+      if (!spilled) {
+        throw new HttpError(500, "storage_integrity_error", `inbox spill payload is missing at seq ${seq}`);
+      }
+      bytes = this.encodeBytes(new Uint8Array(spilled));
     }
-  }
-  async getMeta() {
-    return await this.state.get(META_KEY2) ?? this.defaults;
-  }
-  async deliverEnvelope(input, now) {
-    const meta = await this.getMeta();
-    const existingSeq = await this.state.get(`${IDEMPOTENCY_PREFIX2}${input.envelope.messageId}`);
-    if (existingSeq !== void 0) {
-      return { accepted: true, seq: existingSeq, deliveredTo: "inbox" };
-    }
-    const seq = meta.headSeq + 1;
-    const expiresAt = now + meta.retentionDays * 24 * 60 * 60 * 1e3;
     const record = {
       seq,
       recipientDeviceId: this.deviceId,
-      messageId: input.envelope.messageId,
+      messageId: index.messageId,
+      receivedAt: index.receivedAt,
+      expiresAt: index.expiresAt,
+      state: "available",
+      envelope: {
+        recipientDeviceId: this.deviceId,
+        lane: index.lane,
+        mid: index.messageId,
+        ...bytes ? { bytes } : {},
+        ...index.storageRef ? { storageRef: index.storageRef } : {}
+      }
+    };
+    if (record.messageId !== index.messageId || record.recipientDeviceId !== index.recipientDeviceId) {
+      throw new HttpError(500, "storage_integrity_error", `inbox record payload does not match index at seq ${seq}`);
+    }
+    return record;
+  }
+  async getMeta() {
+    return await this.state.get(INBOX_DO_KEYS.meta) ?? this.defaults;
+  }
+  async isAcceptedLane(lane) {
+    return await this.state.get(INBOX_DO_KEYS.acceptedLane(lane)) !== void 0;
+  }
+  async nextLaneSeq(lane) {
+    const current = await this.state.get(INBOX_DO_KEYS.laneSeq(lane)) ?? 0;
+    const next = current + 1;
+    await this.state.put(INBOX_DO_KEYS.laneSeq(lane), next);
+    return next;
+  }
+  async deliverEnvelope(input, now) {
+    const meta = await this.getMeta();
+    const existingSeq = await this.state.get(INBOX_DO_KEYS.idempotency(input.envelope.mid));
+    if (existingSeq !== void 0) {
+      return { accepted: true, seq: existingSeq };
+    }
+    const seq = meta.headSeq + 1;
+    const expiresAt = now + meta.retentionDays * 24 * 60 * 60 * 1e3;
+    const bytes = input.envelope.bytes;
+    const decoded = bytes ? this.decodeBytes(bytes) : null;
+    const ciphertextSize = decoded?.byteLength ?? 0;
+    const record = {
+      seq,
+      recipientDeviceId: this.deviceId,
+      messageId: input.envelope.mid,
       receivedAt: now,
       expiresAt,
       state: "available",
       envelope: input.envelope
     };
-    const serialized = JSON.stringify(record);
-    const storageKey = `${RECORD_PREFIX2}${seq}`;
-    if (new TextEncoder().encode(serialized).byteLength <= meta.maxInlineBytes && input.envelope.inlineCiphertext) {
+    if (ciphertextSize > 0 && ciphertextSize <= meta.maxInlineBytes && bytes) {
       const inlineIndex = {
         seq,
         messageId: record.messageId,
@@ -5714,12 +5689,14 @@ var InboxService = class {
         receivedAt: record.receivedAt,
         expiresAt,
         state: record.state,
-        inlineRecord: record
+        lane: input.envelope.lane,
+        storageRef: input.envelope.storageRef,
+        inlineBytes: bytes
       };
-      await this.state.put(storageKey, inlineIndex);
-    } else {
+      await this.state.put(INBOX_DO_KEYS.record(seq), inlineIndex);
+    } else if (decoded) {
       const payloadRef = R2_KEYS.inboxPayload(this.deviceId, seq);
-      await this.spillStore.putJson(payloadRef, record);
+      await this.spillStore.putBytes(payloadRef, decoded);
       const indexed = {
         seq,
         messageId: record.messageId,
@@ -5727,12 +5704,26 @@ var InboxService = class {
         receivedAt: record.receivedAt,
         expiresAt,
         state: record.state,
+        lane: input.envelope.lane,
+        storageRef: input.envelope.storageRef,
         payloadRef
       };
-      await this.state.put(storageKey, indexed);
+      await this.state.put(INBOX_DO_KEYS.record(seq), indexed);
+    } else {
+      const indexed = {
+        seq,
+        messageId: record.messageId,
+        recipientDeviceId: record.recipientDeviceId,
+        receivedAt: record.receivedAt,
+        expiresAt,
+        state: record.state,
+        lane: input.envelope.lane,
+        storageRef: input.envelope.storageRef
+      };
+      await this.state.put(INBOX_DO_KEYS.record(seq), indexed);
     }
-    await this.state.put(`${IDEMPOTENCY_PREFIX2}${record.messageId}`, seq);
-    await this.state.put(META_KEY2, { ...meta, headSeq: seq });
+    await this.state.put(INBOX_DO_KEYS.idempotency(record.messageId), seq);
+    await this.state.put(INBOX_DO_KEYS.meta, { ...meta, headSeq: seq });
     this.publish({
       event: "head_updated",
       deviceId: this.deviceId,
@@ -5744,26 +5735,22 @@ var InboxService = class {
       seq,
       record
     });
-    return { accepted: true, seq, deliveredTo: "inbox" };
+    return { accepted: true, seq };
   }
   async queueMessageRequestWithLimit(input, now) {
     await this.enforceMessageRequestRateLimit(now);
     await this.pruneExpiredMessageRequests(now);
     const limits = await this.getMeta();
-    const senderUserId = input.envelope.senderUserId;
-    const key = this.messageRequestKey(senderUserId);
-    const requestId = this.requestIdForSender(senderUserId);
+    const lane = input.envelope.lane;
+    const key = INBOX_DO_KEYS.messageRequest(lane);
     const existing = await this.state.get(key);
-    const index = await this.state.get(this.messageRequestIndexKey()) ?? [];
-    const queueMeta = await this.state.get(MESSAGE_REQUEST_META_KEY) ?? {
+    const index = await this.state.get(INBOX_DO_KEYS.messageRequestIndex) ?? [];
+    const queueMeta = await this.state.get(INBOX_DO_KEYS.messageRequestMeta) ?? {
       version: 1,
       totalBytes: 0,
       senderCount: index.length
     };
     const requestBytes = new TextEncoder().encode(JSON.stringify(input)).byteLength;
-    if (existing && existing.pendingRequests.length >= (limits.messageRequestMaxPerSender ?? 16)) {
-      this.messageRequestCapacityExceeded("message request sender quota exceeded");
-    }
     if (!existing && index.length >= (limits.messageRequestMaxSenders ?? 64)) {
       this.messageRequestCapacityExceeded("message request sender capacity exceeded");
     }
@@ -5771,17 +5758,17 @@ var InboxService = class {
       this.messageRequestCapacityExceeded("message request byte capacity exceeded");
     }
     const entry = existing ?? {
-      requestId,
+      requestId: `request:${this.randomOpaqueId()}`,
       recipientDeviceId: this.deviceId,
-      senderUserId,
+      lane,
+      senderUserId: "",
       senderBundleShareUrl: input.senderBundleShareUrl,
       senderBundleHash: input.senderBundleHash,
       senderDisplayName: input.senderDisplayName,
       firstSeenAt: now,
       lastSeenAt: now,
       messageCount: 0,
-      lastMessageId: input.envelope.messageId,
-      lastConversationId: input.envelope.conversationId,
+      lastMessageId: input.envelope.mid,
       pendingRequests: [],
       byteSize: 0,
       expiresAt: now + (limits.messageRequestTtlSeconds ?? 7 * 24 * 60 * 60) * 1e3
@@ -5791,12 +5778,11 @@ var InboxService = class {
     entry.senderDisplayName ??= input.senderDisplayName;
     entry.lastSeenAt = now;
     entry.messageCount += 1;
-    entry.lastMessageId = input.envelope.messageId;
-    entry.lastConversationId = input.envelope.conversationId;
+    entry.lastMessageId = input.envelope.mid;
     entry.pendingRequests.push(input);
     entry.byteSize = (entry.byteSize ?? this.messageRequestEntryBytes(entry) - requestBytes) + requestBytes;
     entry.expiresAt ??= entry.firstSeenAt + (limits.messageRequestTtlSeconds ?? 7 * 24 * 60 * 60) * 1e3;
-    const nextIndex = index.includes(senderUserId) ? index : [...index, senderUserId].sort();
+    const nextIndex = index.includes(lane) ? index : [...index, lane].sort();
     const nextQueueMeta = {
       version: 1,
       totalBytes: queueMeta.totalBytes + requestBytes,
@@ -5804,56 +5790,32 @@ var InboxService = class {
     };
     await this.state.putEntries({
       [key]: entry,
-      [this.messageRequestIndexKey()]: nextIndex,
-      [MESSAGE_REQUEST_META_KEY]: nextQueueMeta
+      [INBOX_DO_KEYS.messageRequestIndex]: nextIndex,
+      [INBOX_DO_KEYS.messageRequestMeta]: nextQueueMeta
     });
     await this.scheduleNextAlarm(now);
     this.publish({
       event: "message_request_changed",
       deviceId: this.deviceId,
-      senderUserId,
-      requestId,
+      senderUserId: entry.senderUserId,
+      requestId: entry.requestId,
       change: "queued"
     });
     return {
       accepted: true,
-      seq: 0,
-      deliveredTo: "message_request",
-      queuedAsRequest: true,
-      requestId
+      seq: await this.nextLaneSeq(lane)
     };
   }
   messageRequestCapacityExceeded(message) {
     throw new HttpError(429, "message_request_capacity_exceeded", message);
   }
-  messageRequestsToPromote(entry) {
-    if (this.groupInviteMetadata(entry)) {
-      return entry.pendingRequests;
-    }
-    const latestConversationId = entry.lastConversationId || entry.pendingRequests[entry.pendingRequests.length - 1]?.envelope.conversationId;
-    if (!latestConversationId) {
-      return [];
-    }
-    return entry.pendingRequests.filter(
-      (request) => request.envelope.conversationId === latestConversationId
-    );
-  }
-  supersededMessageRequestResult() {
-    return {
-      accepted: true,
-      seq: 0,
-      deliveredTo: "rejected",
-      queuedAsRequest: false
-    };
-  }
-  async enforceRateLimit(senderUserId, now) {
+  async enforceRateLimit(key, now) {
     const meta = await this.getMeta();
     const minuteLimit = meta.rateLimitPerMinute;
     const hourLimit = meta.rateLimitPerHour;
     if (minuteLimit <= 0 && hourLimit <= 0) {
       return;
     }
-    const key = `${RATE_LIMIT_PREFIX}${senderUserId}`;
     const minuteWindowStart = Math.floor(now / 6e4) * 6e4;
     const hourWindowStart = Math.floor(now / 36e5) * 36e5;
     const state = await this.state.get(key) ?? {
@@ -5886,7 +5848,7 @@ var InboxService = class {
     const hourLimit = meta.messageRequestRateLimitHour ?? 300;
     const minuteWindowStart = Math.floor(now / 6e4) * 6e4;
     const hourWindowStart = Math.floor(now / 36e5) * 36e5;
-    const state = await this.state.get(MESSAGE_REQUEST_RATE_LIMIT_KEY) ?? {
+    const state = await this.state.get(INBOX_DO_KEYS.messageRequestRateLimit) ?? {
       minuteWindowStart,
       minuteCount: 0,
       hourWindowStart,
@@ -5918,7 +5880,7 @@ var InboxService = class {
     }
     state.minuteCount += 1;
     state.hourCount += 1;
-    await this.state.put(MESSAGE_REQUEST_RATE_LIMIT_KEY, state);
+    await this.state.put(INBOX_DO_KEYS.messageRequestRateLimit, state);
   }
   publish(event) {
     const payload = JSON.stringify(event);
@@ -5933,46 +5895,45 @@ var InboxService = class {
     if (input.envelope.recipientDeviceId !== this.deviceId) {
       throw new HttpError(400, "invalid_input", "envelope recipient_device_id does not match inbox route");
     }
-    if (!input.envelope.messageId || !input.envelope.conversationId || !input.envelope.senderUserId) {
-      throw new HttpError(400, "invalid_input", "append request is missing required envelope fields");
+    this.assertOpaqueId(input.envelope.lane, "lane");
+    this.assertOpaqueId(input.envelope.mid, "mid");
+    const hasBytes = Boolean(input.envelope.bytes);
+    const hasStorageRef = Boolean(input.envelope.storageRef?.ref);
+    if (!hasBytes && !hasStorageRef) {
+      throw new HttpError(400, "invalid_input", "envelope must include bytes or a storage_ref");
     }
-    const hasInline = Boolean(input.envelope.inlineCiphertext);
-    const hasStorageRefs = (input.envelope.storageRefs?.length ?? 0) > 0;
-    if (!hasInline && !hasStorageRefs) {
-      throw new HttpError(400, "invalid_input", "envelope must include inline_ciphertext or storage_refs");
+    const size = new TextEncoder().encode(JSON.stringify(input.envelope)).byteLength;
+    if (size > ENVELOPE_MAX_BYTES) {
+      throw new HttpError(413, "payload_too_large", "envelope exceeds worker size limit");
     }
   }
-  requestIdForSender(senderUserId) {
-    return `request:${senderUserId}`;
+  assertOpaqueId(value, field) {
+    if (!OPAQUE_ID.test(value)) {
+      throw new HttpError(400, "invalid_input", `${field} must be a 128-bit hex id`);
+    }
   }
-  messageRequestKey(senderUserId) {
-    return `${MESSAGE_REQUEST_PREFIX}${senderUserId}`;
-  }
-  messageRequestIndexKey() {
-    return `${MESSAGE_REQUEST_PREFIX}index`;
-  }
-  async deleteMessageRequest(senderUserId, change) {
-    const existing = await this.state.get(this.messageRequestKey(senderUserId));
-    const index = await this.state.get(this.messageRequestIndexKey()) ?? [];
-    const nextIndex = index.filter((entry) => entry !== senderUserId);
-    const queueMeta = await this.state.get(MESSAGE_REQUEST_META_KEY) ?? {
+  async deleteMessageRequest(lane, change) {
+    const existing = await this.state.get(INBOX_DO_KEYS.messageRequest(lane));
+    const index = await this.state.get(INBOX_DO_KEYS.messageRequestIndex) ?? [];
+    const nextIndex = index.filter((entry) => entry !== lane);
+    const queueMeta = await this.state.get(INBOX_DO_KEYS.messageRequestMeta) ?? {
       version: 1,
       totalBytes: 0,
       senderCount: index.length
     };
     await this.state.mutateEntries({
-      [this.messageRequestIndexKey()]: nextIndex,
-      [MESSAGE_REQUEST_META_KEY]: {
+      [INBOX_DO_KEYS.messageRequestIndex]: nextIndex,
+      [INBOX_DO_KEYS.messageRequestMeta]: {
         version: 1,
         totalBytes: Math.max(0, queueMeta.totalBytes - (existing ? this.messageRequestEntryBytes(existing) : 0)),
         senderCount: nextIndex.length
       }
-    }, [this.messageRequestKey(senderUserId)]);
+    }, [INBOX_DO_KEYS.messageRequest(lane)]);
     if (existing) {
       this.publish({
         event: "message_request_changed",
         deviceId: this.deviceId,
-        senderUserId,
+        senderUserId: existing.senderUserId,
         requestId: existing.requestId,
         change
       });
@@ -5984,7 +5945,14 @@ var InboxService = class {
     if (!match) {
       return null;
     }
-    return await this.state.get(this.messageRequestKey(match.senderUserId)) ?? null;
+    const index = await this.state.get(INBOX_DO_KEYS.messageRequestIndex) ?? [];
+    for (const lane of index) {
+      const entry = await this.state.get(INBOX_DO_KEYS.messageRequest(lane));
+      if (entry?.requestId === requestId) {
+        return entry;
+      }
+    }
+    return null;
   }
   messageRequestEntryBytes(entry) {
     if (entry.byteSize !== void 0 && Number.isSafeInteger(entry.byteSize) && entry.byteSize >= 0) {
@@ -5997,13 +5965,13 @@ var InboxService = class {
   }
   async pruneExpiredMessageRequests(now) {
     const limits = await this.getMeta();
-    const index = await this.state.get(this.messageRequestIndexKey()) ?? [];
+    const index = await this.state.get(INBOX_DO_KEYS.messageRequestIndex) ?? [];
     const retained = [];
     const updates = {};
     const deleteKeys = [];
     let totalBytes = 0;
-    for (const senderUserId of index) {
-      const key = this.messageRequestKey(senderUserId);
+    for (const lane of index) {
+      const key = INBOX_DO_KEYS.messageRequest(lane);
       const entry = await this.state.get(key);
       if (!entry) {
         continue;
@@ -6013,11 +5981,11 @@ var InboxService = class {
       if (expiresAt <= now) {
         deleteKeys.push(key);
         for (const pending of entry.pendingRequests) {
-          deleteKeys.push(`${APPEND_RESULT_PREFIX}${pending.envelope.messageId}`);
+          deleteKeys.push(INBOX_DO_KEYS.appendResult(pending.envelope.mid));
         }
         continue;
       }
-      retained.push(senderUserId);
+      retained.push(lane);
       totalBytes += byteSize;
       if (entry.byteSize !== byteSize || entry.expiresAt !== expiresAt || entry.messageCount !== entry.pendingRequests.length) {
         updates[key] = {
@@ -6028,8 +5996,8 @@ var InboxService = class {
         };
       }
     }
-    updates[this.messageRequestIndexKey()] = retained.sort();
-    updates[MESSAGE_REQUEST_META_KEY] = {
+    updates[INBOX_DO_KEYS.messageRequestIndex] = retained.sort();
+    updates[INBOX_DO_KEYS.messageRequestMeta] = {
       version: 1,
       totalBytes,
       senderCount: retained.length
@@ -6037,9 +6005,8 @@ var InboxService = class {
     await this.state.mutateEntries(updates, deleteKeys);
   }
   async scheduleNextAlarm(now) {
-    const meta = await this.getMeta();
-    const records = await this.state.list({ prefix: RECORD_PREFIX2 });
-    const messageRequestSenders = await this.state.get(this.messageRequestIndexKey()) ?? [];
+    const records = await this.state.list({ prefix: "record:" });
+    const messageRequestLanes = await this.state.get(INBOX_DO_KEYS.messageRequestIndex) ?? [];
     let nextAt;
     for (const record of records.values()) {
       if (record.expiresAt === void 0) {
@@ -6047,8 +6014,8 @@ var InboxService = class {
       }
       nextAt = nextAt === void 0 ? record.expiresAt : Math.min(nextAt, record.expiresAt);
     }
-    for (const senderUserId of messageRequestSenders) {
-      const entry = await this.state.get(this.messageRequestKey(senderUserId));
+    for (const lane of messageRequestLanes) {
+      const entry = await this.state.get(INBOX_DO_KEYS.messageRequest(lane));
       if (entry?.expiresAt !== void 0) {
         nextAt = nextAt === void 0 ? entry.expiresAt : Math.min(nextAt, entry.expiresAt);
       }
@@ -6058,7 +6025,6 @@ var InboxService = class {
     }
   }
   toMessageRequestItem(entry) {
-    const groupInvite = this.groupInviteMetadata(entry);
     return {
       requestId: entry.requestId,
       recipientDeviceId: entry.recipientDeviceId,
@@ -6070,32 +6036,32 @@ var InboxService = class {
       lastSeenAt: entry.lastSeenAt,
       messageCount: entry.messageCount,
       lastMessageId: entry.lastMessageId,
-      lastConversationId: entry.lastConversationId,
-      requestKind: groupInvite ? "group_invite" : "direct",
-      groupId: groupInvite?.groupId,
-      groupTitle: groupInvite?.title
+      requestKind: "direct"
     };
   }
-  groupInviteMetadata(entry) {
-    for (let index = entry.pendingRequests.length - 1; index >= 0; index -= 1) {
-      const request = entry.pendingRequests[index];
-      if (request.envelope.messageType !== "control_group_welcome_pickup") {
-        continue;
+  decodeBytes(value) {
+    try {
+      const binary = atob(value);
+      const bytes = new Uint8Array(binary.length);
+      for (let index = 0; index < binary.length; index += 1) {
+        bytes[index] = binary.charCodeAt(index);
       }
-      const encoded = request.envelope.inlineCiphertext;
-      if (!encoded) {
-        return null;
-      }
-      try {
-        const payload = JSON.parse(atob(encoded));
-        if (payload.groupId && payload.title) {
-          return payload;
-        }
-      } catch {
-        return null;
-      }
+      return bytes;
+    } catch {
+      throw new HttpError(400, "invalid_input", "bytes must be valid base64");
     }
-    return null;
+  }
+  encodeBytes(bytes) {
+    let binary = "";
+    for (const byte of bytes) {
+      binary += String.fromCharCode(byte);
+    }
+    return btoa(binary);
+  }
+  randomOpaqueId() {
+    const bytes = new Uint8Array(16);
+    crypto.getRandomValues(bytes);
+    return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
   }
 };
 
@@ -6207,7 +6173,6 @@ async function handleInboxDurableRequest(request, deps) {
     maxInlineBytes: deps.maxInlineBytes,
     rateLimitPerMinute: deps.rateLimitPerMinute,
     rateLimitPerHour: deps.rateLimitPerHour,
-    messageRequestMaxPerSender: deps.messageRequestMaxPerSender ?? 16,
     messageRequestMaxSenders: deps.messageRequestMaxSenders ?? 64,
     messageRequestMaxTotalBytes: deps.messageRequestMaxTotalBytes ?? 4 * 1024 * 1024,
     messageRequestTtlSeconds: deps.messageRequestTtlSeconds ?? 7 * 24 * 60 * 60,
@@ -6234,26 +6199,22 @@ async function handleInboxDurableRequest(request, deps) {
       const result = action === "accept" ? await service.acceptMessageRequest(requestId, now) : await service.rejectMessageRequest(requestId, now);
       return jsonResponse3(result);
     }
-    if (url.pathname.endsWith("/allowlist") && request.method === "GET") {
-      return jsonResponse3(await service.getAllowlist(now));
+    const acceptedLaneMatch = url.pathname.match(/\/accepted-lanes\/([^/]+)$/);
+    if (acceptedLaneMatch && request.method === "PUT") {
+      const lane = decodeURIComponent(acceptedLaneMatch[1]);
+      return jsonResponse3(await service.registerAcceptedLane(lane, now));
     }
-    if (url.pathname.endsWith("/allowlist") && request.method === "PUT") {
-      const body = await readJsonLimited(request, CONTROL_JSON_MAX_BYTES);
-      const result = await service.replaceAllowlist(
-        body.allowedSenderUserIds ?? [],
-        body.rejectedSenderUserIds ?? [],
-        now
-      );
-      return jsonResponse3(result);
+    if (acceptedLaneMatch && request.method === "DELETE") {
+      const lane = decodeURIComponent(acceptedLaneMatch[1]);
+      return jsonResponse3(await service.revokeAcceptedLane(lane));
     }
     if (url.pathname.endsWith("/messages") && request.method === "POST") {
       const body = await readJsonLimited(
         request,
         deps.messageRequestMaxBodyBytes ?? DEFAULT_MESSAGE_REQUEST_MAX_BODY_BYTES
       );
-      const mode = request.headers.get(APPEND_AUTH_CONTEXT_HEADER) === "legacy_unverified" ? "legacy_unverified" : "verified";
       const result = await service.appendEnvelope(body, now, {
-        mode,
+        mode: "verified",
         reason: request.headers.get(APPEND_AUTH_REASON_HEADER) ?? void 0
       });
       return jsonResponse3(result);
@@ -6326,7 +6287,6 @@ var InboxDurableObject = class extends DurableObjectBase3 {
       rateLimitPerMinute: Number(this.envRef.RATE_LIMIT_PER_MINUTE ?? "60"),
       rateLimitPerHour: Number(this.envRef.RATE_LIMIT_PER_HOUR ?? "600"),
       messageRequestMaxBodyBytes: Number(this.envRef.MESSAGE_REQUEST_MAX_BODY_BYTES ?? String(DEFAULT_MESSAGE_REQUEST_MAX_BODY_BYTES)),
-      messageRequestMaxPerSender: Number(this.envRef.MESSAGE_REQUEST_MAX_PER_SENDER ?? "16"),
       messageRequestMaxSenders: Number(this.envRef.MESSAGE_REQUEST_MAX_SENDERS ?? "64"),
       messageRequestMaxTotalBytes: Number(this.envRef.MESSAGE_REQUEST_MAX_TOTAL_BYTES ?? String(4 * 1024 * 1024)),
       messageRequestTtlSeconds: Number(this.envRef.MESSAGE_REQUEST_TTL_SECONDS ?? String(7 * 24 * 60 * 60)),
@@ -6370,7 +6330,6 @@ var InboxDurableObject = class extends DurableObjectBase3 {
         maxInlineBytes: Number(this.envRef.MAX_INLINE_BYTES ?? "4096"),
         rateLimitPerMinute: Number(this.envRef.RATE_LIMIT_PER_MINUTE ?? "60"),
         rateLimitPerHour: Number(this.envRef.RATE_LIMIT_PER_HOUR ?? "600"),
-        messageRequestMaxPerSender: Number(this.envRef.MESSAGE_REQUEST_MAX_PER_SENDER ?? "16"),
         messageRequestMaxSenders: Number(this.envRef.MESSAGE_REQUEST_MAX_SENDERS ?? "64"),
         messageRequestMaxTotalBytes: Number(this.envRef.MESSAGE_REQUEST_MAX_TOTAL_BYTES ?? String(4 * 1024 * 1024)),
         messageRequestTtlSeconds: Number(this.envRef.MESSAGE_REQUEST_TTL_SECONDS ?? String(7 * 24 * 60 * 60)),
@@ -6987,7 +6946,7 @@ function publicDeploymentBundle(request, env) {
         "generic_sync",
         "attachment_v2",
         "message_requests",
-        "allowlist",
+        "accepted_lanes",
         "rate_limit",
         "group_outbox_mvp",
         "welcome_pickup_mvp",
@@ -7135,7 +7094,7 @@ async function handleRequest(request, env) {
       const result = await verified.json();
       return jsonResponse4({ runtimeCredential: await issueDeviceRuntimeAuth(env, userId, deviceId, result.registrationVersion, now) });
     }
-    const inboxMatch = url.pathname.match(/^\/v1\/inbox\/([^/]+)\/(messages|ack|head|subscribe|allowlist|message-requests(?:\/[^/]+\/(?:accept|reject))?)$/);
+    const inboxMatch = url.pathname.match(/^\/v1\/inbox\/([^/]+)\/(messages|ack|head|subscribe|accepted-lanes(?:\/[^/]+)?|message-requests(?:\/[^/]+\/(?:accept|reject))?)$/);
     if (inboxMatch) {
       const deviceId = decodeURIComponent(inboxMatch[1]);
       const operation = inboxMatch[2];
@@ -7160,7 +7119,7 @@ async function handleRequest(request, env) {
         await validateRegisteredRuntimeAuthorizationForDevice(request, env, deviceId, "inbox_ack", now);
       } else if (operation === "subscribe") {
         await validateRegisteredRuntimeAuthorizationForDevice(request, env, deviceId, "inbox_subscribe", now);
-      } else if (operation === "allowlist" || operation === "message-requests" || operation.startsWith("message-requests/")) {
+      } else if (operation === "accepted-lanes" || operation.startsWith("accepted-lanes/") || operation === "message-requests" || operation.startsWith("message-requests/")) {
         await validateRegisteredRuntimeAuthorizationForDevice(request, env, deviceId, "inbox_manage", now);
       }
       if (request.method !== "GET" && request.method !== "HEAD") {

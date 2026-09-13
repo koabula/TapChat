@@ -19,10 +19,10 @@ use tapchat_core::platform_ports::{
     TransportPort, execute_platform_effect,
 };
 use tapchat_core::transport_contract::{
-    AppendEnvelopeRequest, BlobDownloadRequest, BlobUploadRequest, FetchAllowlistRequest,
-    FetchIdentityBundleRequest, FetchMessageRequestsRequest, MessageRequestActionRequest,
-    PrepareBlobUploadRequest, PublishSharedStateRequest, RealtimeSubscriptionRequest,
-    ReplaceAllowlistRequest,
+    AppendEnvelopeRequest, BlobDownloadRequest, BlobUploadRequest, FetchIdentityBundleRequest,
+    FetchMessageRequestsRequest, MessageRequestActionRequest, PrepareBlobUploadRequest,
+    PublishSharedStateRequest, RealtimeSubscriptionRequest, RegisterAcceptedLaneRequest,
+    RevokeAcceptedLanesRequest,
 };
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
@@ -232,21 +232,30 @@ impl CoreDriver {
 
     pub fn pending_mls_artifacts(&self, conversation_id: &str) -> PendingMlsArtifacts {
         let mut artifacts = PendingMlsArtifacts::default();
+        let matches_conversation = |envelope: &Envelope| {
+            self.runtime.latest_snapshot.as_ref().is_some_and(|snapshot| {
+                snapshot.conversations.iter().any(|persisted| {
+                    persisted.conversation_id == conversation_id
+                        && persisted.state.lanes.as_ref().is_some_and(|lanes| {
+                            lanes.outbound_lane == envelope.lane
+                                || lanes.inbound_lane == envelope.lane
+                        })
+                })
+            })
+        };
+        let count = |envelope: &Envelope, artifacts: &mut PendingMlsArtifacts| {
+            if tapchat_core::mls_adapter::MlsAdapter::payload_is_welcome(
+                envelope.payload_b64().unwrap_or_default(),
+            ) {
+                artifacts.pending_welcome_count = artifacts.pending_welcome_count.saturating_add(1);
+            } else {
+                artifacts.pending_commit_count = artifacts.pending_commit_count.saturating_add(1);
+            }
+        };
         let Some(snapshot) = self.runtime.latest_snapshot.as_ref() else {
             for envelope in &self.runtime.recent_appends {
-                if envelope.conversation_id != conversation_id {
-                    continue;
-                }
-                match envelope.message_type {
-                    MessageType::MlsWelcome => {
-                        artifacts.pending_welcome_count =
-                            artifacts.pending_welcome_count.saturating_add(1);
-                    }
-                    MessageType::MlsCommit => {
-                        artifacts.pending_commit_count =
-                            artifacts.pending_commit_count.saturating_add(1);
-                    }
-                    _ => {}
+                if matches_conversation(envelope) {
+                    count(envelope, &mut artifacts);
                 }
             }
             for (recent_conversation_id, message_type) in &self.runtime.recent_messages {
@@ -268,35 +277,13 @@ impl CoreDriver {
             return artifacts;
         };
         for item in &snapshot.pending_outbox {
-            if item.envelope.conversation_id != conversation_id {
-                continue;
-            }
-            match item.envelope.message_type {
-                MessageType::MlsWelcome => {
-                    artifacts.pending_welcome_count =
-                        artifacts.pending_welcome_count.saturating_add(1);
-                }
-                MessageType::MlsCommit => {
-                    artifacts.pending_commit_count =
-                        artifacts.pending_commit_count.saturating_add(1);
-                }
-                _ => {}
+            if matches_conversation(&item.envelope) {
+                count(&item.envelope, &mut artifacts);
             }
         }
         for envelope in &self.runtime.recent_appends {
-            if envelope.conversation_id != conversation_id {
-                continue;
-            }
-            match envelope.message_type {
-                MessageType::MlsWelcome => {
-                    artifacts.pending_welcome_count =
-                        artifacts.pending_welcome_count.saturating_add(1);
-                }
-                MessageType::MlsCommit => {
-                    artifacts.pending_commit_count =
-                        artifacts.pending_commit_count.saturating_add(1);
-                }
-                _ => {}
+            if matches_conversation(envelope) {
+                count(envelope, &mut artifacts);
             }
         }
         for (recent_conversation_id, message_type) in &self.runtime.recent_messages {
@@ -735,63 +722,76 @@ impl CoreDriver {
         }
     }
 
-    async fn fetch_allowlist(&mut self, fetch: FetchAllowlistRequest) -> Result<Vec<CoreEvent>> {
-        let mut request = self.runtime.client.get(fetch.endpoint);
-        for (key, value) in &fetch.headers {
+    async fn register_accepted_lane(
+        &mut self,
+        register: RegisterAcceptedLaneRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        let endpoint = format!(
+            "{}/{}",
+            register.endpoint.trim_end_matches('/'),
+            register.lane
+        );
+        let mut request = self.runtime.client.put(endpoint);
+        for (key, value) in &register.headers {
             request = request.header(key, value);
         }
         match request.send().await {
             Ok(response) if response.status().is_success() => {
-                let body = response.text().await?;
-                let document = serde_json::from_str(&to_snake_case_json_string(&body)?)?;
-                Ok(vec![CoreEvent::AllowlistFetched { document }])
+                Ok(vec![CoreEvent::AcceptedLaneRegistered {
+                    lane: register.lane,
+                }])
             }
             Ok(response) => {
                 let status = response.status().as_u16();
                 let body = response.text().await.unwrap_or_default();
-                Ok(vec![CoreEvent::AllowlistFetchFailed {
+                Ok(vec![CoreEvent::AcceptedLaneRegisterFailed {
+                    lane: register.lane,
                     failure: tapchat_core::AppErrorV1::from_http_response(status, &body),
                 }])
             }
-            Err(_error) => Ok(vec![CoreEvent::AllowlistFetchFailed {
+            Err(_error) => Ok(vec![CoreEvent::AcceptedLaneRegisterFailed {
+                lane: register.lane,
                 failure: tapchat_core::AppErrorV1::network_unavailable(),
             }]),
         }
     }
 
-    async fn replace_allowlist(
+    async fn revoke_accepted_lanes(
         &mut self,
-        update: ReplaceAllowlistRequest,
+        revoke: RevokeAcceptedLanesRequest,
     ) -> Result<Vec<CoreEvent>> {
-        let mut request = self.runtime.client.put(update.endpoint);
-        for (key, value) in &update.headers {
-            request = request.header(key, value);
+        let mut last_ok = true;
+        let mut last_failure = None;
+        for lane in &revoke.lanes {
+            let endpoint = format!("{}/{}", revoke.endpoint.trim_end_matches('/'), lane);
+            let mut request = self.runtime.client.delete(endpoint);
+            for (key, value) in &revoke.headers {
+                request = request.header(key, value);
+            }
+            match request.send().await {
+                Ok(response) if response.status().is_success() => {}
+                Ok(response) => {
+                    last_ok = false;
+                    last_failure = Some(tapchat_core::AppErrorV1::from_http_response(
+                        response.status().as_u16(),
+                        &response.text().await.unwrap_or_default(),
+                    ));
+                }
+                Err(_error) => {
+                    last_ok = false;
+                    last_failure = Some(tapchat_core::AppErrorV1::network_unavailable());
+                }
+            }
         }
-        let body = serde_json::to_string(&serde_json::json!({
-            "allowedSenderUserIds": update.document.allowed_sender_user_ids,
-            "rejectedSenderUserIds": update.document.rejected_sender_user_ids,
-        }))?;
-        match request
-            .header("Content-Type", "application/json")
-            .body(body)
-            .send()
-            .await
-        {
-            Ok(response) if response.status().is_success() => {
-                let body = response.text().await?;
-                let document = serde_json::from_str(&to_snake_case_json_string(&body)?)?;
-                Ok(vec![CoreEvent::AllowlistReplaced { document }])
-            }
-            Ok(response) => {
-                let status = response.status().as_u16();
-                let body = response.text().await.unwrap_or_default();
-                Ok(vec![CoreEvent::AllowlistReplaceFailed {
-                    failure: tapchat_core::AppErrorV1::from_http_response(status, &body),
-                }])
-            }
-            Err(_error) => Ok(vec![CoreEvent::AllowlistReplaceFailed {
-                failure: tapchat_core::AppErrorV1::network_unavailable(),
-            }]),
+        if last_ok {
+            Ok(vec![CoreEvent::AcceptedLanesRevoked {
+                lanes: revoke.lanes,
+            }])
+        } else {
+            Ok(vec![CoreEvent::AcceptedLanesRevokeFailed {
+                lanes: revoke.lanes,
+                failure: last_failure.unwrap_or_else(tapchat_core::AppErrorV1::network_unavailable),
+            }])
         }
     }
 
@@ -1150,15 +1150,18 @@ impl TransportPort for CoreDriver {
         CoreDriver::act_on_message_request(self, action).await
     }
 
-    async fn fetch_allowlist(&mut self, fetch: FetchAllowlistRequest) -> Result<Vec<CoreEvent>> {
-        CoreDriver::fetch_allowlist(self, fetch).await
+    async fn register_accepted_lane(
+        &mut self,
+        register: RegisterAcceptedLaneRequest,
+    ) -> Result<Vec<CoreEvent>> {
+        CoreDriver::register_accepted_lane(self, register).await
     }
 
-    async fn replace_allowlist(
+    async fn revoke_accepted_lanes(
         &mut self,
-        update: ReplaceAllowlistRequest,
+        revoke: RevokeAcceptedLanesRequest,
     ) -> Result<Vec<CoreEvent>> {
-        CoreDriver::replace_allowlist(self, update).await
+        CoreDriver::revoke_accepted_lanes(self, revoke).await
     }
 
     async fn publish_shared_state(
@@ -1323,8 +1326,8 @@ fn merge_outputs(mut left: CoreOutput, right: CoreOutput) -> CoreOutput {
             left_view
                 .welcome_pickups
                 .append(&mut right_view.welcome_pickups);
-            if right_view.allowlist.is_some() {
-                left_view.allowlist = right_view.allowlist.take();
+            if right_view.revoked_contact_user_id.is_some() {
+                left_view.revoked_contact_user_id = right_view.revoked_contact_user_id.take();
             }
             if right_view.message_request_action.is_some() {
                 left_view.message_request_action = right_view.message_request_action.take();

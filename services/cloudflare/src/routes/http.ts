@@ -21,7 +21,6 @@ import { StorageService } from "../storage/service";
 import { WelcomePickupService } from "../welcome-pickup/service";
 import {
   CURRENT_MODEL_VERSION,
-  type AllowlistDocument,
   type AppendGroupEnvelopeRequest,
   type AppendEnvelopeRequest,
   type DeploymentBundle,
@@ -323,7 +322,7 @@ function publicDeploymentBundle(request: Request, env: Env): DeploymentBundle {
         "generic_sync",
         "attachment_v2",
         "message_requests",
-        "allowlist",
+        "accepted_lanes",
         "rate_limit",
         "group_outbox_mvp",
         "welcome_pickup_mvp",
@@ -516,7 +515,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       return jsonResponse({ runtimeCredential: await issueDeviceRuntimeAuth(env, userId, deviceId, result.registrationVersion, now) });
     }
 
-    const inboxMatch = url.pathname.match(/^\/v1\/inbox\/([^/]+)\/(messages|ack|head|subscribe|allowlist|message-requests(?:\/[^/]+\/(?:accept|reject))?)$/);
+    const inboxMatch = url.pathname.match(/^\/v1\/inbox\/([^/]+)\/(messages|ack|head|subscribe|accepted-lanes(?:\/[^/]+)?|message-requests(?:\/[^/]+\/(?:accept|reject))?)$/);
     if (inboxMatch) {
       const deviceId = decodeURIComponent(inboxMatch[1]);
       const operation = inboxMatch[2];
@@ -543,7 +542,8 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       } else if (operation === "subscribe") {
         await validateRegisteredRuntimeAuthorizationForDevice(request, env, deviceId, "inbox_subscribe", now);
       } else if (
-        operation === "allowlist" ||
+        operation === "accepted-lanes" ||
+        operation.startsWith("accepted-lanes/") ||
         operation === "message-requests" ||
         operation.startsWith("message-requests/")
       ) {

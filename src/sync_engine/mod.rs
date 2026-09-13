@@ -145,14 +145,14 @@ impl SyncEngine {
     pub fn quarantine_record(state: &mut DeviceSyncState, record: &InboxRecord) {
         state.quarantine.insert(record.seq, record.clone());
 
-        let conversation_id = record.envelope.conversation_id.clone();
-        while Self::quarantined_for_conversation(state, &conversation_id)
+        let lane = record.envelope.lane.clone();
+        while Self::quarantined_for_conversation(state, &lane)
             > MAX_QUARANTINED_RECORDS_PER_CONVERSATION
         {
             let Some(oldest) = state
                 .quarantine
                 .iter()
-                .find(|(_, held)| held.envelope.conversation_id == conversation_id)
+                .find(|(_, held)| held.envelope.lane == lane)
                 .map(|(seq, _)| *seq)
             else {
                 break;
@@ -167,11 +167,11 @@ impl SyncEngine {
         }
     }
 
-    fn quarantined_for_conversation(state: &DeviceSyncState, conversation_id: &str) -> usize {
+    fn quarantined_for_conversation(state: &DeviceSyncState, lane: &str) -> usize {
         state
             .quarantine
             .values()
-            .filter(|held| held.envelope.conversation_id == conversation_id)
+            .filter(|held| held.envelope.lane == lane)
             .count()
     }
 
@@ -185,7 +185,6 @@ impl SyncEngine {
         Ack {
             device_id: state.checkpoint.device_id.clone(),
             ack_seq: state.checkpoint.last_acked_seq,
-            acked_message_ids: Vec::new(),
             acked_at: state.checkpoint.updated_at,
         }
     }
@@ -198,8 +197,7 @@ mod tests {
         MAX_QUARANTINED_RECORDS_PER_CONVERSATION,
     };
     use crate::model::{
-        DeliveryClass, Envelope, InboxRecord, InboxRecordState, MessageType, SenderProof,
-        CURRENT_MODEL_VERSION,
+        Envelope, InboxRecord, InboxRecordState,
     };
 
     #[test]
@@ -290,7 +288,7 @@ mod tests {
             for _ in 0..8 {
                 seq += 1;
                 let mut record = sample_record(&format!("msg:{seq}"), seq);
-                record.envelope.conversation_id = format!("conv:{conversation}");
+                record.envelope.lane = format!("{conversation:032x}");
                 SyncEngine::quarantine_record(&mut state, &record);
             }
         }
@@ -341,23 +339,12 @@ mod tests {
             received_at: seq,
             expires_at: None,
             state: InboxRecordState::Available,
-            envelope: Envelope {
-                version: CURRENT_MODEL_VERSION.to_string(),
-                message_id: message_id.into(),
-                conversation_id: "conv:user:alice:user:bob".into(),
-                sender_user_id: "user:alice".into(),
-                sender_device_id: "device:alice:phone".into(),
-                recipient_device_id: "device:bob:phone".into(),
-                created_at: seq,
-                message_type: MessageType::MlsApplication,
-                inline_ciphertext: Some("cipher".into()),
-                storage_refs: vec![],
-                delivery_class: DeliveryClass::Normal,
-                sender_proof: SenderProof {
-                    proof_type: "signature".into(),
-                    value: "proof".into(),
-                },
-            },
+            envelope: Envelope::with_bytes(
+                "device:bob:phone",
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                message_id,
+                "cipher",
+            ),
         }
     }
 }

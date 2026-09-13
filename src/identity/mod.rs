@@ -674,7 +674,6 @@ mod tests {
                     target_device_id: identity.device_identity.device_id.clone(),
                     endpoint: "https://example.com/inbox".into(),
                     operations: vec![CapabilityOperation::Append],
-                    conversation_scope: vec![],
                     expires_at: 999,
                     constraints: Some(CapabilityConstraints {
                         max_bytes: Some(1024),

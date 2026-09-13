@@ -322,50 +322,10 @@ impl CoreEngine {
                 }
             }
         }
-        if let Some(group_state) = group_state {
-            if let Some(recipient_user_id) = group_state
-                .manifest
-                .member_devices
-                .iter()
-                .find(|device| device.device_id == descriptor.device_id)
-                .map(|device| device.user_id.clone())
-            {
-                let local_user_id = self.local_identity_user_id()?;
-                if recipient_user_id != local_user_id
-                    && self.state.contacts.contains_key(&recipient_user_id)
-                {
-                    let direct_conversation_id = self
-                        .active_direct_conversation_for_peer(&recipient_user_id)
-                        .map(|(conversation_id, _)| conversation_id)
-                        .unwrap_or_else(|| {
-                            direct_conversation_id(&local_user_id, &recipient_user_id)
-                        });
-                    let invite = GroupWelcomePickupControl {
-                        version: crate::model::CURRENT_MODEL_VERSION.to_string(),
-                        group_id: group_state.group_id.clone(),
-                        conversation_id: group_state.conversation_id.clone(),
-                        title: group_state.manifest.title.clone(),
-                        inviter_user_id: local_user_id,
-                        welcome_pickup_descriptor: descriptor.clone(),
-                    };
-                    let payload = serde_json::to_vec(&invite).map_err(|error| {
-                        CoreError::invalid_input(format!(
-                            "failed to encode group welcome pickup control: {error}"
-                        ))
-                    })?;
-                    let envelope = self.build_envelope(
-                        &direct_conversation_id,
-                        &descriptor.device_id,
-                        MessageType::ControlGroupWelcomePickup,
-                        STANDARD.encode(payload),
-                    )?;
-                    persist_ops.push(PersistOp::SaveOutgoingEnvelope {
-                        message_id: envelope.message_id.clone(),
-                    });
-                    self.enqueue_envelopes(recipient_user_id, vec![envelope]);
-                }
-            }
-        }
+        // Group welcome pickup is published on the group path. A 1:1
+        // ControlGroupWelcomePickup envelope is no longer expressible; submit 2
+        // will carry the notify as an MLS payload_kind when a session exists.
+        let _ = group_state;
         let mut output = CoreOutput {
             state_update: CoreStateUpdate {
                 checkpoints_changed: true,
@@ -3463,6 +3423,7 @@ impl CoreEngine {
                     recovery_status: RecoveryStatus::Healthy,
                     archive_metadata: None,
                     pcs: Default::default(),
+                    lanes: None,
                 },
             );
             self.state.group_cursors.insert(

@@ -22,15 +22,17 @@ function segment(value: string): string {
 /** Inbox Durable Object keys. */
 export const INBOX_DO_KEYS = {
   meta: "meta",
-  allowlist: "allowlist",
+  acceptedLane: (lane: string): string => `accepted-lane:${lane}`,
+  laneSeq: (lane: string): string => `lane-seq:${lane}`,
   record: (seq: number): string => `record:${seq}`,
-  idempotency: (messageId: string): string => `idempotency:${messageId}`,
-  appendResult: (messageId: string): string => `append-result:${messageId}`,
-  messageRequest: (senderUserId: string): string => `message-request:${senderUserId}`,
+  idempotency: (mid: string): string => `idempotency:${mid}`,
+  appendResult: (mid: string): string => `append-result:${mid}`,
+  messageRequest: (lane: string): string => `message-request:${lane}`,
   messageRequestIndex: "message-request:index",
   messageRequestMeta: "message-request:meta",
   messageRequestRateLimit: "message-request:rate-limit",
-  rateLimit: (senderUserId: string): string => `rate-limit:${senderUserId}`
+  rateLimit: (lane: string): string => `rate-limit:${lane}`,
+  rateLimitFirstContact: "rate-limit:first-contact"
 } as const;
 
 /** R2 object keys, across every namespace in the single storage bucket. */
@@ -77,15 +79,17 @@ export const R2_KEYS = {
  */
 export const INBOX_DO_KEY_TEMPLATES: Record<keyof typeof INBOX_DO_KEYS, string> = {
   meta: "meta",
-  allowlist: "allowlist",
+  acceptedLane: "accepted-lane:{lane}",
+  laneSeq: "lane-seq:{lane}",
   record: "record:{seq}",
-  idempotency: "idempotency:{messageId}",
-  appendResult: "append-result:{messageId}",
-  messageRequest: "message-request:{senderUserId}",
+  idempotency: "idempotency:{mid}",
+  appendResult: "append-result:{mid}",
+  messageRequest: "message-request:{lane}",
   messageRequestIndex: "message-request:index",
   messageRequestMeta: "message-request:meta",
   messageRequestRateLimit: "message-request:rate-limit",
-  rateLimit: "rate-limit:{senderUserId}"
+  rateLimit: "rate-limit:{lane}",
+  rateLimitFirstContact: "rate-limit:first-contact"
 };
 
 export const R2_KEY_TEMPLATES: Record<keyof typeof R2_KEYS, string> = {

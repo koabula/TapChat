@@ -254,17 +254,8 @@ export async function actOnMessageRequest(
   });
 }
 
-// Allowlist
-export async function getAllowlist(): Promise<CoreOutput> {
-  return invoke("get_allowlist");
-}
-
-export async function addToAllowlist(userId: string): Promise<CoreOutput> {
-  return invoke("add_to_allowlist", { userId });
-}
-
-export async function removeFromAllowlist(userId: string): Promise<CoreOutput> {
-  return invoke("remove_from_allowlist", { userId });
+export async function revokeContact(userId: string): Promise<CoreOutput> {
+  return invoke("revoke_contact", { userId });
 }
 
 // Cloudflare

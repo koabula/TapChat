@@ -38,11 +38,6 @@ struct RuntimeMessageRequestList {
     pub requests: Vec<RuntimeMessageRequest>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct RuntimeAllowlistDocument {
-    pub allowed_sender_user_ids: Vec<String>,
-    pub rejected_sender_user_ids: Vec<String>,
-}
 
 #[derive(Debug, Clone, Default)]
 pub struct CloudflareRuntimeOptions {
@@ -287,56 +282,52 @@ impl CloudflareRuntimeHandle {
         Ok(())
     }
 
-    pub async fn put_allowlist(
+    pub async fn register_accepted_lane(
         &self,
         auth: &DeviceRuntimeAuth,
-        allowed_sender_user_ids: &[String],
+        lane: &str,
     ) -> Result<()> {
         let response = self
             .client
             .put(format!(
-                "{}/v1/inbox/{}/allowlist",
+                "{}/v1/inbox/{}/accepted-lanes/{}",
                 self.base_url,
-                urlencoding::encode(&auth.device_id)
+                urlencoding::encode(&auth.device_id),
+                lane
             ))
             .header("Authorization", format!("Bearer {}", auth.token))
-            .header("Content-Type", "application/json")
-            .body(serde_json::to_string(&json!({
-                "allowedSenderUserIds": allowed_sender_user_ids,
-                "rejectedSenderUserIds": []
-            }))?)
             .send()
             .await
-            .context("put allowlist")?;
+            .context("register accepted lane")?;
         if !response.status().is_success() {
-            bail!("put allowlist failed with status {}", response.status());
+            bail!(
+                "register accepted lane failed with status {}",
+                response.status()
+            );
         }
         Ok(())
     }
 
-    pub async fn get_allowlist(
-        &self,
-        auth: &DeviceRuntimeAuth,
-    ) -> Result<RuntimeAllowlistDocument> {
+    pub async fn revoke_accepted_lane(&self, auth: &DeviceRuntimeAuth, lane: &str) -> Result<()> {
         let response = self
             .client
-            .get(format!(
-                "{}/v1/inbox/{}/allowlist",
+            .delete(format!(
+                "{}/v1/inbox/{}/accepted-lanes/{}",
                 self.base_url,
-                urlencoding::encode(&auth.device_id)
+                urlencoding::encode(&auth.device_id),
+                lane
             ))
             .header("Authorization", format!("Bearer {}", auth.token))
             .send()
             .await
-            .context("get allowlist")?;
+            .context("revoke accepted lane")?;
         if !response.status().is_success() {
-            bail!("get allowlist failed with status {}", response.status());
+            bail!(
+                "revoke accepted lane failed with status {}",
+                response.status()
+            );
         }
-        let body = response.text().await?;
-        let normalized = to_snake_case_json_string(&body)?;
-        Ok(serde_json::from_str::<RuntimeAllowlistDocument>(
-            &normalized,
-        )?)
+        Ok(())
     }
 
     pub async fn list_message_requests(

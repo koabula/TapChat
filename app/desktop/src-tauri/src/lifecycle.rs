@@ -1094,8 +1094,8 @@ fn merge_view_models(base: &mut CoreViewModel, mut next: CoreViewModel) {
     base.banners.append(&mut next.banners);
     base.message_requests.append(&mut next.message_requests);
     base.operation_results.append(&mut next.operation_results);
-    if next.allowlist.is_some() {
-        base.allowlist = next.allowlist;
+    if next.revoked_contact_user_id.is_some() {
+        base.revoked_contact_user_id = next.revoked_contact_user_id;
     }
     if next.message_request_action.is_some() {
         base.message_request_action = next.message_request_action;

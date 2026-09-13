@@ -111,6 +111,14 @@ pub struct WelcomeAuthor {
     pub device_public_key: String,
 }
 
+/// Group id and credential identity peeked from a Welcome without joining.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WelcomeInspection {
+    pub conversation_id: String,
+    pub author_user_id: String,
+    pub author_device_id: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WelcomeEnvelope {
     pub recipient_device_id: String,
@@ -812,10 +820,36 @@ impl MlsAdapter {
             .collect()
     }
 
+    pub const REPLY_LANE_EXTENSION_TYPE: u16 = 0xF0A1;
+
+    fn reply_lane_extension_type() -> ExtensionType {
+        ExtensionType::Unknown(Self::REPLY_LANE_EXTENSION_TYPE)
+    }
+
+    fn capabilities_with_reply_lane() -> Capabilities {
+        Capabilities::builder()
+            .extensions(vec![Self::reply_lane_extension_type()])
+            .credentials(vec![CredentialType::Basic])
+            .build()
+    }
+
     pub fn create_conversation(
         &mut self,
         conversation_id: &str,
         peer_devices_with_keypackages: &[PeerDeviceKeyPackage],
+    ) -> CoreResult<CreateConversationArtifacts> {
+        self.create_conversation_with_reply_lane(
+            conversation_id,
+            peer_devices_with_keypackages,
+            None,
+        )
+    }
+
+    pub fn create_conversation_with_reply_lane(
+        &mut self,
+        conversation_id: &str,
+        peer_devices_with_keypackages: &[PeerDeviceKeyPackage],
+        reply_lane: Option<&str>,
     ) -> CoreResult<CreateConversationArtifacts> {
         if conversation_id.trim().is_empty() {
             return Err(CoreError::invalid_input(
@@ -849,10 +883,29 @@ impl MlsAdapter {
         // Trade-off: the forward-secrecy boundary is epoch e-1, not e — a
         // compromise while in epoch e can still decrypt epoch e-1 traffic,
         // since that epoch's key material is deliberately kept around.
-        let config = MlsGroupCreateConfig::builder()
+        let mut builder = MlsGroupCreateConfig::builder()
             .use_ratchet_tree_extension(true)
-            .max_past_epochs(1)
-            .build();
+            .max_past_epochs(1);
+        if let Some(lane) = reply_lane {
+            let extensions = Extensions::try_from(vec![
+                Extension::RequiredCapabilities(RequiredCapabilitiesExtension::new(
+                    &[Self::reply_lane_extension_type()],
+                    &[],
+                    &[CredentialType::Basic],
+                )),
+                Extension::Unknown(
+                    Self::REPLY_LANE_EXTENSION_TYPE,
+                    UnknownExtension(lane.as_bytes().to_vec()),
+                ),
+            ])
+            .map_err(|error| {
+                CoreError::invalid_input(format!("reply lane extension is invalid: {error}"))
+            })?;
+            builder = builder
+                .with_group_context_extensions(extensions)
+                .capabilities(Self::capabilities_with_reply_lane());
+        }
+        let config = builder.build();
         let mut group = MlsGroup::new_with_group_id(
             &self.provider,
             &self.signer,
@@ -1368,6 +1421,86 @@ impl MlsAdapter {
                 "mls adapter only supports MLS message types",
             )),
         }
+    }
+
+    pub fn export_lane_wrap_key(
+        &self,
+        conversation_id: &str,
+        dir: u8,
+    ) -> CoreResult<[u8; crate::lane_wrap::WRAP_KEY_LEN]> {
+        let state = self.groups.get(conversation_id).ok_or_else(|| {
+            CoreError::invalid_input("conversation MLS state does not exist")
+        })?;
+        let secret = state
+            .group
+            .export_secret(
+                self.provider.crypto(),
+                crate::lane_wrap::LANE_WRAP_LABEL,
+                &[dir],
+                crate::lane_wrap::WRAP_KEY_LEN,
+            )
+            .map_err(|error| {
+                CoreError::invalid_state(format!("lane wrap exporter failed: {error}"))
+            })?;
+        crate::lane_wrap::key_from_exporter(&secret)
+    }
+
+    pub fn inspect_welcome(&self, payload_b64: &str) -> Option<WelcomeInspection> {
+        let welcome = decode_welcome_body(payload_b64)?;
+        // Stage on a fork. `StagedWelcome::new_from_welcome` deletes the
+        // matched KeyPackage from provider storage before any validation;
+        // doing that on the live adapter would drain the pool before
+        // `ingest_welcome` could adopt the same Welcome.
+        let fork = self.fork().ok()?;
+        let config = MlsGroupJoinConfig::builder()
+            .use_ratchet_tree_extension(true)
+            .max_past_epochs(1)
+            .build();
+        let staged = StagedWelcome::new_from_welcome(&fork.provider, &config, welcome, None).ok()?;
+        let conversation_id =
+            String::from_utf8(staged.group_context().group_id().as_slice().to_vec()).ok()?;
+        if !crate::model::is_opaque_id(&conversation_id) {
+            return None;
+        }
+        let sender = staged.welcome_sender().ok()?;
+        let identity = extract_sender_identity(sender.credential()).ok()?;
+        let mut parts = identity.split('|');
+        let author_user_id = parts.next()?.to_string();
+        let author_device_id = parts.next()?.to_string();
+        if parts.next().is_some() || author_user_id.is_empty() || author_device_id.is_empty() {
+            return None;
+        }
+        Some(WelcomeInspection {
+            conversation_id,
+            author_user_id,
+            author_device_id,
+        })
+    }
+
+    pub fn classify_mls_payload(payload_b64: &str) -> Option<MessageType> {
+        if decode_welcome_body(payload_b64).is_some() {
+            return Some(MessageType::MlsWelcome);
+        }
+        let protocol = decode_protocol_message(payload_b64)?;
+        match protocol.content_type() {
+            ContentType::Application => Some(MessageType::MlsApplication),
+            ContentType::Commit => Some(MessageType::MlsCommit),
+            ContentType::Proposal => Some(MessageType::MlsProposal),
+            _ => None,
+        }
+    }
+
+    pub fn payload_is_welcome(payload_b64: &str) -> bool {
+        decode_welcome_body(payload_b64).is_some()
+    }
+
+    pub fn reply_lane_from_group(&self, conversation_id: &str) -> Option<String> {
+        let state = self.groups.get(conversation_id)?;
+        let extension = state
+            .group
+            .extensions()
+            .unknown(Self::REPLY_LANE_EXTENSION_TYPE)?;
+        String::from_utf8(extension.0.clone()).ok()
     }
 
     pub fn export_group_summary(&self, conversation_id: &str) -> CoreResult<MlsStateSummary> {
@@ -2238,6 +2371,7 @@ impl MlsAdapter {
         let lifetime = Lifetime::init(not_before_seconds, not_after_seconds);
         let key_package_bundle = KeyPackage::builder()
             .key_package_lifetime(lifetime)
+            .leaf_node_capabilities(Self::capabilities_with_reply_lane())
             .build(DEFAULT_CIPHERSUITE, provider, signer, credential_with_key)
             .map_err(|error| {
                 CoreError::invalid_state(format!("failed to build key package: {error}"))
@@ -2674,11 +2808,10 @@ mod tests {
             .expect("genuine key package");
     }
 
-    /// Existence proof that an MLS PrivateMessage header names the conversation
-    /// in the clear: `group_id = conversation_id.as_bytes()`. The ledger fixture
-    /// `representative_mls_frame` is only a representative of this leak.
+    /// Wrapped application and commit frames must not contain the MLS
+    /// `group_id` / local `conversation_id` as a cleartext substring.
     #[test]
-    fn mls_frame_header_names_the_conversation_in_the_clear() {
+    fn wrapped_mls_frames_do_not_name_the_conversation_in_the_clear() {
         let alice = identity(ALICE_MNEMONIC);
         let bob = identity(BOB_MNEMONIC);
         let conversation_id = crate::conversation::direct_conversation_id(
@@ -2697,23 +2830,30 @@ mod tests {
         let commit = alice_adapter
             .rotate_direct_self_update(&conversation_id)
             .expect("self-update commit");
+        let wrap_key = alice_adapter
+            .export_lane_wrap_key(&conversation_id, crate::lane_wrap::WRAP_DIR_C1)
+            .expect("export wrap key");
 
         let application_bytes = BASE64
             .decode(application.payload_b64)
             .expect("application frame");
         let commit_bytes = BASE64.decode(commit.commit_b64).expect("commit frame");
+        let wrapped_application =
+            crate::lane_wrap::wrap_frame(&wrap_key, &application_bytes).expect("wrap application");
+        let wrapped_commit =
+            crate::lane_wrap::wrap_frame(&wrap_key, &commit_bytes).expect("wrap commit");
         let needle = conversation_id.as_bytes();
         assert!(
-            application_bytes
+            !wrapped_application
                 .windows(needle.len())
                 .any(|window| window == needle),
-            "application frame must contain conversation_id in the clear"
+            "wrapped application frame must not contain conversation_id"
         );
         assert!(
-            commit_bytes
+            !wrapped_commit
                 .windows(needle.len())
                 .any(|window| window == needle),
-            "commit frame must contain conversation_id in the clear"
+            "wrapped commit frame must not contain conversation_id"
         );
     }
 

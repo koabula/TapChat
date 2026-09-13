@@ -43,8 +43,7 @@
 use sha2::{Digest, Sha256};
 
 use super::{
-    DeliveryClass, Envelope, GroupEnvelope, GroupEnvelopeVisibility, GroupMessageType, MessageType,
-    StorageRef,
+    GroupEnvelope, GroupEnvelopeVisibility, GroupMessageType, MessageType, StorageRef,
 };
 
 /// Every payload this project signs, outside MLS.
@@ -61,7 +60,6 @@ use super::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SignatureDomain {
     // Signed by the device key.
-    EnvelopeSenderProof,
     GroupEnvelopeSenderProof,
     GroupManifest,
     GroupMembershipProof,
@@ -85,7 +83,6 @@ impl SignatureDomain {
     /// carry no negotiation.
     pub fn as_str(&self) -> &'static str {
         match self {
-            SignatureDomain::EnvelopeSenderProof => "tapchat.envelope.sender_proof.v2",
             SignatureDomain::GroupEnvelopeSenderProof => "tapchat.group_envelope.sender_proof.v1",
             SignatureDomain::GroupManifest => "tapchat.group_manifest.v1",
             SignatureDomain::GroupMembershipProof => "tapchat.group.membership.v1",
@@ -108,7 +105,6 @@ impl SignatureDomain {
     /// test that guards the whole scheme.
     #[cfg(test)]
     pub(crate) const ALL: &'static [SignatureDomain] = &[
-        SignatureDomain::EnvelopeSenderProof,
         SignatureDomain::GroupEnvelopeSenderProof,
         SignatureDomain::GroupManifest,
         SignatureDomain::GroupMembershipProof,
@@ -257,14 +253,6 @@ impl GroupEnvelopeVisibility {
     }
 }
 
-impl DeliveryClass {
-    pub fn wire_name(&self) -> &'static str {
-        match self {
-            DeliveryClass::Normal => "normal",
-        }
-    }
-}
-
 fn push_storage_ref(payload: &mut SigningPayload, reference: &StorageRef) {
     payload.push_str(&reference.kind);
     payload.push_str(&reference.object_ref);
@@ -279,41 +267,6 @@ fn push_storage_ref(payload: &mut SigningPayload, reference: &StorageRef) {
 #[cfg(test)]
 pub fn signing_payload_bytes_for_test(payload: SigningPayload) -> Vec<u8> {
     payload.into_bytes()
-}
-
-/// The exact bytes an envelope's `sender_proof` signs.
-///
-/// Covers every field of the envelope except `sender_proof` itself. The
-/// payload is included as a SHA-256 of the base64 text rather than inline, so
-/// the signing input stays a fixed couple of hundred bytes even for a large
-/// Welcome or attachment manifest, and so no base64 alphabet or padding
-/// ambiguity can arise in a cross-language reimplementation.
-///
-/// `storage_refs` are signed in transmission order, not sorted: the order is
-/// semantically live, since it is copied verbatim into the stored message.
-pub fn envelope_sender_proof_payload(envelope: &Envelope) -> SigningPayload {
-    let mut payload = SigningPayload::new(SignatureDomain::EnvelopeSenderProof);
-    payload.push_str(&envelope.version);
-    payload.push_str(&envelope.message_id);
-    payload.push_str(&envelope.conversation_id);
-    payload.push_str(&envelope.sender_user_id);
-    payload.push_str(&envelope.sender_device_id);
-    payload.push_str(&envelope.recipient_device_id);
-    payload.push_u64(envelope.created_at);
-    payload.push_str(envelope.message_type.wire_name());
-    payload.push_str(envelope.delivery_class.wire_name());
-    match envelope.inline_ciphertext.as_deref() {
-        Some(ciphertext) => {
-            payload.push_u32(1);
-            payload.push_bytes(&Sha256::digest(ciphertext.as_bytes()));
-        }
-        None => payload.push_u32(0),
-    }
-    payload.push_u32(envelope.storage_refs.len() as u32);
-    for reference in &envelope.storage_refs {
-        push_storage_ref(&mut payload, reference);
-    }
-    payload
 }
 
 /// The exact bytes a group envelope's `sender_proof` signs.
@@ -371,40 +324,12 @@ mod tests {
     use super::*;
     use crate::model::{SenderProof, StorageRef, CURRENT_MODEL_VERSION};
 
-    /// A named field mutation, for the coverage test below.
-    type Mutation = (&'static str, Box<dyn Fn(&mut Envelope)>);
-
-    /// The group counterpart of [`Mutation`].
+    /// The group counterpart of a named field mutation.
     type GroupMutation = (&'static str, Box<dyn Fn(&mut GroupEnvelope)>);
 
-    /// SHA-256 of the golden envelope's signing payload. Computed from this
-    /// implementation; a TypeScript port must reproduce it byte for byte.
-    const GOLDEN_ENVELOPE_DIGEST: &str =
-        "4e50c2c241007efcd8a027f988345a6ab227524a87a4b9227a897667b5f12d6e";
-
-    /// The group counterpart of [`GOLDEN_ENVELOPE_DIGEST`].
+    /// SHA-256 of the golden group envelope's signing payload.
     const GOLDEN_GROUP_ENVELOPE_DIGEST: &str =
         "6563a355dec4d7081f6d1a9f26dba49ccae18ee945308ee6843aa2738cd13bcf";
-
-    fn envelope() -> Envelope {
-        Envelope {
-            version: CURRENT_MODEL_VERSION.to_string(),
-            message_id: "msg:1".into(),
-            conversation_id: "conv:alice:bob".into(),
-            sender_user_id: "user:alice".into(),
-            sender_device_id: "device:alice:phone".into(),
-            recipient_device_id: "device:bob:phone".into(),
-            created_at: 1_700_000_000_000,
-            message_type: MessageType::MlsApplication,
-            inline_ciphertext: Some("Y2lwaGVy".into()),
-            storage_refs: Vec::new(),
-            delivery_class: DeliveryClass::Normal,
-            sender_proof: SenderProof {
-                proof_type: "device_signature".into(),
-                value: "unsigned".into(),
-            },
-        }
-    }
 
     /// The whole scheme rests on domains being distinguishable, and nothing
     /// else checks it. Pairwise distinctness is not enough on its own: because
@@ -427,153 +352,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    /// Every signed field must actually change the bytes. Without this, a
-    /// field could silently drop out of the domain during a refactor and the
-    /// signature would stop covering it.
-    #[test]
-    fn every_field_is_covered() {
-        let base = envelope_sender_proof_payload(&envelope()).into_bytes();
-
-        let mutations: Vec<Mutation> = vec![
-            (
-                "version",
-                Box::new(|e: &mut Envelope| e.version = "0.2".into()),
-            ),
-            (
-                "message_id",
-                Box::new(|e: &mut Envelope| e.message_id = "msg:2".into()),
-            ),
-            (
-                "conversation_id",
-                Box::new(|e: &mut Envelope| e.conversation_id = "conv:alice:mallory".into()),
-            ),
-            (
-                "sender_user_id",
-                Box::new(|e: &mut Envelope| e.sender_user_id = "user:mallory".into()),
-            ),
-            (
-                "sender_device_id",
-                Box::new(|e: &mut Envelope| e.sender_device_id = "device:mallory:phone".into()),
-            ),
-            (
-                "recipient_device_id",
-                Box::new(|e: &mut Envelope| e.recipient_device_id = "device:carol:phone".into()),
-            ),
-            ("created_at", Box::new(|e: &mut Envelope| e.created_at += 1)),
-            (
-                "message_type",
-                Box::new(|e: &mut Envelope| {
-                    e.message_type = MessageType::ControlConversationNeedsRebuild
-                }),
-            ),
-            (
-                "inline_ciphertext",
-                Box::new(|e: &mut Envelope| e.inline_ciphertext = Some("b3RoZXI=".into())),
-            ),
-            (
-                "inline_ciphertext absence",
-                Box::new(|e: &mut Envelope| e.inline_ciphertext = None),
-            ),
-            (
-                "storage_refs",
-                Box::new(|e: &mut Envelope| {
-                    e.storage_refs = vec![StorageRef {
-                        kind: "attachment".into(),
-                        object_ref: "blob:1".into(),
-                        size_bytes: 10,
-                        mime_type: "image/png".into(),
-                        file_name: None,
-                        expires_at: None,
-                    }]
-                }),
-            ),
-        ];
-
-        for (field, mutate) in mutations {
-            let mut mutated = envelope();
-            mutate(&mut mutated);
-            assert_ne!(
-                envelope_sender_proof_payload(&mutated).into_bytes(),
-                base,
-                "{field} is not covered by the signing domain"
-            );
-        }
-    }
-
-    /// `sender_proof` must not sign itself.
-    #[test]
-    fn sender_proof_is_not_part_of_its_own_domain() {
-        let base = envelope_sender_proof_payload(&envelope()).into_bytes();
-        let mut other = envelope();
-        other.sender_proof.value = "something else".into();
-        assert_eq!(envelope_sender_proof_payload(&other).into_bytes(), base);
-    }
-
-    /// The bug that delimiter-joined domains have: two different envelopes
-    /// whose fields concatenate to the same string under a `|` separator must
-    /// not collide here.
-    #[test]
-    fn field_boundaries_cannot_be_shifted() {
-        let mut left = envelope();
-        left.conversation_id = "conv:a".into();
-        left.sender_user_id = "b|user:c".into();
-
-        let mut right = envelope();
-        right.conversation_id = "conv:a|b".into();
-        right.sender_user_id = "user:c".into();
-
-        assert_ne!(
-            envelope_sender_proof_payload(&left).into_bytes(),
-            envelope_sender_proof_payload(&right).into_bytes()
-        );
-    }
-
-    /// An empty payload and an absent payload are different envelopes.
-    #[test]
-    fn absent_and_empty_payload_differ() {
-        let mut empty = envelope();
-        empty.inline_ciphertext = Some(String::new());
-        let mut absent = envelope();
-        absent.inline_ciphertext = None;
-        assert_ne!(
-            envelope_sender_proof_payload(&empty).into_bytes(),
-            envelope_sender_proof_payload(&absent).into_bytes()
-        );
-    }
-
-    /// Pins the byte layout, so a change that would silently invalidate every
-    /// peer's signatures has to be deliberate. Also the vector a TypeScript
-    /// port checks itself against.
-    #[test]
-    fn golden_vector_is_stable() {
-        let mut envelope = envelope();
-        envelope.storage_refs = vec![
-            StorageRef {
-                kind: "attachment".into(),
-                object_ref: "blob:1".into(),
-                size_bytes: 4096,
-                mime_type: "image/png".into(),
-                file_name: Some("cat.png".into()),
-                expires_at: Some(1_700_000_100_000),
-            },
-            StorageRef {
-                kind: "attachment".into(),
-                object_ref: "blob:2".into(),
-                size_bytes: 0,
-                mime_type: "application/octet-stream".into(),
-                file_name: None,
-                expires_at: None,
-            },
-        ];
-        let digest = Sha256::digest(envelope_sender_proof_payload(&envelope).into_bytes());
-        assert_eq!(
-            format!("{digest:x}"),
-            GOLDEN_ENVELOPE_DIGEST,
-            "the envelope signing domain changed; update every implementation \
-             of it (Rust and TypeScript) before changing this vector"
-        );
     }
 
     fn group_envelope() -> GroupEnvelope {
@@ -724,18 +502,7 @@ mod tests {
         );
     }
 
-    /// A group envelope and a direct envelope must never produce the same
-    /// bytes, however similar their contents. The domain prefix is what makes
-    /// that true, and nothing else checks it for this pair.
-    #[test]
-    fn group_and_direct_sender_proofs_are_different_domains() {
-        assert_ne!(
-            group_envelope_sender_proof_payload(&group_envelope()).into_bytes(),
-            envelope_sender_proof_payload(&envelope()).into_bytes()
-        );
-    }
-
-    /// Pins the byte layout. Same purpose as [`golden_vector_is_stable`].
+    /// Pins the byte layout.
     #[test]
     fn group_golden_vector_is_stable() {
         let mut envelope = group_envelope();

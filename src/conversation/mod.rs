@@ -3,8 +3,8 @@ use std::collections::BTreeSet;
 use crate::direct_pcs::DirectPcsState;
 use crate::error::{CoreError, CoreResult};
 use crate::model::{
-    Conversation, ConversationKind, ConversationMember, ConversationState, DeviceStatusKind,
-    Envelope, MessageType, StorageRef,
+    random_opaque_id, Conversation, ConversationKind, ConversationMember, ConversationState,
+    DeviceStatusKind, Envelope, MessageType, StorageRef,
 };
 use serde::{Deserialize, Serialize};
 
@@ -82,6 +82,38 @@ pub struct LocalConversationState {
     pub archive_metadata: Option<ConversationArchiveMetadata>,
     #[serde(default)]
     pub pcs: DirectPcsState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lanes: Option<ConversationLanes>,
+}
+
+/// Per-direction admission tokens and the wrap key for the previous epoch.
+///
+/// `outbound_dir` is `0` when this side writes C₁ and `1` when it writes C₂.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversationLanes {
+    pub inbound_lane: String,
+    pub outbound_lane: String,
+    pub outbound_dir: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wrap_prev: Option<LaneWrapCache>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaneWrapCache {
+    pub epoch: u64,
+    pub key: [u8; 32],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outbound_key: Option<[u8; 32]>,
+}
+
+impl ConversationLanes {
+    pub fn inbound_dir(&self) -> u8 {
+        if self.outbound_dir == crate::lane_wrap::WRAP_DIR_C1 {
+            crate::lane_wrap::WRAP_DIR_C2
+        } else {
+            crate::lane_wrap::WRAP_DIR_C1
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -176,6 +208,7 @@ impl ConversationManager {
             recovery_status: RecoveryStatus::Healthy,
             archive_metadata: None,
             pcs: DirectPcsState::default(),
+            lanes: None,
         })
     }
 
@@ -265,16 +298,25 @@ impl ConversationManager {
     pub fn apply_incoming_envelope(
         state: &mut LocalConversationState,
         envelope: &Envelope,
+        sender_user_id: &str,
+        sender_device_id: &str,
+        message_type: MessageType,
+        created_at: u64,
+        storage_refs: Vec<StorageRef>,
     ) -> CoreResult<AppliedEnvelopeEffect> {
-        if envelope.conversation_id != state.conversation.conversation_id {
+        if state
+            .lanes
+            .as_ref()
+            .is_some_and(|lanes| lanes.inbound_lane != envelope.lane)
+        {
             return Err(CoreError::invalid_input(
-                "incoming envelope conversation_id does not match local conversation",
+                "incoming envelope lane does not match local conversation",
             ));
         }
         if state
             .messages
             .iter()
-            .any(|message| message.message_id == envelope.message_id)
+            .any(|message| message.message_id == envelope.mid)
         {
             return Ok(AppliedEnvelopeEffect {
                 duplicate_message: true,
@@ -283,24 +325,24 @@ impl ConversationManager {
         }
 
         state.messages.push(StoredMessage {
-            message_id: envelope.message_id.clone(),
+            message_id: envelope.mid.clone(),
             app_message_id: None,
             mls_ciphertext_sha256: None,
-            sender_user_id: Some(envelope.sender_user_id.clone()),
-            sender_device_id: envelope.sender_device_id.clone(),
+            sender_user_id: Some(sender_user_id.to_string()),
+            sender_device_id: sender_device_id.to_string(),
             recipient_device_id: envelope.recipient_device_id.clone(),
-            message_type: envelope.message_type,
-            created_at: envelope.created_at,
+            message_type,
+            created_at,
             plaintext: None,
-            storage_refs: envelope.storage_refs.clone(),
+            storage_refs,
             delivery_state: None,
             message_request_id: None,
         });
-        state.last_message_type = Some(envelope.message_type);
-        state.conversation.updated_at = envelope.created_at;
+        state.last_message_type = Some(message_type);
+        state.conversation.updated_at = created_at;
 
         let mut effect = AppliedEnvelopeEffect::default();
-        match envelope.message_type {
+        match message_type {
             MessageType::ControlConversationNeedsRebuild => {
                 state.conversation.state = ConversationState::NeedsRebuild;
                 state.recovery_status = RecoveryStatus::NeedsRebuild;
@@ -318,7 +360,7 @@ impl ConversationManager {
             MessageType::MlsApplication => {
                 state
                     .last_known_peer_active_devices
-                    .insert(envelope.sender_device_id.clone());
+                    .insert(sender_device_id.to_string());
             }
             _ => {}
         }
@@ -335,10 +377,8 @@ pub struct AppliedEnvelopeEffect {
     pub duplicate_message: bool,
 }
 
-pub fn direct_conversation_id(a: &str, b: &str) -> String {
-    let mut parts = [a.to_string(), b.to_string()];
-    parts.sort();
-    format!("conv:{}:{}", parts[0], parts[1])
+pub fn direct_conversation_id(_a: &str, _b: &str) -> String {
+    random_opaque_id()
 }
 
 #[cfg(test)]
@@ -347,7 +387,7 @@ mod tests {
         ConversationManager, ConversationModule, LocalConversationState, ReconcileMembershipInput,
         RecoveryStatus,
     };
-    use crate::model::{ConversationState, DeliveryClass, Envelope, MessageType, SenderProof};
+    use crate::model::{ConversationState, Envelope, MessageType};
 
     #[test]
     fn module_name_is_stable() {
@@ -442,26 +482,19 @@ mod tests {
             &["device:bob:phone".into()],
         )
         .expect("conversation should be created");
-        let conversation_id = state.conversation.conversation_id.clone();
         let effect = ConversationManager::apply_incoming_envelope(
             &mut state,
-            &Envelope {
-                version: crate::model::CURRENT_MODEL_VERSION.to_string(),
-                message_id: "msg:1".into(),
-                conversation_id,
-                sender_user_id: "user:bob".into(),
-                sender_device_id: "device:bob:phone".into(),
-                recipient_device_id: "device:alice:phone".into(),
-                created_at: 1,
-                message_type: MessageType::ControlConversationNeedsRebuild,
-                inline_ciphertext: Some("cipher".into()),
-                storage_refs: vec![],
-                delivery_class: DeliveryClass::Normal,
-                sender_proof: SenderProof {
-                    proof_type: "signature".into(),
-                    value: "proof".into(),
-                },
-            },
+            &Envelope::with_bytes(
+                "device:alice:phone",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "cipher",
+            ),
+            "user:bob",
+            "device:bob:phone",
+            MessageType::ControlConversationNeedsRebuild,
+            1,
+            Vec::new(),
         )
         .expect("apply should succeed");
 
@@ -479,27 +512,19 @@ mod tests {
             &["device:bob:phone".into()],
         )
         .expect("conversation should be created");
-        let conversation_id = state.conversation.conversation_id.clone();
-
         let effect = ConversationManager::apply_incoming_envelope(
             &mut state,
-            &Envelope {
-                version: crate::model::CURRENT_MODEL_VERSION.to_string(),
-                message_id: "msg:2".into(),
-                conversation_id,
-                sender_user_id: "user:bob".into(),
-                sender_device_id: "device:bob:phone".into(),
-                recipient_device_id: "device:alice:phone".into(),
-                created_at: 2,
-                message_type: MessageType::ControlDeviceMembershipChanged,
-                inline_ciphertext: Some("cipher".into()),
-                storage_refs: vec![],
-                delivery_class: DeliveryClass::Normal,
-                sender_proof: SenderProof {
-                    proof_type: "signature".into(),
-                    value: "proof".into(),
-                },
-            },
+            &Envelope::with_bytes(
+                "device:alice:phone",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "cccccccccccccccccccccccccccccccc",
+                "cipher",
+            ),
+            "user:bob",
+            "device:bob:phone",
+            MessageType::ControlDeviceMembershipChanged,
+            2,
+            Vec::new(),
         )
         .expect("apply should succeed");
 
@@ -517,29 +542,33 @@ mod tests {
             &["device:bob:phone".into()],
         )
         .expect("conversation should be created");
-        let conversation_id = state.conversation.conversation_id.clone();
-        let envelope = Envelope {
-            version: crate::model::CURRENT_MODEL_VERSION.to_string(),
-            message_id: "msg:2".into(),
-            conversation_id,
-            sender_user_id: "user:bob".into(),
-            sender_device_id: "device:bob:phone".into(),
-            recipient_device_id: "device:alice:phone".into(),
-            created_at: 2,
-            message_type: MessageType::MlsApplication,
-            inline_ciphertext: Some("cipher".into()),
-            storage_refs: vec![],
-            delivery_class: DeliveryClass::Normal,
-            sender_proof: SenderProof {
-                proof_type: "signature".into(),
-                value: "proof".into(),
-            },
-        };
+        let envelope = Envelope::with_bytes(
+            "device:alice:phone",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "dddddddddddddddddddddddddddddddd",
+            "cipher",
+        );
 
-        let first = ConversationManager::apply_incoming_envelope(&mut state, &envelope)
-            .expect("first apply");
-        let second = ConversationManager::apply_incoming_envelope(&mut state, &envelope)
-            .expect("second apply");
+        let first = ConversationManager::apply_incoming_envelope(
+            &mut state,
+            &envelope,
+            "user:bob",
+            "device:bob:phone",
+            MessageType::MlsApplication,
+            2,
+            Vec::new(),
+        )
+        .expect("first apply");
+        let second = ConversationManager::apply_incoming_envelope(
+            &mut state,
+            &envelope,
+            "user:bob",
+            "device:bob:phone",
+            MessageType::MlsApplication,
+            2,
+            Vec::new(),
+        )
+        .expect("second apply");
 
         assert!(!first.duplicate_message);
         assert!(second.duplicate_message);

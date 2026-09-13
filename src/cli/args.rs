@@ -191,7 +191,12 @@ pub enum ContactSubcommand {
         profile: Option<PathBuf>,
     },
     Requests(ContactRequestsCommand),
-    Allowlist(ContactAllowlistCommand),
+    Revoke {
+        #[arg(long)]
+        profile: Option<PathBuf>,
+        #[arg(long)]
+        user_id: String,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -220,31 +225,6 @@ pub enum ContactRequestsSubcommand {
     },
 }
 
-#[derive(Debug, Args)]
-pub struct ContactAllowlistCommand {
-    #[command(subcommand)]
-    pub command: ContactAllowlistSubcommand,
-}
-
-#[derive(Debug, Subcommand)]
-pub enum ContactAllowlistSubcommand {
-    List {
-        #[arg(long)]
-        profile: Option<PathBuf>,
-    },
-    Add {
-        #[arg(long)]
-        profile: Option<PathBuf>,
-        #[arg(long)]
-        user_id: String,
-    },
-    Remove {
-        #[arg(long)]
-        profile: Option<PathBuf>,
-        #[arg(long)]
-        user_id: String,
-    },
-}
 
 #[derive(Debug, Args)]
 pub struct ConversationCommand {

@@ -262,9 +262,15 @@ impl CoreEngine {
                 messages: generated
                     .iter()
                     .map(|envelope| MessageSummary {
-                        conversation_id: envelope.conversation_id.clone(),
-                        message_id: envelope.message_id.clone(),
-                        message_type: envelope.message_type,
+                        conversation_id: conversation_id.clone(),
+                        message_id: envelope.mid.clone(),
+                        message_type: if crate::mls_adapter::MlsAdapter::payload_is_welcome(
+                            envelope.payload_b64().unwrap_or_default(),
+                        ) {
+                            MessageType::MlsWelcome
+                        } else {
+                            MessageType::MlsCommit
+                        },
                     })
                     .collect(),
                 ..CoreViewModel::default()
@@ -341,9 +347,15 @@ impl CoreEngine {
                     messages: generated
                         .iter()
                         .map(|envelope| MessageSummary {
-                            conversation_id: envelope.conversation_id.clone(),
-                            message_id: envelope.message_id.clone(),
-                            message_type: envelope.message_type,
+                            conversation_id: conversation_id.clone(),
+                            message_id: envelope.mid.clone(),
+                            message_type: if crate::mls_adapter::MlsAdapter::payload_is_welcome(
+                                envelope.payload_b64().unwrap_or_default(),
+                            ) {
+                                MessageType::MlsWelcome
+                            } else {
+                                MessageType::MlsCommit
+                            },
                         })
                         .collect(),
                     ..CoreViewModel::default()
@@ -692,43 +704,13 @@ impl CoreEngine {
         local_user_id: &str,
         record: &InboxRecord,
     ) {
-        self.state
-            .conversations
-            .entry(record.envelope.conversation_id.clone())
-            .or_insert_with(|| LocalConversationState {
-                conversation: crate::model::Conversation {
-                    conversation_id: record.envelope.conversation_id.clone(),
-                    kind: ConversationKind::Direct,
-                    member_users: vec![
-                        record.envelope.sender_user_id.clone(),
-                        local_user_id.to_string(),
-                    ],
-                    member_devices: vec![
-                        crate::model::ConversationMember {
-                            user_id: record.envelope.sender_user_id.clone(),
-                            device_id: record.envelope.sender_device_id.clone(),
-                            status: crate::model::DeviceStatusKind::Active,
-                        },
-                        crate::model::ConversationMember {
-                            user_id: local_user_id.to_string(),
-                            device_id: device_id.to_string(),
-                            status: crate::model::DeviceStatusKind::Active,
-                        },
-                    ],
-                    state: ConversationState::Active,
-                    updated_at: record.envelope.created_at,
-                },
-                messages: Vec::new(),
-                last_message_type: None,
-                peer_user_id: record.envelope.sender_user_id.clone(),
-                last_known_peer_active_devices: BTreeSet::from([record
-                    .envelope
-                    .sender_device_id
-                    .clone()]),
-                recovery_status: RecoveryStatus::Healthy,
-                archive_metadata: None,
-                pcs: Default::default(),
-            });
+        let Some(conversation_id) = self.conversation_id_for_lane(&record.envelope.lane) else {
+            return;
+        };
+        if self.state.conversations.contains_key(&conversation_id) {
+            return;
+        }
+        let _ = (device_id, local_user_id);
     }
 
     /// Whether a retained record is waiting on something that only a Welcome
@@ -767,10 +749,11 @@ impl CoreEngine {
             .sync_states
             .get(device_id)
             .map(|sync_state| {
-                sync_state
-                    .quarantine
-                    .values()
-                    .any(|record| record.envelope.conversation_id == conversation_id)
+                sync_state.quarantine.values().any(|record| {
+                    self.conversation_id_for_lane(&record.envelope.lane)
+                        .as_deref()
+                        == Some(conversation_id)
+                })
             })
             .unwrap_or(false)
     }
@@ -809,25 +792,38 @@ impl CoreEngine {
         conversation_id: &str,
         live_epoch: u64,
     ) {
-        let Some(sync_state) = self.state.sync_states.get_mut(device_id) else {
+        let Some(sync_state) = self.state.sync_states.get(device_id) else {
             return;
         };
-        sync_state.quarantine.retain(|_, record| {
-            if record.envelope.conversation_id != conversation_id
-                || record.envelope.message_type != MessageType::MlsCommit
-            {
-                return true;
+        let drop_seqs = sync_state
+            .quarantine
+            .iter()
+            .filter_map(|(seq, record)| {
+                if self
+                    .conversation_id_for_lane(&record.envelope.lane)
+                    .as_deref()
+                    != Some(conversation_id)
+                {
+                    return None;
+                }
+                let payload = self.unwrap_inbound_bytes(
+                    conversation_id,
+                    record.envelope.payload_b64().unwrap_or_default(),
+                )?;
+                if MlsAdapter::classify_mls_payload(&payload) != Some(MessageType::MlsCommit) {
+                    return None;
+                }
+                match MlsAdapter::protocol_message_epoch(&payload) {
+                    Ok(epoch) if epoch < live_epoch => Some(*seq),
+                    _ => None,
+                }
+            })
+            .collect::<Vec<_>>();
+        if let Some(sync_state) = self.state.sync_states.get_mut(device_id) {
+            for seq in drop_seqs {
+                sync_state.quarantine.remove(&seq);
             }
-            let payload = record
-                .envelope
-                .inline_ciphertext
-                .as_deref()
-                .unwrap_or_default();
-            match MlsAdapter::protocol_message_epoch(payload) {
-                Ok(epoch) => epoch >= live_epoch,
-                Err(_) => true,
-            }
-        });
+        }
     }
 
     pub(super) fn recovery_reason_for_record(&self, conversation_id: &str) -> RecoveryReason {

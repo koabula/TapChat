@@ -428,7 +428,7 @@ pub async fn get_messages(
                 && !snapshot
                     .pending_outbox
                     .iter()
-                    .any(|item| item.envelope.message_id == *message_id) =>
+                    .any(|item| item.envelope.mid == *message_id) =>
             {
                 Some(MessageView {
                     message_id: message_id.clone(),
@@ -484,18 +484,22 @@ pub async fn get_messages(
     let outbox_messages: Vec<MessageView> = snapshot
         .pending_outbox
         .iter()
-        .filter(|env| env.envelope.conversation_id == conversation_id)
         .filter(|env| {
-            matches!(
-                env.envelope.message_type,
-                tapchat_core::model::MessageType::MlsApplication
+            snapshot.conversations.iter().any(|persisted| {
+                persisted.conversation_id == conversation_id
+                    && persisted.state.lanes.as_ref().is_some_and(|lanes| {
+                        lanes.outbound_lane == env.envelope.lane
+                            || lanes.inbound_lane == env.envelope.lane
+                    })
+            }) && !tapchat_core::mls_adapter::MlsAdapter::payload_is_welcome(
+                env.envelope.payload_b64().unwrap_or_default(),
             )
         })
         .filter_map(|env| {
             let logical_message_id = env
                 .app_message_id
                 .as_deref()
-                .unwrap_or(&env.envelope.message_id);
+                .unwrap_or(&env.envelope.mid);
             // Only include if not already in conversation messages
             let already_exists = conversation_messages
                 .iter()
@@ -518,11 +522,11 @@ pub async fn get_messages(
             // This is an outgoing message
             Some(MessageView {
                 message_id: logical_message_id.to_string(),
-                sender_device_id: env.envelope.sender_device_id.clone(),
+                sender_device_id: local_device_id.clone().unwrap_or_default(),
                 recipient_device_id: env.envelope.recipient_device_id.clone(),
                 message_type: MessageDirection::Sent,
                 raw_message_type: "mls_application".into(),
-                created_at: env.envelope.created_at,
+                created_at: 0,
                 plaintext: if has_manifest {
                     None
                 } else {
@@ -530,12 +534,8 @@ pub async fn get_messages(
                 },
                 attachment_manifest,
                 attachment_state: has_manifest.then_some(MessageAttachmentState::Published),
-                has_attachment: !env.envelope.storage_refs.is_empty() || has_manifest,
-                storage_refs: if has_manifest {
-                    Vec::new()
-                } else {
-                    env.envelope.storage_refs.clone()
-                },
+                has_attachment: has_manifest,
+                storage_refs: Vec::new(),
                 delivery_state: Some(
                     if env.retries >= tapchat_core::ffi_api::MAX_TRANSPORT_RETRIES {
                         MessageDeliveryState::Failed

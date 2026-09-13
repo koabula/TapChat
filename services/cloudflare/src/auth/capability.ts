@@ -50,7 +50,7 @@ export function getBearerToken(request: Request): string {
 }
 
 export interface AppendAuthContext {
-  mode: "verified" | "legacy_unverified";
+  mode: "verified";
   reason?: string;
 }
 
@@ -106,9 +106,6 @@ export async function validateAppendAuthorization(
   const requestUrl = new URL(request.url);
   if (capability.endpoint !== `${requestUrl.origin}${requestUrl.pathname}`) {
     throw new HttpError(403, "invalid_capability", "capability endpoint does not match request path");
-  }
-  if (capability.conversationScope?.length && !capability.conversationScope.includes(body.envelope.conversationId)) {
-    throw new HttpError(403, "invalid_capability", "conversation is outside capability scope");
   }
   const size = new TextEncoder().encode(JSON.stringify(body.envelope)).byteLength;
   if (capability.constraints?.maxBytes !== undefined && size > capability.constraints.maxBytes) {
@@ -178,11 +175,6 @@ export function capabilityPayload(capability: InboxAppendCapability) {
     .pushU32(capability.operations.length);
   for (const operation of capability.operations) {
     payload.pushStr(wireName(CAPABILITY_OPERATIONS, operation, "capability operation"));
-  }
-  const scope = capability.conversationScope ?? [];
-  payload.pushU32(scope.length);
-  for (const conversationId of scope) {
-    payload.pushStr(conversationId);
   }
   payload.pushU64(capability.expiresAt);
   if (capability.constraints) {

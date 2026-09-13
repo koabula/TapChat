@@ -2856,6 +2856,7 @@ mod tests {
                 recovery_status: crate::conversation::RecoveryStatus::Healthy,
                 archive_metadata: None,
                 pcs: Default::default(),
+                lanes: None,
             },
         };
         store
@@ -2989,6 +2990,7 @@ mod tests {
                 recovery_status: crate::conversation::RecoveryStatus::Healthy,
                 archive_metadata: None,
                 pcs: Default::default(),
+                lanes: None,
             },
         };
         store
@@ -3073,6 +3075,7 @@ mod tests {
                 recovery_status: crate::conversation::RecoveryStatus::Healthy,
                 archive_metadata: None,
                 pcs: Default::default(),
+                lanes: None,
             },
         };
         let snapshot = CorePersistenceSnapshot {
@@ -3292,6 +3295,7 @@ mod tests {
             recovery_status: crate::conversation::RecoveryStatus::Healthy,
             archive_metadata: None,
             pcs: Default::default(),
+            lanes: None,
         };
         store
             .save_snapshot(&CorePersistenceSnapshot {

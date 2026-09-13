@@ -353,6 +353,7 @@ pub(crate) fn maximal_protected_message() -> crate::model::ProtectedAppMessage {
         )],
         payload_kind: ProtectedPayloadKind::Text,
         body: sentinel::PLAINTEXT_BODY.to_string(),
+        sent_at: 1_664_111_222_333,
     }
 }
 
@@ -496,60 +497,35 @@ pub(crate) fn fixture_bindings() -> BTreeMap<String, String> {
 /// of these types must fail to compile here. Never relax one with
 /// `..Default::default()`.
 pub(crate) fn maximal_append_request() -> crate::transport_contract::AppendEnvelopeRequest {
-    use crate::model::{
-        DeliveryClass, Envelope, MessageType, SenderProof, StorageRef, CURRENT_MODEL_VERSION,
-    };
+    use crate::model::{Envelope, EnvelopeStorageRef, CURRENT_MODEL_VERSION};
 
-    let sender_user_id = format!("user:{}", sentinel::SENDER_USER_FP);
-    let recipient_user_id = format!("user:{}", sentinel::RECIPIENT_USER_FP);
-    let sender_device_id = format!(
-        "device:{}:{}",
-        sentinel::SENDER_USER_FP,
-        sentinel::SENDER_DEVICE_FP
-    );
     let recipient_device_id = format!(
         "device:{}:{}",
         sentinel::RECIPIENT_USER_FP,
         sentinel::RECIPIENT_DEVICE_FP
     );
-
-    // Derived by the real implementation rather than hand-written, so that a
-    // change to the derivation shows up here instead of being mirrored.
-    let conversation_id =
-        crate::conversation::direct_conversation_id(&sender_user_id, &recipient_user_id);
-    let message_id = format!(
-        "msg:{conversation_id}:{}:{recipient_device_id}",
-        sentinel::MESSAGE_NONCE
-    );
-
+    let conversation_id = crate::model::random_opaque_id();
+    let lane = crate::model::random_opaque_id();
+    let mid = crate::model::random_opaque_id();
+    let frame = representative_mls_frame(&conversation_id);
+    let frame_bytes = base64::engine::general_purpose::STANDARD
+        .decode(frame)
+        .expect("representative frame");
+    let wrapped = crate::lane_wrap::wrap_frame(&[0xA5; 32], &frame_bytes).expect("wrap frame");
     let envelope = Envelope {
-        version: CURRENT_MODEL_VERSION.to_string(),
-        message_id,
-        conversation_id: conversation_id.clone(),
-        sender_user_id,
-        sender_device_id,
         recipient_device_id,
-        created_at: 1_775_000_000_000,
-        message_type: MessageType::MlsApplication,
-        inline_ciphertext: Some(representative_mls_frame(&conversation_id)),
-        storage_refs: vec![StorageRef {
-            kind: "attachment_original".to_string(),
+        lane,
+        mid,
+        bytes: Some(base64::engine::general_purpose::STANDARD.encode(wrapped)),
+        storage_ref: Some(EnvelopeStorageRef {
             object_ref: format!(
                 "blobs/original/user:{}/device:{}:{}/direct/direct/conv/msg-task",
                 sentinel::SENDER_USER_FP,
                 sentinel::SENDER_USER_FP,
                 sentinel::SENDER_DEVICE_FP
             ),
-            size_bytes: 4096,
-            mime_type: "application/octet-stream".to_string(),
-            file_name: Some(sentinel::ATTACHMENT_FILE_NAME.to_string()),
-            expires_at: Some(1_777_000_000_000),
-        }],
-        delivery_class: DeliveryClass::Normal,
-        sender_proof: SenderProof {
-            proof_type: "signature".to_string(),
-            value: "c2lnbmF0dXJl".to_string(),
-        },
+            size: 4096,
+        }),
     };
 
     crate::transport_contract::AppendEnvelopeRequest {
@@ -596,9 +572,8 @@ fn representative_mls_frame(conversation_id: &str) -> String {
 pub(crate) fn inbox_path_surfaces() -> Vec<(&'static str, Value)> {
     use crate::model::Ack;
     use crate::transport_contract::{
-        AckRequest, AllowlistDocument, FetchMessagesRequest, MessageRequestAction,
-        MessageRequestActionRequest, PrepareBlobUploadRequest, ReplaceAllowlistRequest,
-        TransportAuthRequirement,
+        AckRequest, FetchMessagesRequest, MessageRequestAction, MessageRequestActionRequest,
+        PrepareBlobUploadRequest, RegisterAcceptedLaneRequest, TransportAuthRequirement,
     };
     use std::collections::BTreeMap;
 
@@ -624,12 +599,6 @@ pub(crate) fn inbox_path_surfaces() -> Vec<(&'static str, Value)> {
                 ack: Ack {
                     device_id: recipient_device_id.clone(),
                     ack_seq: 42,
-                    // Non-empty on purpose: this carries message ids, which
-                    // carry the conversation id, which names both parties.
-                    acked_message_ids: vec![format!(
-                        "msg:{conversation_id}:{}:{recipient_device_id}",
-                        sentinel::MESSAGE_NONCE
-                    )],
                     acked_at: 1_775_000_000_000,
                 },
             }),
@@ -643,19 +612,16 @@ pub(crate) fn inbox_path_surfaces() -> Vec<(&'static str, Value)> {
             }),
         ),
         (
-            "replace_allowlist_request",
-            host_view(&ReplaceAllowlistRequest {
+            "register_accepted_lane_request",
+            host_view(&RegisterAcceptedLaneRequest {
                 device_id: recipient_device_id.clone(),
+                lane: crate::model::random_opaque_id(),
                 endpoint: format!(
-                    "https://runtime.example/v1/inbox/{}/allowlist",
+                    "https://runtime.example/v1/inbox/{}/accepted-lanes",
                     urlencoding_colon(&recipient_device_id)
                 ),
                 headers: BTreeMap::new(),
                 auth: auth.clone(),
-                document: AllowlistDocument {
-                    allowed_sender_user_ids: vec![sender_user_id.clone()],
-                    rejected_sender_user_ids: vec![format!("user:{}", sentinel::RECIPIENT_USER_FP)],
-                },
             }),
         ),
         (
@@ -1009,61 +975,18 @@ mod tests {
     /// from the ledger, whose completeness `surface_paths_match_the_ledger`
     /// guarantees.
     #[test]
-    fn signed_annotations_match_the_sender_proof_domain() {
-        use crate::model::{signing::envelope_sender_proof_payload, Envelope};
-        use crate::transport_contract::json_case::camel_to_snake_value;
-
+    fn one_to_one_envelope_fields_are_unsigned() {
         let ledger = Ledger::load();
-        let base_request = maximal_append_request();
-        let base_payload = envelope_sender_proof_payload(&base_request.envelope).into_bytes();
-        let mut checked = 0usize;
-        let mut unprobeable: Vec<String> = Vec::new();
-
-        for entry in &ledger.entries {
-            let Some(field_path) = entry
-                .path
-                .strip_prefix("envelope.")
-                .filter(|_| entry.surface == "append_request")
-            else {
-                continue;
-            };
-            let mut view = host_view(&base_request.envelope);
-            if !mutate_at(&mut view, field_path) {
-                // Single-variant enums (`deliveryClass`) have no other value to
-                // take, so they cannot be probed this way.
-                continue;
-            }
-            let Ok(mutated) = serde_json::from_value::<Envelope>(camel_to_snake_value(view)) else {
-                // An enum-valued field: appending a suffix yields no valid
-                // variant, so it cannot be probed this way. Recorded rather
-                // than skipped silently, so a new one has to be looked at.
-                unprobeable.push(field_path.to_string());
-                continue;
-            };
-            let changed = envelope_sender_proof_payload(&mutated).into_bytes() != base_payload;
-            assert_eq!(
-                changed,
-                entry.signed,
-                "envelope.{field_path}: the ledger says signed={}, but mutating it {} the \
-                 sender-proof payload. A field that drops out of the signing domain can be \
-                 rewritten in transit.",
-                entry.signed,
-                if changed {
-                    "changes"
-                } else {
-                    "does not change"
-                }
-            );
-            checked += 1;
-        }
+        let signed: Vec<&str> = ledger
+            .entries
+            .iter()
+            .filter(|entry| entry.surface == "append_request" && entry.path.starts_with("envelope."))
+            .filter(|entry| entry.signed)
+            .map(|entry| entry.path.as_str())
+            .collect();
         assert!(
-            checked >= 10,
-            "expected to probe most envelope fields, probed only {checked}"
-        );
-        assert_eq!(
-            unprobeable,
-            vec!["deliveryClass".to_string(), "messageType".to_string()],
-            "these envelope fields are enum-valued, so a string mutation yields no valid              variant and their `signed` claim is unverified. Both are covered by the              hand-written domain test in src/model/signing.rs; a NEW entry here is not."
+            signed.is_empty(),
+            "1:1 envelope fields are not signed; leftover signed annotations: {signed:?}"
         );
     }
 
@@ -1106,22 +1029,23 @@ mod tests {
     #[test]
     fn every_wire_type_is_classified() {
         // Types the fixtures above construct, directly or as a nested field.
-        const ENUMERATED: [&str; 15] = [
+        const ENUMERATED: [&str; 16] = [
             "AppendEnvelopeRequest",
             "Envelope",
+            "EnvelopeStorageRef",
             "StorageRef",
-            "SenderProof",
-            "MessageType",
-            "DeliveryClass",
             "Ack",
             "AckRequest",
             "FetchMessagesRequest",
-            "AllowlistDocument",
-            "ReplaceAllowlistRequest",
+            "RegisterAcceptedLaneRequest",
             "MessageRequestActionRequest",
             "MessageRequestAction",
             "PrepareBlobUploadRequest",
             "TransportAuthRequirement",
+            "SenderProof",
+            "MessageType",
+            "DeliveryClass",
+            "RevokeAcceptedLanesRequest",
         ];
 
         let ledger = Ledger::load();

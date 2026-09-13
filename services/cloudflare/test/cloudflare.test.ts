@@ -3,7 +3,6 @@ import assert from "node:assert/strict";
 import { ed25519 } from "@noble/curves/ed25519";
 import {
   CURRENT_MODEL_VERSION,
-  type AllowlistDocument,
   type AppendEnvelopeRequest,
   type AppendGroupEnvelopeRequest,
   type AppendGroupTransitionRequest,
@@ -618,31 +617,20 @@ function createEnv(options?: {
   return { env: env as unknown as Env, bucket };
 }
 
-function sampleAppend(deviceId = "device:bob:phone", messageId = "msg:1", conversationId = "conv:alice:bob", senderUserId = "user:alice"): AppendEnvelopeRequest {
+function sampleAppend(deviceId = "device:bob:phone", mid = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", lane = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"): AppendEnvelopeRequest {
   return {
     version: CURRENT_MODEL_VERSION,
     recipientDeviceId: deviceId,
     envelope: {
-      version: CURRENT_MODEL_VERSION,
-      messageId,
-      conversationId,
-      senderUserId,
-      senderDeviceId: `${senderUserId.replace("user", "device")}:phone`,
       recipientDeviceId: deviceId,
-      createdAt: 1,
-      messageType: "mls_application",
-      inlineCiphertext: "cipher",
-      storageRefs: [],
-      deliveryClass: "normal",
-      senderProof: {
-        type: "signature",
-        value: "sig"
-      }
+      lane,
+      mid,
+      bytes: "cipher"
     }
   };
 }
 
-function sampleCapability(deviceId = "device:bob:phone", conversationScope?: string[], maxBytes?: number) {
+function sampleCapability(deviceId = "device:bob:phone", maxBytes?: number) {
   return {
     version: CURRENT_MODEL_VERSION,
     service: "inbox" as const,
@@ -650,7 +638,6 @@ function sampleCapability(deviceId = "device:bob:phone", conversationScope?: str
     targetDeviceId: deviceId,
     endpoint: `https://example.com/v1/inbox/${deviceId}/messages`,
     operations: ["append"],
-    conversationScope,
     expiresAt: Date.now() + 60_000,
     constraints: maxBytes === undefined ? undefined : { maxBytes },
     signature: "append-cap-sig"
@@ -659,7 +646,6 @@ function sampleCapability(deviceId = "device:bob:phone", conversationScope?: str
 
 function signedIdentityFixture(options?: {
   capabilityExpiresAt?: number;
-  conversationScope?: string[];
   endpoint?: string;
   maxBytes?: number;
   userId?: string;
@@ -679,7 +665,6 @@ function signedIdentityFixture(options?: {
     targetDeviceId: deviceId,
     endpoint: options?.endpoint ?? `https://example.com/v1/inbox/${deviceId}/messages`,
     operations: ["append"],
-    conversationScope: options?.conversationScope,
     expiresAt: options?.capabilityExpiresAt ?? now + 60_000,
     constraints:
       options?.maxBytes === undefined ? undefined : { maxBytes: options.maxBytes },
@@ -1264,23 +1249,18 @@ async function appendWithCapability(env: Env, append = sampleAppend()): Promise<
   );
 }
 
-async function setAllowlist(env: Env, token: string, deviceId: string, allowedSenderUserIds: string[], rejectedSenderUserIds: string[] = []): Promise<AllowlistDocument> {
+async function registerAcceptedLane(env: Env, token: string, deviceId: string, lane: string): Promise<void> {
   const response = await handleRequest(
-    new Request(`https://example.com/v1/inbox/${deviceId}/allowlist`, {
+    new Request(`https://example.com/v1/inbox/${deviceId}/accepted-lanes/${lane}`, {
       method: "PUT",
       headers: {
         ...authHeaders(token),
         "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        allowedSenderUserIds,
-        rejectedSenderUserIds
-      })
+      }
     }),
     env
   );
   assert.equal(response.status, 200);
-  return (await response.json()) as AllowlistDocument;
 }
 
 test("runtime readiness checks the device registry and reports its audience", async () => {
@@ -1328,7 +1308,7 @@ test("issues device deployment bundle with runtime auth and security features", 
     "keypackage_write"
   ]);
   assert.ok(bundle.runtimeConfig.features.includes("message_requests"));
-  assert.ok(bundle.runtimeConfig.features.includes("allowlist"));
+  assert.ok(bundle.runtimeConfig.features.includes("accepted_lanes"));
   assert.ok(bundle.runtimeConfig.features.includes("rate_limit"));
   assert.ok(bundle.runtimeConfig.features.includes("group_outbox_mvp"));
   assert.ok(bundle.runtimeConfig.features.includes("welcome_pickup_mvp"));
@@ -1518,10 +1498,7 @@ test("accepts append requests only with explicit capability header", async () =>
   assert.deepEqual(await response.json(), {
     version: CURRENT_MODEL_VERSION,
     accepted: true,
-    seq: 0,
-    deliveredTo: "message_request",
-    queuedAsRequest: true,
-    requestId: "request:user:alice"
+    seq: 1
   });
 });
 
@@ -1531,9 +1508,9 @@ test("verified append capability delivers allowlisted sender to inbox", async ()
   const token = bundle.runtimeCredential.token;
   const fixture = signedIdentityFixture();
   await bucket.putJson("shared-state/user:bob/identity_bundle.json", fixture.bundle);
-  await setAllowlist(env, token, fixture.deviceId, ["user:alice"]);
+  await registerAcceptedLane(env, token, fixture.deviceId, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
 
-  const append = sampleAppend(fixture.deviceId, "msg:signed");
+  const append = sampleAppend(fixture.deviceId, "11111111111111111111111111111111");
   const response = await handleRequest(
     new Request(`https://example.com/v1/inbox/${fixture.deviceId}/messages`, {
       method: "POST",
@@ -1552,7 +1529,7 @@ test("verified append capability delivers allowlisted sender to inbox", async ()
     version: CURRENT_MODEL_VERSION,
     accepted: true,
     seq: 1,
-    deliveredTo: "inbox"
+    accepted: true
   });
 
   const head = await handleRequest(
@@ -1570,7 +1547,7 @@ test("tampered append grant is rejected even when sender is allowlisted", async 
   const token = bundle.runtimeCredential.token;
   const fixture = signedIdentityFixture();
   await bucket.putJson("shared-state/user:bob/identity_bundle.json", fixture.bundle);
-  await setAllowlist(env, token, fixture.deviceId, ["user:alice"]);
+  await registerAcceptedLane(env, token, fixture.deviceId, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
 
   const tamperedSignature = `${fixture.capability.signature[0] === "0" ? "1" : "0"}${fixture.capability.signature.slice(1)}`;
   const response = await handleRequest(
@@ -1596,7 +1573,7 @@ test("expired signed append grant requests a capability refresh", async () => {
   const token = bundle.runtimeCredential.token;
   const fixture = signedIdentityFixture({ capabilityExpiresAt: Date.now() - 1 });
   await bucket.putJson("shared-state/user:bob/identity_bundle.json", fixture.bundle);
-  await setAllowlist(env, token, fixture.deviceId, ["user:alice"]);
+  await registerAcceptedLane(env, token, fixture.deviceId, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
 
   const response = await handleRequest(
     new Request(`https://example.com/v1/inbox/${fixture.deviceId}/messages`, {
@@ -1683,45 +1660,46 @@ test("append requests without capability header require an upgraded client", asy
   assert.equal(((await response.json()) as { code: string }).code, "upgrade_required");
 });
 
-test("enforces append conversation scope and payload size", async () => {
+test("enforces append payload size and ignores conversation scope", async () => {
   const { env } = createEnv();
-  const wrongScope = await handleRequest(
-    new Request("https://example.com/v1/inbox/device:bob:phone/messages", {
-      method: "POST",
-      headers: {
-        ...authHeaders("append-cap-sig"),
-        "X-Tapchat-Capability": JSON.stringify(sampleCapability("device:bob:phone", ["conv:other"])),
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify(sampleAppend())
-    }),
-    env
-  );
-  assert.equal(wrongScope.status, 403);
+  const queued = await appendWithCapability(env, sampleAppend());
+  assert.equal(queued.status, 200);
+  assert.deepEqual(await queued.json(), {
+    version: CURRENT_MODEL_VERSION,
+    accepted: true,
+    seq: 1
+  });
 
+  const fixture = signedIdentityFixture({ deviceId: "device:bob:phone", maxBytes: 1 });
+  await env.TAPCHAT_STORAGE.put(
+    `shared-state/${fixture.userId}/identity_bundle.json`,
+    JSON.stringify(fixture.bundle)
+  );
   const tooLarge = await handleRequest(
     new Request("https://example.com/v1/inbox/device:bob:phone/messages", {
       method: "POST",
       headers: {
-        ...authHeaders("append-cap-sig"),
-        "X-Tapchat-Capability": JSON.stringify(sampleCapability("device:bob:phone", undefined, 1)),
+        ...authHeaders(fixture.capability.signature),
+        "X-Tapchat-Capability": JSON.stringify(fixture.capability),
         "Content-Type": "application/json"
       },
-      body: JSON.stringify(sampleAppend())
+      body: JSON.stringify(sampleAppend("device:bob:phone", "cccccccccccccccccccccccccccccccc"))
     }),
     env
   );
   assert.equal(tooLarge.status, 413);
 });
 
-test("message requests stay out of inbox until accepted and reject blocks future appends", async () => {
+test("message requests stay out of inbox until accepted", async () => {
   const { env } = createEnv();
   const bundle = await issueDeviceBundle(env);
   const token = bundle.runtimeCredential.token;
+  const aliceLane = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+  const malloryLane = "cccccccccccccccccccccccccccccccc";
 
-  const queued = await appendWithCapability(env, sampleAppend("device:bob:phone", "msg:req-1"));
+  const queued = await appendWithCapability(env, sampleAppend("device:bob:phone", "22222222222222222222222222222222", aliceLane));
   assert.equal(queued.status, 200);
-  const queuedWelcome = await appendWithCapability(env, sampleAppend("device:bob:phone", "msg:req-1b"));
+  const queuedWelcome = await appendWithCapability(env, sampleAppend("device:bob:phone", "33333333333333333333333333333333", aliceLane));
   assert.equal(queuedWelcome.status, 200);
 
   const head = await handleRequest(
@@ -1736,7 +1714,6 @@ test("message requests stay out of inbox until accepted and reject blocks future
   );
   const requests = (await list.json()) as MessageRequestListResult & { version: string };
   assert.equal(requests.requests.length, 1);
-  assert.equal(requests.requests[0].senderUserId, "user:alice");
   assert.equal(requests.requests[0].messageCount, 2);
 
   const accept = await handleRequest(
@@ -1749,75 +1726,73 @@ test("message requests stay out of inbox until accepted and reject blocks future
   assert.equal(accept.status, 200);
   const acceptResult = (await accept.json()) as MessageRequestActionResult & { version: string };
   assert.equal(acceptResult.promotedCount, 2);
-  assert.deepEqual(acceptResult.promotedConversationIds, ["conv:alice:bob"]);
 
   const accepted = await handleRequest(
     new Request("https://example.com/v1/inbox/device:bob:phone/messages?fromSeq=1&limit=10", { headers: authHeaders(token) }),
     env
   );
   const fetched = (await accepted.json()) as { records: Array<{ messageId: string }> };
-  assert.deepEqual(fetched.records.map((record) => record.messageId), ["msg:req-1", "msg:req-1b"]);
+  assert.deepEqual(fetched.records.map((record) => record.messageId), [
+    "22222222222222222222222222222222",
+    "33333333333333333333333333333333"
+  ]);
 
-  const allowlistedAppend = await appendWithCapability(env, sampleAppend("device:bob:phone", "msg:req-2"));
-  assert.deepEqual(await allowlistedAppend.json(), {
+  const registeredAppend = await appendWithCapability(env, sampleAppend("device:bob:phone", "44444444444444444444444444444444", aliceLane));
+  assert.deepEqual(await registeredAppend.json(), {
     version: CURRENT_MODEL_VERSION,
     accepted: true,
-    seq: 3,
-    deliveredTo: "inbox"
+    seq: 3
   });
 
-  const rejectList = await appendWithCapability(env, sampleAppend("device:bob:phone", "msg:req-3", "conv:alice:bob", "user:mallory"));
-  assert.equal(rejectList.status, 200);
-  const rejectRequests = await handleRequest(
+  const otherLane = await appendWithCapability(env, sampleAppend("device:bob:phone", "55555555555555555555555555555555", malloryLane));
+  assert.equal(otherLane.status, 200);
+  const otherRequests = await handleRequest(
     new Request("https://example.com/v1/inbox/device:bob:phone/message-requests", { headers: authHeaders(token) }),
     env
   );
-  const pendingMallory = (await rejectRequests.json()) as MessageRequestListResult & { version: string };
-  const malloryRequest = pendingMallory.requests.find((request) => request.senderUserId === "user:mallory");
-  assert.ok(malloryRequest);
+  const pendingOther = (await otherRequests.json()) as MessageRequestListResult & { version: string };
+  assert.equal(pendingOther.requests.length, 1);
 
   const reject = await handleRequest(
-    new Request(`https://example.com/v1/inbox/device:bob:phone/message-requests/${encodeURIComponent(malloryRequest!.requestId)}/reject`, {
+    new Request(`https://example.com/v1/inbox/device:bob:phone/message-requests/${encodeURIComponent(pendingOther.requests[0].requestId)}/reject`, {
       method: "POST",
       headers: authHeaders(token)
     }),
     env
   );
   assert.equal(reject.status, 200);
-  const rejectResult = (await reject.json()) as MessageRequestActionResult & { version: string };
-  assert.deepEqual(rejectResult.promotedConversationIds, []);
 
-  const rejectedAppend = await appendWithCapability(env, sampleAppend("device:bob:phone", "msg:req-4", "conv:alice:bob", "user:mallory"));
-  assert.deepEqual(await rejectedAppend.json(), {
+  const afterReject = await appendWithCapability(env, sampleAppend("device:bob:phone", "66666666666666666666666666666666", malloryLane));
+  assert.deepEqual(await afterReject.json(), {
     version: CURRENT_MODEL_VERSION,
     accepted: true,
-    seq: 0,
-    deliveredTo: "rejected",
-    queuedAsRequest: false
+    seq: 2
   });
 });
 
-test("direct message request accept promotes only the latest conversation group", async () => {
+test("direct message request accept promotes only the accepted lane", async () => {
   const { env } = createEnv();
   const bundle = await issueDeviceBundle(env);
   const token = bundle.runtimeCredential.token;
+  const oldLane = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const newLane = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
-  await appendWithCapability(env, sampleAppend("device:bob:phone", "msg:old-commit", "conv:alice:bob:rel:1"));
-  await appendWithCapability(env, sampleAppend("device:bob:phone", "msg:old-welcome", "conv:alice:bob:rel:1"));
-  await appendWithCapability(env, sampleAppend("device:bob:phone", "msg:new-commit", "conv:alice:bob:rel:2"));
-  await appendWithCapability(env, sampleAppend("device:bob:phone", "msg:new-welcome", "conv:alice:bob:rel:2"));
+  await appendWithCapability(env, sampleAppend("device:bob:phone", "01010101010101010101010101010101", oldLane));
+  await appendWithCapability(env, sampleAppend("device:bob:phone", "02020202020202020202020202020202", oldLane));
+  await appendWithCapability(env, sampleAppend("device:bob:phone", "03030303030303030303030303030303", newLane));
+  await appendWithCapability(env, sampleAppend("device:bob:phone", "04040404040404040404040404040404", newLane));
 
   const list = await handleRequest(
     new Request("https://example.com/v1/inbox/device:bob:phone/message-requests", { headers: authHeaders(token) }),
     env
   );
   const requests = (await list.json()) as MessageRequestListResult & { version: string };
-  assert.equal(requests.requests.length, 1);
-  assert.equal(requests.requests[0].lastConversationId, "conv:alice:bob:rel:2");
-  assert.equal(requests.requests[0].messageCount, 4);
+  assert.equal(requests.requests.length, 2);
+  const newest = requests.requests.find((request) => request.messageCount === 2 && request.lastMessageId === "04040404040404040404040404040404");
+  assert.ok(newest);
 
   const accept = await handleRequest(
-    new Request(`https://example.com/v1/inbox/device:bob:phone/message-requests/${encodeURIComponent(requests.requests[0].requestId)}/accept`, {
+    new Request(`https://example.com/v1/inbox/device:bob:phone/message-requests/${encodeURIComponent(newest!.requestId)}/accept`, {
       method: "POST",
       headers: authHeaders(token)
     }),
@@ -1826,34 +1801,35 @@ test("direct message request accept promotes only the latest conversation group"
   assert.equal(accept.status, 200);
   const acceptResult = (await accept.json()) as MessageRequestActionResult & { version: string };
   assert.equal(acceptResult.promotedCount, 2);
-  assert.deepEqual(acceptResult.promotedConversationIds, ["conv:alice:bob:rel:2"]);
 
   const accepted = await handleRequest(
     new Request("https://example.com/v1/inbox/device:bob:phone/messages?fromSeq=1&limit=10", { headers: authHeaders(token) }),
     env
   );
-  const fetched = (await accepted.json()) as { records: Array<{ messageId: string; envelope: { conversationId: string } }> };
-  assert.deepEqual(fetched.records.map((record) => record.messageId), ["msg:new-commit", "msg:new-welcome"]);
+  const fetched = (await accepted.json()) as { records: Array<{ messageId: string; envelope: { lane: string } }> };
+  assert.deepEqual(fetched.records.map((record) => record.messageId), [
+    "03030303030303030303030303030303",
+    "04040404040404040404040404040404"
+  ]);
   assert.deepEqual(
-    fetched.records.map((record) => record.envelope.conversationId),
-    ["conv:alice:bob:rel:2", "conv:alice:bob:rel:2"]
+    fetched.records.map((record) => record.envelope.lane),
+    [newLane, newLane]
   );
 
-  const oldRetry = await appendWithCapability(env, sampleAppend("device:bob:phone", "msg:old-commit", "conv:alice:bob:rel:1"));
-  assert.deepEqual(await oldRetry.json(), {
-    version: CURRENT_MODEL_VERSION,
-    accepted: true,
-    seq: 0,
-    deliveredTo: "rejected",
-    queuedAsRequest: false
-  });
+  const remaining = await handleRequest(
+    new Request("https://example.com/v1/inbox/device:bob:phone/message-requests", { headers: authHeaders(token) }),
+    env
+  );
+  const leftover = (await remaining.json()) as MessageRequestListResult & { version: string };
+  assert.equal(leftover.requests.length, 1);
+  assert.equal(leftover.requests[0].messageCount, 2);
 });
 
 test("requires device runtime auth for head, fetch, ack, subscribe, and manage routes", async () => {
   const { env } = createEnv();
   const bundle = await issueDeviceBundle(env);
   const token = bundle.runtimeCredential.token;
-  await setAllowlist(env, token, "device:bob:phone", ["user:alice"]);
+  await registerAcceptedLane(env, token, "device:bob:phone", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
   await appendWithCapability(env);
 
   const unauthHead = await handleRequest(new Request("https://example.com/v1/inbox/device:bob:phone/head"), env);
@@ -1886,7 +1862,7 @@ test("requires device runtime auth for head, fetch, ack, subscribe, and manage r
         ack: {
           deviceId: "device:bob:phone",
           ackSeq: 0,
-          ackedMessageIds: [],
+          
           ackedAt: 2
         }
       })
@@ -1913,29 +1889,30 @@ test("requires device runtime auth for head, fetch, ack, subscribe, and manage r
   assert.equal(listRequests.status, 200);
 });
 
-test("rate limit is per recipient sender pair and idempotent retries do not consume extra quota", async () => {
+test("rate limit is per accepted lane and idempotent retries do not consume extra quota", async () => {
   const { env } = createEnv({ rateLimitPerMinute: "1", rateLimitPerHour: "10" });
   const bundle = await issueDeviceBundle(env);
   const token = bundle.runtimeCredential.token;
-  await setAllowlist(env, token, "device:bob:phone", ["user:alice", "user:mallory"]);
+  const acceptedLane = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+  const otherLane = "cccccccccccccccccccccccccccccccc";
+  await registerAcceptedLane(env, token, "device:bob:phone", acceptedLane);
 
-  const first = await appendWithCapability(env, sampleAppend("device:bob:phone", "msg:rl-1", "conv:alice:bob", "user:alice"));
+  const first = await appendWithCapability(env, sampleAppend("device:bob:phone", "77777777777777777777777777777777", acceptedLane));
   assert.equal(first.status, 200);
 
-  const duplicate = await appendWithCapability(env, sampleAppend("device:bob:phone", "msg:rl-1", "conv:alice:bob", "user:alice"));
+  const duplicate = await appendWithCapability(env, sampleAppend("device:bob:phone", "77777777777777777777777777777777", acceptedLane));
   assert.equal(duplicate.status, 200);
   assert.deepEqual(await duplicate.json(), {
     version: CURRENT_MODEL_VERSION,
     accepted: true,
-    seq: 1,
-    deliveredTo: "inbox"
+    seq: 1
   });
 
-  const limited = await appendWithCapability(env, sampleAppend("device:bob:phone", "msg:rl-2", "conv:alice:bob", "user:alice"));
+  const limited = await appendWithCapability(env, sampleAppend("device:bob:phone", "88888888888888888888888888888888", acceptedLane));
   assert.equal(limited.status, 429);
 
-  const otherSender = await appendWithCapability(env, sampleAppend("device:bob:phone", "msg:rl-3", "conv:alice:bob", "user:mallory"));
-  assert.equal(otherSender.status, 200);
+  const other = await appendWithCapability(env, sampleAppend("device:bob:phone", "99999999999999999999999999999999", otherLane));
+  assert.equal(other.status, 200);
 });
 
 test("prepare-upload requires runtime auth and blob-scoped capability gates access", async () => {
@@ -2758,7 +2735,7 @@ test("group outbox spills large records to R2 and fetches them back", async () =
   const { env, bucket } = createEnv({ maxInlineBytes: "1" });
   const capability = sampleGroupCapability();
   const append = sampleGroupAppend("group:project", "msg:large", "mls_application", capability);
-  append.envelope.inlineCiphertext = "large cipher payload";
+  append.envelope.bytes = "large cipher payload";
 
   const response = await handleRequest(
     new Request("https://example.com/v1/groups/group%3Aproject/outbox/messages", {
@@ -2860,7 +2837,7 @@ test("inbox hard retention advances history floor even while the client is offli
     rateLimitPerHour: 1000
   });
 
-  await service.replaceAllowlist(["user:alice"], [], 500);
+  await service.registerAcceptedLane("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", 500);
   const delivered = await service.appendEnvelope(sampleAppend(), 1_000);
   assert.equal(delivered.seq, 1);
   assert.equal(spillStore.has("inbox-payload/device:bob:phone/1.json"), true);
@@ -2941,7 +2918,7 @@ test("inbox fetch fails closed when an R2 spill payload is missing", async () =>
     rateLimitPerHour: 1000
   });
 
-  await service.replaceAllowlist(["user:alice"], [], 500);
+  await service.registerAcceptedLane("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", 500);
   await service.appendEnvelope(sampleAppend(), 1_000);
   await spillStore.delete("inbox-payload/device:bob:phone/1.json");
 
@@ -3394,21 +3371,17 @@ test("message request quotas, global rate limit, expiry, and capacity recovery w
     messageRequestRateLimitHour: 20
   });
 
-  await service.appendEnvelope(sampleAppend(undefined, "msg:q1", undefined, "user:one"), 1_000, { mode: "verified" });
-  await service.appendEnvelope(sampleAppend(undefined, "msg:q2", undefined, "user:one"), 1_001, { mode: "verified" });
+  await service.appendEnvelope(sampleAppend(undefined, "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1", "b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1"), 1_000, { mode: "verified" });
+  await service.appendEnvelope(sampleAppend(undefined, "a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2", "b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1"), 1_001, { mode: "verified" });
   await assert.rejects(
-    () => service.appendEnvelope(sampleAppend(undefined, "msg:q3", undefined, "user:one"), 1_002, { mode: "verified" }),
-    (error: unknown) => (error as { code?: string }).code === "message_request_capacity_exceeded"
-  );
-  await assert.rejects(
-    () => service.appendEnvelope(sampleAppend(undefined, "msg:q4", undefined, "user:two"), 1_003, { mode: "verified" }),
+    () => service.appendEnvelope(sampleAppend(undefined, "a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3", "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1"), 1_002, { mode: "verified" }),
     (error: unknown) => (error as { code?: string }).code === "message_request_capacity_exceeded"
   );
 
   const queued = await service.listMessageRequests(1_002);
   assert.equal(queued.length, 1);
   await service.rejectMessageRequest(queued[0].requestId, 1_004);
-  await service.appendEnvelope(sampleAppend(undefined, "msg:q5", undefined, "user:two"), 1_005, { mode: "verified" });
+  await service.appendEnvelope(sampleAppend(undefined, "a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4", "c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1"), 1_005, { mode: "verified" });
   assert.equal((await service.listMessageRequests(1_006)).length, 1);
   assert.equal((await service.listMessageRequests(11_006)).length, 0);
 
@@ -3419,17 +3392,16 @@ test("message request quotas, global rate limit, expiry, and capacity recovery w
     maxInlineBytes: 4096,
     rateLimitPerMinute: 100,
     rateLimitPerHour: 1000,
-    messageRequestMaxPerSender: 16,
     messageRequestMaxSenders: 64,
     messageRequestMaxTotalBytes: 1024 * 1024,
     messageRequestTtlSeconds: 60,
     messageRequestRateLimitMinute: 2,
     messageRequestRateLimitHour: 20
   });
-  await rateService.appendEnvelope(sampleAppend(undefined, "msg:r1", undefined, "user:one"), 1_000, { mode: "verified" });
-  await rateService.appendEnvelope(sampleAppend(undefined, "msg:r2", undefined, "user:two"), 1_001, { mode: "verified" });
+  await rateService.appendEnvelope(sampleAppend(undefined, "d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1", "e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1"), 1_000, { mode: "verified" });
+  await rateService.appendEnvelope(sampleAppend(undefined, "d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2", "e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2"), 1_001, { mode: "verified" });
   await assert.rejects(
-    () => rateService.appendEnvelope(sampleAppend(undefined, "msg:r3", undefined, "user:three"), 1_002, { mode: "verified" }),
+    () => rateService.appendEnvelope(sampleAppend(undefined, "d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3", "e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3e3"), 1_002, { mode: "verified" }),
     (error: unknown) => (error as { code?: string; details?: { retryAfterSeconds?: number } }).code === "message_request_rate_limited" &&
       Number((error as { details?: { retryAfterSeconds?: number } }).details?.retryAfterSeconds) > 0
   );
@@ -3466,7 +3438,7 @@ test("legacy message request entries are migrated lazily and expire", async () =
     lastSeenAt: 1_000,
     messageCount: 1,
     lastMessageId: "msg:legacy",
-    lastConversationId: pending.envelope.conversationId,
+    lastConversationId: pending.envelope.lane,
     pendingRequests: [pending]
   });
   const service = new InboxService("device:bob:phone", state, new MemoryR2Store(), [], {

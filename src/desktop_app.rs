@@ -31,7 +31,7 @@ use crate::ffi_api::{
 use crate::model::{DeploymentBundle, IdentityBundle, MessageType, StorageRef, Validate};
 use crate::persistence::ContactRelationshipStatus;
 use crate::persistence::PersistedPendingBlobTransfer;
-use crate::transport_contract::{AllowlistDocument, MessageRequestAction, MessageRequestItem};
+use crate::transport_contract::{MessageRequestAction, MessageRequestItem};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ProfileSummary {
@@ -247,9 +247,8 @@ pub struct ContactShareLinkView {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct AllowlistView {
-    pub allowed_sender_user_ids: Vec<String>,
-    pub rejected_sender_user_ids: Vec<String>,
+pub struct RevokeContactView {
+    pub user_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1218,40 +1217,22 @@ pub async fn message_request_reject(
     ))
 }
 
-pub async fn allowlist_get(profile_path: impl AsRef<Path>) -> Result<AllowlistView> {
-    let profile = Profile::open(profile_path)?;
-    let mut driver = load_driver(&profile)?;
-    let output = driver
-        .run_command_until_idle(CoreCommand::ListAllowlist)
-        .await?;
-    Ok(map_allowlist(allowlist_from_output(&output)?))
-}
-
-pub async fn allowlist_add(profile_path: impl AsRef<Path>, user_id: &str) -> Result<AllowlistView> {
+pub async fn revoke_contact(profile_path: impl AsRef<Path>, user_id: &str) -> Result<RevokeContactView> {
     let mut profile = Profile::open(profile_path)?;
     let mut driver = load_driver(&profile)?;
     let output = driver
-        .run_command_until_idle(CoreCommand::AddAllowlistUser {
+        .run_command_until_idle(CoreCommand::RevokeContact {
             user_id: user_id.to_string(),
         })
         .await?;
     persist_driver(&mut profile, &driver)?;
-    Ok(map_allowlist(allowlist_from_output(&output)?))
-}
-
-pub async fn allowlist_remove(
-    profile_path: impl AsRef<Path>,
-    user_id: &str,
-) -> Result<AllowlistView> {
-    let mut profile = Profile::open(profile_path)?;
-    let mut driver = load_driver(&profile)?;
-    let output = driver
-        .run_command_until_idle(CoreCommand::RemoveAllowlistUser {
-            user_id: user_id.to_string(),
-        })
-        .await?;
-    persist_driver(&mut profile, &driver)?;
-    Ok(map_allowlist(allowlist_from_output(&output)?))
+    Ok(RevokeContactView {
+        user_id: output
+            .view_model
+            .as_ref()
+            .and_then(|view| view.revoked_contact_user_id.clone())
+            .unwrap_or_else(|| user_id.to_string()),
+    })
 }
 
 pub fn conversation_list(profile_path: impl AsRef<Path>) -> Result<Vec<ConversationListItem>> {
@@ -2483,12 +2464,6 @@ fn map_message_request_action(
     }
 }
 
-fn map_allowlist(document: &AllowlistDocument) -> AllowlistView {
-    AllowlistView {
-        allowed_sender_user_ids: document.allowed_sender_user_ids.clone(),
-        rejected_sender_user_ids: document.rejected_sender_user_ids.clone(),
-    }
-}
 
 fn map_message(
     conversation_id: &str,
@@ -2583,13 +2558,6 @@ fn annotate_peer_bundle_error(
     error
 }
 
-fn allowlist_from_output(output: &CoreOutput) -> Result<&AllowlistDocument> {
-    output
-        .view_model
-        .as_ref()
-        .and_then(|view| view.allowlist.as_ref())
-        .ok_or_else(|| anyhow!("allowlist document was not returned by core"))
-}
 
 fn message_preview(message: &StoredMessage) -> Option<String> {
     if let Some(text) = message.plaintext.as_deref() {

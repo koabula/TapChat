@@ -33,19 +33,17 @@ export type MessageType =
   | "control_group_state_event"
   | "control_group_welcome_pickup";
 
+export interface EnvelopeStorageRef {
+  ref: string;
+  size: number;
+}
+
 export interface Envelope {
-  version: string;
-  messageId: string;
-  conversationId: string;
-  senderUserId: string;
-  senderDeviceId: string;
   recipientDeviceId: string;
-  createdAt: number;
-  messageType: MessageType;
-  inlineCiphertext?: string;
-  storageRefs?: StorageRef[];
-  deliveryClass: "normal";
-  senderProof: SenderProof;
+  lane: string;
+  mid: string;
+  bytes?: string;
+  storageRef?: EnvelopeStorageRef;
 }
 
 export interface InboxRecord {
@@ -595,7 +593,6 @@ export interface ClaimGroupLeaveResult {
 export interface Ack {
   deviceId: string;
   ackSeq: number;
-  ackedMessageIds?: string[];
   ackedAt: number;
 }
 
@@ -611,9 +608,6 @@ export interface AppendEnvelopeRequest {
 export interface AppendEnvelopeResult {
   accepted: boolean;
   seq: number;
-  deliveredTo: "inbox" | "message_request" | "rejected";
-  queuedAsRequest?: boolean;
-  requestId?: string;
 }
 
 export interface FetchMessagesRequest {
@@ -729,7 +723,6 @@ export interface InboxAppendCapability {
   // A named union, not `string[]`: a new Rust variant that nobody adds here is
   // then a tsc error rather than a signature that silently fails to verify.
   operations: CapabilityOperation[];
-  conversationScope?: string[];
   expiresAt: number;
   constraints?: CapabilityConstraints;
   signature: string;
@@ -923,14 +916,6 @@ export interface RealtimeEvent {
   change?: "queued" | "accepted" | "rejected";
 }
 
-export interface AllowlistDocument {
-  version: string;
-  deviceId: string;
-  updatedAt: number;
-  allowedSenderUserIds: string[];
-  rejectedSenderUserIds: string[];
-}
-
 export interface MessageRequestItem {
   requestId: string;
   recipientDeviceId: string;
@@ -942,7 +927,7 @@ export interface MessageRequestItem {
   lastSeenAt: number;
   messageCount: number;
   lastMessageId: string;
-  lastConversationId: string;
+  lastConversationId?: string;
   requestKind?: "direct" | "group_invite";
   groupId?: string;
   groupTitle?: string;

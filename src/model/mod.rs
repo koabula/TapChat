@@ -4,6 +4,24 @@ use crate::error::{CoreError, CoreResult};
 
 pub mod signing;
 
+/// A 128-bit random value as 32 lowercase hex characters. Used for lanes,
+/// message ids, and local conversation ids — identifiers that must name
+/// nobody.
+pub fn random_opaque_id() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    let mut hex = String::with_capacity(32);
+    for byte in bytes {
+        hex.push_str(&format!("{byte:02x}"));
+    }
+    hex
+}
+
+pub fn is_opaque_id(value: &str) -> bool {
+    value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 #[cfg(test)]
 mod welcome_pickup_property_tests;
 
@@ -176,12 +194,6 @@ pub struct InboxAppendCapability {
     pub target_device_id: String,
     pub endpoint: String,
     pub operations: Vec<CapabilityOperation>,
-    #[serde(
-        default,
-        alias = "conversation_scope",
-        skip_serializing_if = "Vec::is_empty"
-    )]
-    pub conversation_scope: Vec<String>,
     #[serde(alias = "expires_at")]
     pub expires_at: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -309,6 +321,7 @@ pub enum DeliveryClass {
 #[serde(rename_all = "snake_case")]
 pub enum ProtectedPayloadKind {
     Text,
+    LaneRotation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -323,6 +336,13 @@ pub struct ProtectedAppMessage {
     pub audience_device_ids: Vec<String>,
     pub payload_kind: ProtectedPayloadKind,
     pub body: String,
+    pub sent_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaneRotationBody {
+    pub inbound_lane: String,
+    pub identity_bundle_ref: String,
 }
 
 impl ProtectedAppMessage {
@@ -334,6 +354,7 @@ impl ProtectedAppMessage {
         recipient_user_id: String,
         mut audience_device_ids: Vec<String>,
         body: String,
+        sent_at: u64,
     ) -> CoreResult<Self> {
         audience_device_ids.sort();
         let message = Self {
@@ -346,6 +367,42 @@ impl ProtectedAppMessage {
             audience_device_ids,
             payload_kind: ProtectedPayloadKind::Text,
             body,
+            sent_at,
+        };
+        message.validate()?;
+        Ok(message)
+    }
+
+    pub fn new_lane_rotation(
+        app_message_id: String,
+        conversation_id: String,
+        sender_user_id: String,
+        sender_device_id: String,
+        recipient_user_id: String,
+        mut audience_device_ids: Vec<String>,
+        inbound_lane: String,
+        identity_bundle_ref: String,
+        sent_at: u64,
+    ) -> CoreResult<Self> {
+        audience_device_ids.sort();
+        let body = serde_json::to_string(&LaneRotationBody {
+            inbound_lane,
+            identity_bundle_ref,
+        })
+        .map_err(|error| {
+            CoreError::invalid_input(format!("lane rotation encode failed: {error}"))
+        })?;
+        let message = Self {
+            version: CURRENT_MODEL_VERSION.to_string(),
+            app_message_id,
+            conversation_id,
+            sender_user_id,
+            sender_device_id,
+            recipient_user_id,
+            audience_device_ids,
+            payload_kind: ProtectedPayloadKind::LaneRotation,
+            body,
+            sent_at,
         };
         message.validate()?;
         Ok(message)
@@ -396,7 +453,7 @@ impl Validate for ProtectedAppMessage {
             }
         }
         match self.payload_kind {
-            ProtectedPayloadKind::Text => {}
+            ProtectedPayloadKind::Text | ProtectedPayloadKind::LaneRotation => {}
         }
         validate_required("body", &self.body)
     }
@@ -613,51 +670,76 @@ pub enum MessageType {
     ControlGroupStateEvent,
 }
 
+/// Host-visible overflow pointer for a wrapped frame that does not fit
+/// inline. Only `ref` and `size` — the host already learns `|m|`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvelopeStorageRef {
+    #[serde(rename = "ref", alias = "object_ref")]
+    pub object_ref: String,
+    pub size: u64,
+}
+
+impl Validate for EnvelopeStorageRef {
+    fn validate(&self) -> CoreResult<()> {
+        validate_required("ref", &self.object_ref)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Envelope {
-    pub version: String,
-    pub message_id: String,
-    pub conversation_id: String,
-    pub sender_user_id: String,
-    pub sender_device_id: String,
     pub recipient_device_id: String,
-    pub created_at: u64,
-    pub message_type: MessageType,
+    pub lane: String,
+    pub mid: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub inline_ciphertext: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub storage_refs: Vec<StorageRef>,
-    pub delivery_class: DeliveryClass,
-    pub sender_proof: SenderProof,
+    pub bytes: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_ref: Option<EnvelopeStorageRef>,
+}
+
+impl Envelope {
+    pub fn with_bytes(
+        recipient_device_id: impl Into<String>,
+        lane: impl Into<String>,
+        mid: impl Into<String>,
+        bytes: impl Into<String>,
+    ) -> Self {
+        Self {
+            recipient_device_id: recipient_device_id.into(),
+            lane: lane.into(),
+            mid: mid.into(),
+            bytes: Some(bytes.into()),
+            storage_ref: None,
+        }
+    }
+
+    pub fn payload_b64(&self) -> Option<&str> {
+        self.bytes.as_deref()
+    }
 }
 
 impl Validate for Envelope {
     fn validate(&self) -> CoreResult<()> {
-        validate_version(&self.version)?;
-        validate_required("message_id", &self.message_id)?;
-        validate_required("conversation_id", &self.conversation_id)?;
-        validate_required("sender_user_id", &self.sender_user_id)?;
-        validate_required("sender_device_id", &self.sender_device_id)?;
         validate_required("recipient_device_id", &self.recipient_device_id)?;
-        match self.delivery_class {
-            DeliveryClass::Normal => {}
+        if !is_opaque_id(&self.lane) {
+            return Err(CoreError::invalid_input("lane must be a 128-bit hex id"));
         }
-        self.sender_proof.validate()?;
-        if self.inline_ciphertext.is_none() && self.storage_refs.is_empty() {
-            return Err(CoreError::invalid_input(
-                "envelope must include inline_ciphertext or at least one storage_ref",
-            ));
+        if !is_opaque_id(&self.mid) {
+            return Err(CoreError::invalid_input("mid must be a 128-bit hex id"));
         }
-        if self
-            .inline_ciphertext
-            .as_ref()
-            .is_some_and(|value| value.trim().is_empty())
-        {
-            return Err(CoreError::invalid_input(
-                "inline_ciphertext must not be empty when provided",
-            ));
+        match (&self.bytes, &self.storage_ref) {
+            (None, None) => {
+                return Err(CoreError::invalid_input(
+                    "envelope must include bytes or a storage_ref",
+                ))
+            }
+            (Some(bytes), _) if bytes.trim().is_empty() => {
+                return Err(CoreError::invalid_input(
+                    "bytes must not be empty when provided",
+                ))
+            }
+            _ => {}
         }
-        for reference in &self.storage_refs {
+        if let Some(reference) = &self.storage_ref {
             reference.validate()?;
         }
         Ok(())
@@ -687,9 +769,9 @@ impl Validate for InboxRecord {
         validate_required("recipient_device_id", &self.recipient_device_id)?;
         validate_required("message_id", &self.message_id)?;
         self.envelope.validate()?;
-        if self.message_id != self.envelope.message_id {
+        if self.message_id != self.envelope.mid {
             return Err(CoreError::invalid_input(
-                "inbox record message_id must match envelope message_id",
+                "inbox record message_id must match envelope mid",
             ));
         }
         if self.recipient_device_id != self.envelope.recipient_device_id {
@@ -1530,8 +1612,6 @@ impl Validate for GroupJoinRequest {
 pub struct Ack {
     pub device_id: String,
     pub ack_seq: u64,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub acked_message_ids: Vec<String>,
     pub acked_at: u64,
 }
 
@@ -2000,6 +2080,7 @@ mod tests {
             "user:bob".into(),
             vec!["device:bob:laptop".into(), "device:bob:phone".into()],
             "hello bob".into(),
+            1_775_000_000_000,
         )
         .expect("sample protected app message")
     }
@@ -2024,6 +2105,7 @@ mod tests {
             "audience_device_ids": ["device:bob:laptop", "device:bob:phone"],
             "payload_kind": "text",
             "body": "hello bob",
+            "sent_at": 1_775_000_000_000u64,
             "extra": true
         });
         assert!(ProtectedAppMessage::from_json_slice(unknown.to_string().as_bytes()).is_err());
@@ -2036,7 +2118,8 @@ mod tests {
             "recipient_user_id": "user:bob",
             "audience_device_ids": ["device:bob:laptop", "device:bob:phone"],
             "payload_kind": "text",
-            "body": "hello bob"
+            "body": "hello bob",
+            "sent_at": 1_775_000_000_000u64
         });
         assert!(ProtectedAppMessage::from_json_slice(missing.to_string().as_bytes()).is_err());
     }
@@ -2052,7 +2135,8 @@ mod tests {
             "recipient_user_id": "user:bob",
             "audience_device_ids": [],
             "payload_kind": "text",
-            "body": "hello bob"
+            "body": "hello bob",
+            "sent_at": 1_775_000_000_000u64
         });
         assert!(ProtectedAppMessage::from_json_slice(empty.to_string().as_bytes()).is_err());
 
@@ -2065,7 +2149,8 @@ mod tests {
             "recipient_user_id": "user:bob",
             "audience_device_ids": ["device:bob:phone", "device:bob:phone"],
             "payload_kind": "text",
-            "body": "hello bob"
+            "body": "hello bob",
+            "sent_at": 1_775_000_000_000u64
         });
         assert!(ProtectedAppMessage::from_json_slice(duplicate.to_string().as_bytes()).is_err());
 
@@ -2078,7 +2163,8 @@ mod tests {
             "recipient_user_id": "user:bob",
             "audience_device_ids": ["device:bob:phone", "device:bob:laptop"],
             "payload_kind": "text",
-            "body": "hello bob"
+            "body": "hello bob",
+            "sent_at": 1_775_000_000_000u64
         });
         assert!(ProtectedAppMessage::from_json_slice(unsorted.to_string().as_bytes()).is_err());
     }
@@ -2181,12 +2267,10 @@ mod tests {
     }
 
     #[test]
-    fn envelope_validation_rejects_empty_inline_ciphertext() {
+    fn envelope_validation_rejects_empty_bytes() {
         let mut envelope = sample_envelope();
-        envelope.inline_ciphertext = Some(String::new());
-        let error = envelope
-            .validate()
-            .expect_err("empty inline ciphertext should fail");
+        envelope.bytes = Some(String::new());
+        let error = envelope.validate().expect_err("empty bytes should fail");
         assert_eq!(error.code(), "invalid_input");
     }
 
@@ -2195,7 +2279,7 @@ mod tests {
         let mut record = InboxRecord {
             seq: 1,
             recipient_device_id: "device:bob:phone".into(),
-            message_id: "msg:1".into(),
+            message_id: sample_envelope().mid.clone(),
             received_at: 1,
             expires_at: None,
             state: InboxRecordState::Available,
@@ -2213,7 +2297,7 @@ mod tests {
         let record = InboxRecord {
             seq: 1,
             recipient_device_id: "device:bob:phone".into(),
-            message_id: "msg:1".into(),
+            message_id: sample_envelope().mid.clone(),
             received_at: 1,
             expires_at: Some(10),
             state: InboxRecordState::Available,
@@ -2656,7 +2740,6 @@ mod tests {
                     target_device_id: "device:alice:phone".into(),
                     endpoint: "https://example.com/inbox".into(),
                     operations: vec![CapabilityOperation::Append],
-                    conversation_scope: vec!["conv:alice-bob".into()],
                     expires_at: 999,
                     constraints: Some(CapabilityConstraints {
                         max_bytes: Some(4096),
@@ -2689,23 +2772,12 @@ mod tests {
     }
 
     fn sample_envelope() -> Envelope {
-        Envelope {
-            version: CURRENT_MODEL_VERSION.to_string(),
-            message_id: "msg:1".into(),
-            conversation_id: "conv:alice-bob".into(),
-            sender_user_id: "user:alice".into(),
-            sender_device_id: "device:alice:phone".into(),
-            recipient_device_id: "device:bob:phone".into(),
-            created_at: 3,
-            message_type: MessageType::MlsApplication,
-            inline_ciphertext: Some("ciphertext".into()),
-            storage_refs: vec![],
-            delivery_class: DeliveryClass::Normal,
-            sender_proof: SenderProof {
-                proof_type: "signature".into(),
-                value: "proof".into(),
-            },
-        }
+        Envelope::with_bytes(
+            "device:bob:phone",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "ciphertext",
+        )
     }
 
     fn sample_group_manifest() -> GroupManifest {

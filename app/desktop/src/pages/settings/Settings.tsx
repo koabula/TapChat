@@ -36,9 +36,7 @@ import {
   selectProfileForRestart,
   deleteProfile,
   startNewProfileOnboarding,
-  addToAllowlist,
-  removeFromAllowlist,
-  getAllowlist,
+  revokeContact,
   setDebugMode,
   getDebugMode,
   getAppMetadata,
@@ -109,8 +107,7 @@ export default function Settings({ initialSection = "account" }: SettingsProps) 
   const [recoveryError, setRecoveryError] = useState<string | null>(null);
   const [recoveryLoading, setRecoveryLoading] = useState(false);
   const [recoveryPhraseCopied, setRecoveryPhraseCopied] = useState(false);
-  const [newAllowlistUser, setNewAllowlistUser] = useState("");
-  const [allowlist, setAllowlist] = useState<string[]>([]);
+  const [revokeUserId, setRevokeUserId] = useState("");
   const [debugMode, setDebugModeState] = useState(false);
   const [developerMode, setDeveloperMode] = useState(readSessionDeveloperMode);
   const [developerClickCount, setDeveloperClickCount] = useState(0);
@@ -156,7 +153,6 @@ export default function Settings({ initialSection = "account" }: SettingsProps) 
       void loadIdentity();
       void loadProfiles();
       if (readSessionDeveloperMode()) {
-        void loadAllowlist();
         void loadDebugMode();
       }
     });
@@ -173,7 +169,6 @@ export default function Settings({ initialSection = "account" }: SettingsProps) 
       }
       return;
     }
-    void loadAllowlist();
     void loadDebugMode();
   }, [activeSection, developerMode]);
 
@@ -230,17 +225,6 @@ export default function Settings({ initialSection = "account" }: SettingsProps) 
       setProfiles(await listProfiles());
     } catch (err) {
       console.error(`[Settings] Failed to load profiles: ${presentError(err).message}`);
-    }
-  };
-
-  const loadAllowlist = async () => {
-    try {
-      const result = await getAllowlist();
-      if (result.view_model?.allowlist) {
-        setAllowlist(result.view_model.allowlist.allowed_sender_user_ids || []);
-      }
-    } catch (err) {
-      console.error(`[Settings] Failed to load allowlist: ${presentError(err).message}`);
     }
   };
 
@@ -377,23 +361,13 @@ export default function Settings({ initialSection = "account" }: SettingsProps) 
     }, 60_000);
   };
 
-  const handleAddAllowlist = async () => {
-    if (!newAllowlistUser.trim()) return;
+  const handleRevokeContact = async () => {
+    if (!revokeUserId.trim()) return;
     try {
-      await addToAllowlist(newAllowlistUser);
-      setNewAllowlistUser("");
-      void loadAllowlist();
+      await revokeContact(revokeUserId.trim());
+      setRevokeUserId("");
     } catch (err) {
-      console.error(`[Settings] Failed to add allowlist entry: ${presentError(err).message}`);
-    }
-  };
-
-  const handleRemoveAllowlist = async (userId: string) => {
-    try {
-      await removeFromAllowlist(userId);
-      void loadAllowlist();
-    } catch (err) {
-      console.error(`[Settings] Failed to remove allowlist entry: ${presentError(err).message}`);
+      console.error(`[Settings] Failed to revoke contact: ${presentError(err).message}`);
     }
   };
 
@@ -1089,31 +1063,19 @@ export default function Settings({ initialSection = "account" }: SettingsProps) 
         </div>
 
         <div className="space-y-2 border-t border-subtle pt-4">
-          <h3 className="font-medium text-primary-color">Allowlist</h3>
-          {allowlist.length === 0 && (
-            <p className="text-sm text-muted-color">
-              No users in allowlist. Add users to automatically accept their messages.
-            </p>
-          )}
-
-          {allowlist.map((userId) => (
-            <div key={userId} className="flex items-center justify-between">
-              <span className="truncate text-primary-color">{userId.slice(0, 20)}...</span>
-              <button className="btn btn-ghost text-xs status-error" onClick={() => handleRemoveAllowlist(userId)}>
-                <X size={14} />
-              </button>
-            </div>
-          ))}
-
+          <h3 className="font-medium text-primary-color">Revoke contact</h3>
+          <p className="text-sm text-muted-color">
+            Stop accepting new messages from a contact. This does not display routing identifiers.
+          </p>
           <div className="flex items-center gap-2 pt-2">
             <input
               className="input flex-1"
               placeholder="User ID"
-              value={newAllowlistUser}
-              onChange={(event) => setNewAllowlistUser(event.target.value)}
+              value={revokeUserId}
+              onChange={(event) => setRevokeUserId(event.target.value)}
             />
-            <button className="btn btn-primary" onClick={handleAddAllowlist} disabled={!newAllowlistUser.trim()}>
-              Add
+            <button className="btn btn-primary" onClick={() => void handleRevokeContact()} disabled={!revokeUserId.trim()}>
+              Revoke
             </button>
           </div>
         </div>

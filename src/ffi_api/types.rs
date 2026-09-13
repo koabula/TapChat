@@ -24,20 +24,19 @@ use crate::persistence::{
 };
 use crate::sync_engine::DeviceSyncState;
 use crate::transport_contract::{
-    AllowlistDocument, AppendDeliveryDisposition, AppendGroupEnvelopeRequest,
-    AppendGroupTransitionRequest, BlobDownloadRequest, BlobUploadRequest, ClaimGroupJoinRequest,
-    ClaimGroupLeaveRequest, CompleteGroupJoinRequest, CreateGroupInviteRequest,
-    DecideGroupJoinRequest, FetchAllowlistRequest, FetchGroupInviteRequest,
-    FetchGroupOutboxRequest, FetchIdentityBundleRequest, FetchMessageRequestsRequest,
-    FetchWelcomePickupRequest, GetGroupAuthorizationStateRequest, GetGroupJoinRequestStatusRequest,
-    GetGroupOutboxHeadRequest, GroupRealtimeSubscriptionRequest,
+    AppendDeliveryDisposition, AppendGroupEnvelopeRequest, AppendGroupTransitionRequest,
+    BlobDownloadRequest, BlobUploadRequest, ClaimGroupJoinRequest, ClaimGroupLeaveRequest,
+    CompleteGroupJoinRequest, CreateGroupInviteRequest, DecideGroupJoinRequest,
+    FetchGroupInviteRequest, FetchGroupOutboxRequest, FetchIdentityBundleRequest,
+    FetchMessageRequestsRequest, FetchWelcomePickupRequest, GetGroupAuthorizationStateRequest,
+    GetGroupJoinRequestStatusRequest, GetGroupOutboxHeadRequest, GroupRealtimeSubscriptionRequest,
     InitializeGroupAuthorizationRequest, ListGroupInvitesRequest, ListGroupJoinRequestsRequest,
     ListGroupLeaveRequestsRequest, MessageRequestAction, MessageRequestActionRequest,
     MessageRequestActionResult, MessageRequestItem, MessageRequestRealtimeChange,
     PrepareBlobUploadRequest, PrepareBlobUploadResult, PublishSharedStateRequest,
-    PutWelcomePickupRequest, RealtimeSubscriptionRequest, ReplaceAllowlistRequest,
-    RevokeGroupInviteRequest, SealGroupOutboxRequest, SharedStateDocumentKind,
-    SubmitGroupJoinRequest, SubmitGroupLeaveRequest,
+    PutWelcomePickupRequest, RealtimeSubscriptionRequest, RegisterAcceptedLaneRequest,
+    RevokeAcceptedLanesRequest, RevokeGroupInviteRequest, SealGroupOutboxRequest,
+    SharedStateDocumentKind, SubmitGroupJoinRequest, SubmitGroupLeaveRequest,
 };
 
 pub const MAX_TRANSPORT_RETRIES: u8 = 3;
@@ -220,11 +219,7 @@ pub enum CoreCommand {
         request_id: String,
         action: MessageRequestAction,
     },
-    ListAllowlist,
-    AddAllowlistUser {
-        user_id: String,
-    },
-    RemoveAllowlistUser {
+    RevokeContact {
         user_id: String,
     },
     CreateAdditionalDeviceIdentity {
@@ -323,16 +318,18 @@ pub enum CoreEvent {
         action: MessageRequestAction,
         failure: crate::error::AppErrorV1,
     },
-    AllowlistFetched {
-        document: AllowlistDocument,
+    AcceptedLaneRegistered {
+        lane: String,
     },
-    AllowlistFetchFailed {
+    AcceptedLaneRegisterFailed {
+        lane: String,
         failure: crate::error::AppErrorV1,
     },
-    AllowlistReplaced {
-        document: AllowlistDocument,
+    AcceptedLanesRevoked {
+        lanes: Vec<String>,
     },
-    AllowlistReplaceFailed {
+    AcceptedLanesRevokeFailed {
+        lanes: Vec<String>,
         failure: crate::error::AppErrorV1,
     },
     SharedStatePublished {
@@ -947,11 +944,11 @@ pub enum CoreEffect {
     ActOnMessageRequest {
         action: MessageRequestActionRequest,
     },
-    FetchAllowlist {
-        fetch: FetchAllowlistRequest,
+    RegisterAcceptedLane {
+        register: RegisterAcceptedLaneRequest,
     },
-    ReplaceAllowlist {
-        update: ReplaceAllowlistRequest,
+    RevokeAcceptedLanes {
+        revoke: RevokeAcceptedLanesRequest,
     },
     PublishSharedState {
         publish: PublishSharedStateRequest,
@@ -1101,11 +1098,6 @@ pub struct MessageRequestActionSummary {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppendResultSummary {
     pub accepted: bool,
-    pub delivered_to: AppendDeliveryDisposition,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub queued_as_request: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub request_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seq: Option<u64>,
 }
@@ -1142,7 +1134,7 @@ pub struct CoreViewModel {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub message_requests: Vec<MessageRequestItem>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub allowlist: Option<AllowlistDocument>,
+    pub revoked_contact_user_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message_request_action: Option<MessageRequestActionSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1303,6 +1295,8 @@ pub(crate) struct CoreState {
     pub(crate) deployment_bundle: Option<DeploymentBundle>,
     pub(crate) contacts: BTreeMap<String, PersistedContact>,
     pub(crate) conversations: BTreeMap<String, LocalConversationState>,
+    /// inbound lane → conversation_id. Rebuilt from `conversations` on load.
+    pub(crate) lane_index: BTreeMap<String, String>,
     pub(crate) sync_states: BTreeMap<String, DeviceSyncState>,
     pub(crate) outbox: Vec<Envelope>,
     pub(crate) pending_outbox: Vec<PendingOutboxItem>,
@@ -1567,6 +1561,7 @@ impl Default for CoreState {
             deployment_bundle: None,
             contacts: BTreeMap::new(),
             conversations: BTreeMap::new(),
+            lane_index: BTreeMap::new(),
             sync_states: BTreeMap::new(),
             outbox: Vec::new(),
             pending_outbox: Vec::new(),

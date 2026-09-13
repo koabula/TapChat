@@ -348,10 +348,7 @@ pub fn run() {
             // Message Requests
             commands::request::list_message_requests,
             commands::request::act_on_message_request,
-            // Allowlist
-            commands::request::get_allowlist,
-            commands::request::add_to_allowlist,
-            commands::request::remove_from_allowlist,
+            commands::request::revoke_contact,
             // Cloudflare
             commands::cloudflare::cloudflare_preflight,
             commands::cloudflare::cloudflare_login,

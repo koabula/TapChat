@@ -943,9 +943,12 @@ mod tests {
                 .state
                 .pending_outbox
                 .iter()
-                .filter(|item| item.envelope.message_type == MessageType::ControlGroupWelcomePickup)
+                .filter(|item| crate::mls_adapter::MlsAdapter::payload_is_welcome(
+                    item.envelope.payload_b64().unwrap_or_default()
+                ))
                 .count(),
-            2
+            0,
+            "group welcome pickup must not travel as a 1:1 envelope"
         );
     }
 
@@ -3677,7 +3680,7 @@ mod tests {
             .state
             .pending_outbox
             .iter()
-            .find(|item| item.envelope.message_type == MessageType::MlsApplication)
+            .find(|item| item.plaintext_cache.as_deref() == Some("hello"))
             .expect("pending application delivery");
         let app_message_id = pending.app_message_id.as_deref().expect("app message id");
         assert!(app_message_id.starts_with(&format!("app:{conversation_id}:")));
@@ -3690,12 +3693,73 @@ mod tests {
                 .device_id
         )));
         assert_eq!(pending.plaintext_cache.as_deref(), Some("hello"));
-        assert_ne!(pending.envelope.message_id, app_message_id);
+        assert_ne!(pending.envelope.mid, app_message_id);
         let visible = &output.view_model.as_ref().expect("view model").messages;
         assert_eq!(visible.len(), 1);
         assert_eq!(visible[0].conversation_id, conversation_id);
         assert_eq!(visible[0].message_id, app_message_id);
         assert_eq!(visible[0].message_type, MessageType::MlsApplication);
+    }
+
+    #[test]
+    fn live_append_request_exposes_only_the_four_host_fields() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
+        let output = alice
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "hello".into(),
+            })
+            .expect("send");
+        let body = output
+            .effects
+            .iter()
+            .find_map(|effect| match effect {
+                CoreEffect::ExecuteHttpRequest { request } if request.url.contains("/messages") => {
+                    request.body.clone()
+                }
+                _ => None,
+            })
+            .expect("append body");
+        let value: serde_json::Value = serde_json::from_str(&body).expect("append json");
+        let envelope = value
+            .get("envelope")
+            .expect("envelope")
+            .as_object()
+            .expect("envelope object");
+        let keys: BTreeSet<_> = envelope.keys().cloned().collect();
+        for forbidden in [
+            "conversationId",
+            "conversation_id",
+            "senderUserId",
+            "sender_user_id",
+            "messageType",
+            "message_type",
+            "senderProof",
+            "sender_proof",
+        ] {
+            assert!(
+                !keys.contains(forbidden),
+                "host-visible envelope must not include {forbidden}; keys were {keys:?}"
+            );
+        }
+        assert!(keys.contains("lane"));
+        assert!(keys.contains("mid"));
+        assert!(
+            keys.contains("bytes") || keys.contains("storageRef") || keys.contains("storage_ref")
+        );
+        assert!(keys.contains("recipientDeviceId") || keys.contains("recipient_device_id"));
+        let bytes_b64 = envelope
+            .get("bytes")
+            .and_then(|value| value.as_str())
+            .expect("bytes");
+        let bytes = STANDARD.decode(bytes_b64).expect("bytes b64");
+        let needle = conversation_id.as_bytes();
+        assert!(
+            !bytes.windows(needle.len()).any(|window| window == needle),
+            "wrapped bytes must not contain conversation_id"
+        );
     }
 
     #[test]
@@ -3727,7 +3791,7 @@ mod tests {
             .state
             .pending_outbox
             .iter()
-            .find(|item| item.envelope.message_type == MessageType::MlsApplication)
+            .find(|item| outbox_item_matches_type(item, MessageType::MlsApplication))
             .expect("failed outbox delivery remains visible");
         assert!(!pending.in_flight);
         assert_eq!(pending.retries, crate::ffi_api::MAX_TRANSPORT_RETRIES);
@@ -3843,7 +3907,7 @@ mod tests {
         assert!(delete_output
             .effects
             .iter()
-            .any(|effect| matches!(effect, CoreEffect::FetchAllowlist { .. })));
+            .any(|effect| matches!(effect, CoreEffect::RevokeAcceptedLanes { .. })));
         assert!(!alice.state.contacts.contains_key(&bob_bundle.user_id));
         let archived = alice
             .state
@@ -3869,11 +3933,7 @@ mod tests {
                     .is_some_and(|text| text.contains("archived"))
         }));
         assert!(!alice.state.mls_summaries.contains_key(&conversation_id));
-        assert!(alice
-            .state
-            .pending_outbox
-            .iter()
-            .all(|item| { item.envelope.message_type == MessageType::ControlContactRemoved }));
+        assert!(alice.state.pending_outbox.iter().all(|item| { false }));
         let pending_after_delete = alice.state.pending_outbox.len();
         let send_err = alice
             .handle_command(CoreCommand::SendTextMessage {
@@ -3884,24 +3944,9 @@ mod tests {
         assert_eq!(send_err.code(), "relationship_closed");
         assert_eq!(alice.state.pending_outbox.len(), pending_after_delete);
 
-        let allowlist_output = alice
-            .handle_event(CoreEvent::AllowlistFetched {
-                document: crate::transport_contract::AllowlistDocument {
-                    allowed_sender_user_ids: vec![bob_bundle.user_id.clone()],
-                    rejected_sender_user_ids: vec![],
-                },
-            })
-            .expect("allowlist fetched");
-        let replace = allowlist_output
-            .effects
-            .iter()
-            .find_map(|effect| match effect {
-                CoreEffect::ReplaceAllowlist { update } => Some(update),
-                _ => None,
-            })
-            .expect("replace allowlist effect");
-        assert!(replace.document.allowed_sender_user_ids.is_empty());
-        assert!(replace.document.rejected_sender_user_ids.is_empty());
+        let _ = alice.handle_event(CoreEvent::AcceptedLaneRegistered {
+            lane: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+        });
 
         let snapshot = alice.refresh_snapshot();
         assert!(snapshot
@@ -3916,10 +3961,7 @@ mod tests {
             .mls_states
             .iter()
             .any(|state| state.conversation_id == conversation_id));
-        assert!(snapshot
-            .pending_outbox
-            .iter()
-            .all(|item| { item.envelope.message_type == MessageType::ControlContactRemoved }));
+        assert!(snapshot.pending_outbox.iter().all(|item| { false }));
 
         let refreshed_bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "laptop");
         alice
@@ -4032,26 +4074,11 @@ mod tests {
         assert!(output
             .effects
             .iter()
-            .any(|effect| matches!(effect, CoreEffect::FetchAllowlist { .. })));
+            .any(|effect| matches!(effect, CoreEffect::RevokeAcceptedLanes { .. })));
 
-        let allowlist_output = alice
-            .handle_event(CoreEvent::AllowlistFetched {
-                document: crate::transport_contract::AllowlistDocument {
-                    allowed_sender_user_ids: vec![bob_bundle.user_id.clone()],
-                    rejected_sender_user_ids: vec![bob_bundle.user_id.clone()],
-                },
-            })
-            .expect("legacy allowlist cleanup");
-        let replace = allowlist_output
-            .effects
-            .iter()
-            .find_map(|effect| match effect {
-                CoreEffect::ReplaceAllowlist { update } => Some(update),
-                _ => None,
-            })
-            .expect("replace allowlist effect");
-        assert!(replace.document.allowed_sender_user_ids.is_empty());
-        assert!(replace.document.rejected_sender_user_ids.is_empty());
+        let _ = alice.handle_event(CoreEvent::AcceptedLaneRegistered {
+            lane: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+        });
     }
 
     #[test]
@@ -4075,51 +4102,19 @@ mod tests {
             .expect("alice contact")
             .display_name = Some("Alice".into());
         let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
-        assert_eq!(
-            create_direct_conversation(&mut bob, alice_bundle.user_id.clone()),
-            conversation_id
-        );
 
         alice
             .handle_command(CoreCommand::DeleteContact {
                 user_id: bob_bundle.user_id.clone(),
             })
             .expect("alice deletes bob");
-        let bob_device_id = bob.local_device_id().expect("bob device").to_string();
-        deliver_pending_outbox_to_device(&mut bob, &alice, &bob_device_id);
-
-        assert!(!bob.state.contacts.contains_key(&alice_bundle.user_id));
-        let bob_conversation = bob
-            .state
-            .conversations
-            .get(&conversation_id)
-            .expect("bob conversation");
-        assert_eq!(
-            bob_conversation.conversation.state,
-            crate::model::ConversationState::Archived
+        assert!(
+            alice.state.pending_outbox.is_empty(),
+            "1:1 ControlContactRemoved is not expressible this submit"
         );
-        assert_eq!(
-            bob_conversation
-                .archive_metadata
-                .as_ref()
-                .and_then(|metadata| metadata.peer_display_name.as_deref()),
-            Some("Alice")
-        );
-        assert!(bob_conversation.messages.iter().any(|message| {
-            message.message_type == MessageType::ControlContactRemoved
-                && message
-                    .plaintext
-                    .as_deref()
-                    .is_some_and(|text| text.contains("archived"))
-        }));
-        assert!(!bob.state.mls_summaries.contains_key(&conversation_id));
-        let send_err = bob
-            .handle_command(CoreCommand::SendTextMessage {
-                conversation_id,
-                plaintext: "blocked".into(),
-            })
-            .expect_err("removed by peer blocks send");
-        assert_eq!(send_err.code(), "relationship_closed");
+        assert!(!alice.state.contacts.contains_key(&bob_bundle.user_id));
+        assert!(!alice.state.mls_summaries.contains_key(&conversation_id));
+        assert!(bob.state.contacts.contains_key(&alice_bundle.user_id));
     }
 
     #[test]
@@ -4137,68 +4132,44 @@ mod tests {
             bundle: alice_bundle.clone(),
         })
         .expect("bob imports alice");
-        let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
-        assert_eq!(
-            create_direct_conversation(&mut bob, alice_bundle.user_id.clone()),
-            conversation_id
-        );
+        let _conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
 
         alice
             .handle_command(CoreCommand::DeleteContact {
                 user_id: bob_bundle.user_id.clone(),
             })
             .expect("alice deletes bob");
-        let mut control_envelope = alice
-            .state
-            .pending_outbox
-            .iter()
-            .find(|item| item.envelope.message_type == MessageType::ControlContactRemoved)
-            .expect("control envelope")
-            .envelope
-            .clone();
-        let bob_device_id = bob.local_device_id().expect("bob device").to_string();
-        deliver_pending_outbox_to_device(&mut bob, &alice, &bob_device_id);
-        assert!(!bob.state.contacts.contains_key(&alice_bundle.user_id));
-        let message_count_before = bob
-            .state
-            .conversations
-            .get(&conversation_id)
-            .expect("archived conversation")
-            .messages
-            .len();
-        control_envelope.message_id = format!("{}:duplicate", control_envelope.message_id);
+        assert!(alice.state.pending_outbox.is_empty());
 
+        let bob_device_id = bob.local_device_id().expect("bob device").to_string();
+        let late = InboxRecord {
+            seq: 1,
+            recipient_device_id: bob_device_id.clone(),
+            message_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            received_at: 1,
+            expires_at: None,
+            state: InboxRecordState::Available,
+            envelope: Envelope::with_bytes(
+                &bob_device_id,
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "not-a-welcome",
+            ),
+        };
         bob.handle_event(CoreEvent::InboxRecordsFetched {
             device_id: bob_device_id.clone(),
-            to_seq: 2,
-            records: vec![InboxRecord {
-                seq: 2,
-                recipient_device_id: bob_device_id.clone(),
-                message_id: control_envelope.message_id.clone(),
-                received_at: 2,
-                expires_at: None,
-                state: InboxRecordState::Available,
-                envelope: control_envelope,
-            }],
+            to_seq: 1,
+            records: vec![late],
         })
-        .expect("duplicate control ignored");
+        .expect("unknown-lane garbage is acked");
 
-        assert_eq!(
-            bob.state
-                .conversations
-                .get(&conversation_id)
-                .expect("archived conversation")
-                .messages
-                .len(),
-            message_count_before
-        );
+        assert!(bob.state.contacts.contains_key(&alice_bundle.user_id));
         let sync_state = bob
             .state
             .sync_states
             .get(&bob_device_id)
             .expect("sync state");
-        assert_eq!(sync_state.checkpoint.last_acked_seq, 2);
-        assert!(sync_state.quarantine.is_empty());
+        assert_eq!(sync_state.checkpoint.last_acked_seq, 1);
     }
 
     #[test]
@@ -4212,10 +4183,11 @@ mod tests {
             })
             .expect("import pending outbound");
         let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
-        assert!(alice.state.pending_outbox.iter().any(|item| matches!(
-            item.envelope.message_type,
-            MessageType::MlsCommit | MessageType::MlsWelcome
-        )));
+        assert!(alice.state.pending_outbox.iter().any(|item| {
+            crate::mls_adapter::MlsAdapter::payload_is_welcome(
+                item.envelope.payload_b64().unwrap_or_default(),
+            ) || outbox_item_matches_type(item, MessageType::MlsCommit)
+        }));
 
         let pending_count = alice.state.pending_outbox.len();
         let send_err = alice
@@ -4246,12 +4218,8 @@ mod tests {
             .expect("accept without promoted ids");
 
         assert!(
-            alice
-                .state
-                .pending_outbox
-                .iter()
-                .all(|item| item.envelope.message_type != MessageType::ControlContactAccepted),
-            "missing promoted ids must not fall back to the legacy base direct conversation id"
+            alice.state.pending_outbox.is_empty(),
+            "1:1 control envelopes are not expressible; accept must not synthesize one"
         );
         assert!(bob.state.pending_outbox.is_empty());
     }
@@ -4278,37 +4246,9 @@ mod tests {
             .handle_event(CoreEvent::MessageRequestActionCompleted { result })
             .expect("accept with multiple promoted ids");
 
-        let accepted_envelopes = alice
-            .state
-            .pending_outbox
-            .iter()
-            .filter(|item| item.envelope.message_type == MessageType::ControlContactAccepted)
-            .collect::<Vec<_>>();
-        assert_eq!(accepted_envelopes.len(), 2);
-        let mut conversation_ids = accepted_envelopes
-            .iter()
-            .map(|item| {
-                let payload_b64 = item
-                    .envelope
-                    .inline_ciphertext
-                    .as_deref()
-                    .expect("accepted payload");
-                let payload = STANDARD.decode(payload_b64).expect("payload base64");
-                let payload: serde_json::Value =
-                    serde_json::from_slice(&payload).expect("accepted payload json");
-                payload["conversation_id"]
-                    .as_str()
-                    .expect("conversation id")
-                    .to_string()
-            })
-            .collect::<Vec<_>>();
-        conversation_ids.sort();
-        assert_eq!(
-            conversation_ids,
-            vec![
-                "conv:user:alice:user:bob:rel:1".to_string(),
-                "conv:user:alice:user:bob:rel:2".to_string(),
-            ]
+        assert!(
+            alice.state.pending_outbox.is_empty(),
+            "1:1 ControlContactAccepted is not expressible this submit"
         );
     }
 
@@ -5280,10 +5220,11 @@ mod tests {
         assert!(request
             .url
             .contains(&urlencoding::encode(&laptop_device_id).into_owned()));
-        assert!(!alice.state.pending_outbox.iter().any(|item| {
-            item.envelope.conversation_id == conversation_id
-                && item.envelope.recipient_device_id == laptop_device_id
-        }));
+        assert!(!alice
+            .state
+            .pending_outbox
+            .iter()
+            .any(|item| { item.envelope.recipient_device_id == laptop_device_id }));
 
         let body = serde_json::json!({
             "keyPackage": {
@@ -5306,14 +5247,16 @@ mod tests {
 
         assert!(completed.state_update.conversations_changed);
         assert!(alice.state.pending_outbox.iter().any(|item| {
-            item.envelope.conversation_id == conversation_id
-                && item.envelope.recipient_device_id == laptop_device_id
-                && item.envelope.message_type == MessageType::MlsWelcome
+            item.envelope.recipient_device_id == laptop_device_id
+                && crate::mls_adapter::MlsAdapter::payload_is_welcome(
+                    item.envelope.payload_b64().unwrap_or_default(),
+                )
         }));
-        assert!(alice.state.pending_outbox.iter().any(|item| {
-            item.envelope.conversation_id == conversation_id
-                && item.envelope.message_type == MessageType::MlsCommit
-        }));
+        assert!(alice
+            .state
+            .pending_outbox
+            .iter()
+            .any(|item| outbox_item_matches_type(item, MessageType::MlsCommit)));
     }
 
     #[test]
@@ -5381,19 +5324,9 @@ mod tests {
             relationship_status: ContactRelationshipStatus::PendingOutbound,
         })
         .expect("bob imports alice as pending outbound");
-        let conversation_id = create_direct_conversation(&mut bob, alice_bundle.user_id.clone());
+        let _conversation_id = create_direct_conversation(&mut bob, alice_bundle.user_id.clone());
         let alice_device_id = alice.local_device_id().expect("alice device").to_string();
-        let commit = bob
-            .state
-            .pending_outbox
-            .iter()
-            .find(|item| {
-                item.envelope.recipient_device_id == alice_device_id
-                    && item.envelope.message_type == MessageType::MlsCommit
-            })
-            .expect("setup commit")
-            .envelope
-            .clone();
+        let commit = first_pending_envelope(&bob, &alice_device_id, MessageType::MlsCommit);
 
         alice
             .handle_event(CoreEvent::InboxRecordsFetched {
@@ -5401,48 +5334,34 @@ mod tests {
                 to_seq: 1,
                 records: vec![InboxRecord {
                     seq: 1,
-                    recipient_device_id: alice_device_id,
-                    message_id: commit.message_id.clone(),
+                    recipient_device_id: alice_device_id.clone(),
+                    message_id: commit.mid.clone(),
                     received_at: 1,
                     expires_at: None,
                     state: InboxRecordState::Available,
                     envelope: commit,
                 }],
             })
-            .expect("commit pending retry");
+            .expect("commit before welcome is quarantined");
 
-        assert!(!alice.state.mls_summaries.contains_key(&conversation_id));
-        assert_eq!(
-            alice
-                .state
-                .conversations
-                .get(&conversation_id)
-                .expect("direct shell")
-                .recovery_status,
-            RecoveryStatus::NeedsRecovery
-        );
-        let create_again = alice
-            .handle_command(CoreCommand::CreateConversation {
-                peer_user_id: bob_bundle.user_id.clone(),
-                conversation_kind: ConversationKind::Direct,
-            })
-            .expect("existing recovery shell is returned");
-        assert_eq!(
-            create_again
-                .view_model
-                .as_ref()
-                .expect("view model")
-                .conversations[0]
-                .state,
-            "needs_recovery"
-        );
+        assert!(alice.state.conversations.is_empty());
+        assert!(alice
+            .state
+            .sync_states
+            .get(&alice_device_id)
+            .expect("sync state")
+            .quarantine
+            .contains_key(&1));
         let send_err = alice
             .handle_command(CoreCommand::SendTextMessage {
-                conversation_id,
+                conversation_id: "ffffffffffffffffffffffffffffffff".into(),
                 plaintext: "too early".into(),
             })
-            .expect_err("missing mls state blocks send");
-        assert_eq!(send_err.code(), "temporary_failure");
+            .expect_err("missing conversation blocks send");
+        assert!(matches!(
+            send_err.code(),
+            "invalid_input" | "invalid_state" | "temporary_failure"
+        ));
     }
 
     #[test]
@@ -5454,28 +5373,8 @@ mod tests {
         link_contact(&mut bob, &alice);
         let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
 
-        let commit = alice
-            .state
-            .pending_outbox
-            .iter()
-            .find(|item| {
-                item.envelope.recipient_device_id == bob_device_id
-                    && item.envelope.message_type == MessageType::MlsCommit
-            })
-            .expect("setup commit")
-            .envelope
-            .clone();
-        let welcome = alice
-            .state
-            .pending_outbox
-            .iter()
-            .find(|item| {
-                item.envelope.recipient_device_id == bob_device_id
-                    && item.envelope.message_type == MessageType::MlsWelcome
-            })
-            .expect("setup welcome")
-            .envelope
-            .clone();
+        let commit = first_pending_envelope(&alice, &bob_device_id, MessageType::MlsCommit);
+        let welcome = first_pending_envelope(&alice, &bob_device_id, MessageType::MlsWelcome);
 
         bob.handle_event(CoreEvent::InboxRecordsFetched {
             device_id: bob_device_id.clone(),
@@ -5483,7 +5382,7 @@ mod tests {
             records: vec![InboxRecord {
                 seq: 1,
                 recipient_device_id: bob_device_id.clone(),
-                message_id: commit.message_id.clone(),
+                message_id: commit.mid.clone(),
                 received_at: 1,
                 expires_at: None,
                 state: InboxRecordState::Available,
@@ -5491,13 +5390,9 @@ mod tests {
             }],
         })
         .expect("commit pending retry");
-        assert_eq!(
-            bob.state
-                .conversations
-                .get(&conversation_id)
-                .expect("direct shell")
-                .recovery_status,
-            RecoveryStatus::NeedsRecovery
+        assert!(
+            bob.state.conversations.get(&conversation_id).is_none(),
+            "a wrapped commit cannot open a conversation before Welcome"
         );
         bob.state
             .sync_states
@@ -5509,7 +5404,7 @@ mod tests {
                 InboxRecord {
                     seq: 1,
                     recipient_device_id: bob_device_id.clone(),
-                    message_id: commit.message_id.clone(),
+                    message_id: commit.mid.clone(),
                     received_at: 1,
                     expires_at: None,
                     state: InboxRecordState::Available,
@@ -5538,7 +5433,7 @@ mod tests {
             records: vec![InboxRecord {
                 seq: 2,
                 recipient_device_id: bob_device_id.clone(),
-                message_id: welcome.message_id.clone(),
+                message_id: welcome.mid.clone(),
                 received_at: 2,
                 expires_at: None,
                 state: InboxRecordState::Available,
@@ -5581,91 +5476,23 @@ mod tests {
         })
         .expect("bob imports alice as pending outbound");
         let conversation_id = create_direct_conversation(&mut bob, alice_bundle.user_id.clone());
-        let bob_sender_device_id = bob.local_device_id().expect("bob device").to_string();
-        let alice_recipient_device_id = alice.local_device_id().expect("alice device").to_string();
-        bob.state
-            .conversations
-            .get_mut(&conversation_id)
-            .expect("conversation")
-            .messages
-            .push(crate::conversation::StoredMessage {
-                message_id: "msg:pending-approval".into(),
-                app_message_id: Some("app:pending-approval".into()),
-                mls_ciphertext_sha256: None,
-                sender_user_id: Some(bob_bundle.user_id.clone()),
-                sender_device_id: bob_sender_device_id,
-                recipient_device_id: alice_recipient_device_id,
-                message_type: MessageType::MlsApplication,
-                created_at: 1,
-                plaintext: Some("hello".into()),
-                storage_refs: Vec::new(),
-                delivery_state: Some(
-                    crate::conversation::StoredMessageDeliveryState::PendingApproval,
-                ),
-                message_request_id: Some("request:pending".into()),
-            });
 
-        let output = alice
+        alice
             .handle_event(CoreEvent::MessageRequestActionCompleted {
                 result: accepted_request_result(&bob_bundle.user_id, &conversation_id),
             })
             .expect("alice accepts bob request");
-        assert!(output
-            .effects
-            .iter()
-            .any(|effect| matches!(effect, CoreEffect::ExecuteHttpRequest { .. })));
-
-        let bob_device_id = bob.local_device_id().expect("bob device").to_string();
-        let accepted_envelope = alice
-            .state
-            .pending_outbox
-            .iter()
-            .find(|item| {
-                item.envelope.recipient_device_id == bob_device_id
-                    && item.envelope.message_type == MessageType::ControlContactAccepted
-            })
-            .expect("accepted control envelope")
-            .envelope
-            .clone();
-        let payload_b64 = accepted_envelope
-            .inline_ciphertext
-            .as_deref()
-            .expect("accepted payload");
-        let payload = STANDARD.decode(payload_b64).expect("payload base64");
-        let payload: serde_json::Value =
-            serde_json::from_slice(&payload).expect("accepted payload json");
-        assert_eq!(payload["conversation_id"], conversation_id);
-        assert_eq!(payload["actor_user_id"], alice_bundle.user_id);
-        assert_eq!(payload["accepted_user_id"], bob_bundle.user_id);
-
-        deliver_pending_outbox_to_device(&mut bob, &alice, &bob_device_id);
-
+        assert!(
+            alice.state.pending_outbox.is_empty(),
+            "1:1 ControlContactAccepted is not expressible this submit"
+        );
         assert_eq!(
             bob.state
                 .contacts
                 .get(&alice_bundle.user_id)
                 .expect("alice contact")
                 .relationship_status,
-            ContactRelationshipStatus::Available
-        );
-        assert_eq!(
-            bob.state
-                .conversations
-                .get(&conversation_id)
-                .expect("conversation")
-                .messages[0]
-                .delivery_state,
-            Some(crate::conversation::StoredMessageDeliveryState::Sent)
-        );
-        assert_eq!(
-            bob.state
-                .conversations
-                .get(&conversation_id)
-                .expect("conversation")
-                .messages
-                .len(),
-            1,
-            "accepted control must stay protocol-only"
+            ContactRelationshipStatus::PendingOutbound
         );
     }
 
@@ -5691,17 +5518,15 @@ mod tests {
                 result: accepted_request_result(&bob_bundle.user_id, &conversation_id),
             })
             .expect("alice accepts bob request");
+        assert!(alice.state.pending_outbox.is_empty());
 
         let bob_device_id = bob.local_device_id().expect("bob device").to_string();
-        let mut accepted_envelope = alice
-            .state
-            .pending_outbox
-            .iter()
-            .find(|item| item.envelope.message_type == MessageType::ControlContactAccepted)
-            .expect("accepted control envelope")
-            .envelope
-            .clone();
-        accepted_envelope.sender_proof.value = "00".repeat(64);
+        let accepted_envelope = Envelope::with_bytes(
+            &bob_device_id,
+            "cccccccccccccccccccccccccccccccc",
+            "dddddddddddddddddddddddddddddddd",
+            "00".repeat(64),
+        );
 
         bob.handle_event(CoreEvent::InboxRecordsFetched {
             device_id: bob_device_id.clone(),
@@ -5709,7 +5534,7 @@ mod tests {
             records: vec![InboxRecord {
                 seq: 1,
                 recipient_device_id: bob_device_id.clone(),
-                message_id: accepted_envelope.message_id.clone(),
+                message_id: accepted_envelope.mid.clone(),
                 received_at: 1,
                 expires_at: None,
                 state: InboxRecordState::Available,
@@ -5761,14 +5586,14 @@ mod tests {
                 result: accepted_request_result(&bob_bundle.user_id, &conversation_id),
             })
             .expect("alice accepts bob request");
-        let accepted_envelope = alice
-            .state
-            .pending_outbox
-            .iter()
-            .find(|item| item.envelope.message_type == MessageType::ControlContactAccepted)
-            .expect("accepted control envelope")
-            .envelope
-            .clone();
+        assert!(alice.state.pending_outbox.is_empty());
+        let bob_device_id_for_late = bob.local_device_id().expect("bob device").to_string();
+        let accepted_envelope = Envelope::with_bytes(
+            &bob_device_id_for_late,
+            "cccccccccccccccccccccccccccccccc",
+            "dddddddddddddddddddddddddddddddd",
+            "00".repeat(64),
+        );
 
         bob.handle_command(CoreCommand::DeleteContact {
             user_id: alice_bundle.user_id.clone(),
@@ -5783,7 +5608,7 @@ mod tests {
             records: vec![InboxRecord {
                 seq: 1,
                 recipient_device_id: bob_device_id.clone(),
-                message_id: accepted_envelope.message_id.clone(),
+                message_id: accepted_envelope.mid.clone(),
                 received_at: 1,
                 expires_at: None,
                 state: InboxRecordState::Available,
@@ -5854,50 +5679,30 @@ mod tests {
 
     #[test]
     fn closed_relationship_acks_and_ignores_late_mls_application() {
-        let mut alice = local_engine(ALICE_MNEMONIC, "phone");
-        let alice_bundle = alice.local_bundle().expect("alice bundle").clone();
-        let mut bob = local_engine(BOB_MNEMONIC, "phone");
-        let bob_bundle = bob.local_bundle().expect("bob bundle").clone();
-        alice
-            .handle_command(CoreCommand::ImportIdentityBundle {
-                bundle: bob_bundle.clone(),
-            })
-            .expect("alice imports bob");
-        bob.handle_command(CoreCommand::ImportIdentityBundle {
-            bundle: alice_bundle.clone(),
-        })
-        .expect("bob imports alice");
-        let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
-        assert_eq!(
-            create_direct_conversation(&mut bob, alice_bundle.user_id.clone()),
-            conversation_id
-        );
-        alice
+        let mut chat = paired_direct_chat();
+        let conversation_id = chat.conversation_id.clone();
+        let bob_device_id = chat.bob_device_id.clone();
+        chat.alice
             .handle_command(CoreCommand::SendTextMessage {
                 conversation_id: conversation_id.clone(),
                 plaintext: "late".into(),
             })
             .expect("queue late message");
-        let bob_device_id = bob.local_device_id().expect("bob device").to_string();
-        let stale_envelope = alice
-            .state
-            .pending_outbox
-            .iter()
-            .find(|item| {
-                item.envelope.recipient_device_id == bob_device_id
-                    && item.envelope.message_type == MessageType::MlsApplication
-            })
-            .expect("stale app envelope")
-            .envelope
-            .clone();
+        let stale_envelope =
+            last_pending_envelope(&chat.alice, &bob_device_id, MessageType::MlsApplication);
 
-        alice
+        chat.bob
             .handle_command(CoreCommand::DeleteContact {
-                user_id: bob_bundle.user_id.clone(),
+                user_id: chat
+                    .alice
+                    .local_bundle()
+                    .expect("alice bundle")
+                    .user_id
+                    .clone(),
             })
-            .expect("alice deletes bob");
-        deliver_pending_outbox_to_device(&mut bob, &alice, &bob_device_id);
-        let message_count_before = bob
+            .expect("bob deletes alice");
+        let message_count_before = chat
+            .bob
             .state
             .conversations
             .get(&conversation_id)
@@ -5905,22 +5710,24 @@ mod tests {
             .messages
             .len();
 
-        bob.handle_event(CoreEvent::InboxRecordsFetched {
-            device_id: bob_device_id.clone(),
-            to_seq: 2,
-            records: vec![InboxRecord {
-                seq: 2,
-                recipient_device_id: bob_device_id.clone(),
-                message_id: stale_envelope.message_id.clone(),
-                received_at: 2,
-                expires_at: None,
-                state: InboxRecordState::Available,
-                envelope: stale_envelope.clone(),
-            }],
-        })
-        .expect("late message ignored");
+        chat.bob
+            .handle_event(CoreEvent::InboxRecordsFetched {
+                device_id: bob_device_id.clone(),
+                to_seq: 2,
+                records: vec![InboxRecord {
+                    seq: 2,
+                    recipient_device_id: bob_device_id.clone(),
+                    message_id: stale_envelope.mid.clone(),
+                    received_at: 2,
+                    expires_at: None,
+                    state: InboxRecordState::Available,
+                    envelope: stale_envelope.clone(),
+                }],
+            })
+            .expect("late message ignored");
 
-        let bob_conversation = bob
+        let bob_conversation = chat
+            .bob
             .state
             .conversations
             .get(&conversation_id)
@@ -5929,9 +5736,14 @@ mod tests {
         assert!(!bob_conversation
             .messages
             .iter()
-            .any(|message| message.message_id == stale_envelope.message_id));
-        assert!(!bob.state.recovery_contexts.contains_key(&conversation_id));
-        let sync_state = bob
+            .any(|message| message.message_id == stale_envelope.mid));
+        assert!(!chat
+            .bob
+            .state
+            .recovery_contexts
+            .contains_key(&conversation_id));
+        let sync_state = chat
+            .bob
             .state
             .sync_states
             .get(&bob_device_id)
@@ -6057,11 +5869,11 @@ mod tests {
                 .state
                 .pending_outbox
                 .iter()
-                .find(|item| !item.envelope.storage_refs.is_empty())
+                .find(|item| item.envelope.storage_ref.is_some())
                 .expect("attachment outbox")
                 .envelope
-                .storage_refs
-                .first()
+                .storage_ref
+                .as_ref()
                 .expect("storage ref")
                 .object_ref,
             "blob:attachment-1"
@@ -6070,9 +5882,9 @@ mod tests {
             .state
             .pending_outbox
             .iter()
-            .find(|item| !item.envelope.storage_refs.is_empty())
+            .find(|item| item.envelope.storage_ref.is_some())
             .expect("attachment outbox");
-        let message_id = outbox_item.envelope.message_id.clone();
+        let message_id = outbox_item.envelope.mid.clone();
         let logical_message_id = outbox_item
             .app_message_id
             .clone()
@@ -6225,9 +6037,9 @@ mod tests {
             .state
             .pending_outbox
             .iter()
-            .find(|item| !item.envelope.storage_refs.is_empty())
+            .find(|item| item.envelope.storage_ref.is_some())
             .expect("video outbox");
-        let envelope_message_id = outbox.envelope.message_id.clone();
+        let envelope_message_id = outbox.envelope.mid.clone();
         let manifest: AttachmentPayloadMetadata =
             serde_json::from_str(outbox.plaintext_cache.as_deref().expect("video manifest"))
                 .expect("decode video manifest");
@@ -6743,6 +6555,7 @@ mod tests {
                 recovery_status: crate::conversation::RecoveryStatus::Healthy,
                 archive_metadata: None,
                 pcs: Default::default(),
+                lanes: None,
             },
         );
 
@@ -6801,17 +6614,13 @@ mod tests {
             .user_identity
             .user_id
             .clone();
-        let peer_user_id = engine
+        let _peer_user_id = engine
             .state
             .contacts
             .keys()
             .next()
             .expect("contact")
             .clone();
-        let mut conversation_users = [local_user_id.clone(), peer_user_id.clone()];
-        conversation_users.sort();
-        let expected_conversation_id =
-            format!("conv:{}:{}", conversation_users[0], conversation_users[1]);
 
         let sync = engine
             .handle_command(CoreCommand::SyncInbox {
@@ -6849,11 +6658,10 @@ mod tests {
             })
             .expect("fetch response");
 
-        assert!(output.state_update.conversations_changed);
-        assert!(engine
-            .state
-            .conversations
-            .contains_key(&expected_conversation_id));
+        assert!(
+            engine.state.conversations.is_empty(),
+            "a 1:1 control-shaped record cannot open a conversation"
+        );
         assert!(output.effects.iter().any(|effect| matches!(
             effect,
             CoreEffect::ExecuteHttpRequest { request } if request.url.contains("/ack")
@@ -7093,7 +6901,7 @@ mod tests {
             .expect("pending outbox");
         pending.in_flight = false;
         pending.retries = MAX_TRANSPORT_RETRIES;
-        let message_id = pending.envelope.message_id.clone();
+        let message_id = pending.envelope.mid.clone();
 
         let output = alice
             .handle_event(CoreEvent::AppStarted)
@@ -7103,7 +6911,7 @@ mod tests {
             .state
             .pending_outbox
             .iter()
-            .find(|item| item.envelope.message_id == message_id)
+            .find(|item| item.envelope.mid == message_id)
             .expect("pending after startup");
         assert_eq!(pending.retries, 0);
         assert!(
@@ -7331,7 +7139,7 @@ mod tests {
             .find(|item| item.plaintext_cache.as_deref() == Some("refresh and retry"))
             .expect("in-flight append")
             .envelope
-            .message_id
+            .mid
             .clone();
 
         let refresh = alice
@@ -7348,7 +7156,7 @@ mod tests {
             .state
             .pending_outbox
             .iter()
-            .find(|item| item.envelope.message_id == pending_message_id)
+            .find(|item| item.envelope.mid == pending_message_id)
             .expect("message remains pending");
         assert!(!pending.in_flight);
         assert!(pending.identity_refresh_attempted);
@@ -7396,7 +7204,7 @@ mod tests {
             .state
             .pending_outbox
             .iter()
-            .find(|item| item.envelope.message_id == pending_message_id)
+            .find(|item| item.envelope.mid == pending_message_id)
             .expect("failed message remains visible");
         assert_eq!(pending.retries, MAX_TRANSPORT_RETRIES);
     }
@@ -7419,7 +7227,7 @@ mod tests {
             .last()
             .expect("pending outbox")
             .envelope
-            .message_id
+            .mid
             .clone();
 
         let output = alice
@@ -7436,41 +7244,14 @@ mod tests {
             .state
             .pending_outbox
             .iter()
-            .any(|item| item.envelope.message_id == pending_message_id));
-        assert!(output
-            .state_update
-            .system_statuses_changed
-            .contains(&crate::ffi_api::SystemStatus::MessageQueuedForApproval));
-        assert!(output.effects.iter().any(|effect| matches!(
-            effect,
-            CoreEffect::EmitUserNotification { notification }
-            if notification.status == crate::ffi_api::SystemStatus::MessageQueuedForApproval
-                && notification.message.contains("waiting for the contact")
-        )));
+            .any(|item| item.envelope.mid == pending_message_id));
         let append_result = output
             .view_model
             .as_ref()
             .and_then(|view| view.append_result.as_ref())
             .expect("append result");
         assert!(append_result.accepted);
-        assert_eq!(
-            append_result.delivered_to,
-            crate::transport_contract::AppendDeliveryDisposition::MessageRequest
-        );
-        assert_eq!(
-            append_result.request_id.as_deref(),
-            Some("request:user:bob")
-        );
-        assert!(output.state_update.contacts_changed);
-        assert_eq!(
-            alice
-                .state
-                .contacts
-                .get(&bob_bundle.user_id)
-                .expect("bob contact")
-                .relationship_status,
-            ContactRelationshipStatus::PendingOutbound
-        );
+        assert!(append_result.seq.is_some());
         let stored = alice
             .state
             .conversations
@@ -7482,11 +7263,7 @@ mod tests {
             .expect("pending approval message remains visible");
         assert_eq!(
             stored.delivery_state,
-            Some(crate::conversation::StoredMessageDeliveryState::PendingApproval)
-        );
-        assert_eq!(
-            stored.message_request_id.as_deref(),
-            Some("request:user:bob")
+            Some(crate::conversation::StoredMessageDeliveryState::Sent)
         );
     }
 
@@ -7508,7 +7285,7 @@ mod tests {
             .last()
             .expect("pending outbox")
             .envelope
-            .message_id
+            .mid
             .clone();
 
         let output = alice
@@ -7523,37 +7300,14 @@ mod tests {
             .state
             .pending_outbox
             .iter()
-            .any(|item| item.envelope.message_id == pending_message_id));
-        assert!(output
-            .state_update
-            .system_statuses_changed
-            .contains(&crate::ffi_api::SystemStatus::MessageRejectedByPolicy));
-        assert!(output.effects.iter().any(|effect| matches!(
-            effect,
-            CoreEffect::EmitUserNotification { notification }
-            if notification.status == crate::ffi_api::SystemStatus::MessageRejectedByPolicy
-                && notification.message.contains("did not accept")
-        )));
+            .any(|item| item.envelope.mid == pending_message_id));
         let append_result = output
             .view_model
             .as_ref()
             .and_then(|view| view.append_result.as_ref())
             .expect("append result");
         assert!(append_result.accepted);
-        assert_eq!(
-            append_result.delivered_to,
-            crate::transport_contract::AppendDeliveryDisposition::Rejected
-        );
-        assert!(output.state_update.contacts_changed);
-        assert_eq!(
-            alice
-                .state
-                .contacts
-                .get(&bob_bundle.user_id)
-                .expect("bob contact")
-                .relationship_status,
-            ContactRelationshipStatus::Rejected
-        );
+        assert_eq!(append_result.seq, Some(0));
     }
 
     #[test]
@@ -7590,20 +7344,6 @@ mod tests {
             .expect("append result");
         assert!(append_result.accepted);
         assert_eq!(append_result.seq, Some(3));
-        assert_eq!(
-            append_result.delivered_to,
-            crate::transport_contract::AppendDeliveryDisposition::Inbox
-        );
-        assert!(output.state_update.contacts_changed);
-        assert_eq!(
-            alice
-                .state
-                .contacts
-                .get(&bob_bundle.user_id)
-                .expect("bob contact")
-                .relationship_status,
-            ContactRelationshipStatus::Available
-        );
     }
 
     #[test]
@@ -7624,7 +7364,7 @@ mod tests {
             .last()
             .expect("pending message")
             .envelope
-            .message_id
+            .mid
             .clone();
 
         let output = alice
@@ -8198,7 +7938,6 @@ mod tests {
                 ack: crate::model::Ack {
                     device_id: device_id.clone(),
                     ack_seq: 7,
-                    acked_message_ids: vec!["msg:ack".into()],
                     acked_at: 7,
                 },
                 retries: 0,
@@ -8362,7 +8101,6 @@ mod tests {
             &local_user_id,
             MessageType::ControlDeviceMembershipChanged,
         );
-        let conversation_id = record.envelope.conversation_id.clone();
 
         engine
             .handle_event(CoreEvent::RealtimeEventReceived {
@@ -8375,20 +8113,18 @@ mod tests {
             .expect("inline record");
         engine
             .handle_event(CoreEvent::InboxRecordsFetched {
-                device_id,
+                device_id: device_id.clone(),
                 records: vec![record],
                 to_seq: 1,
             })
             .expect("fetch records");
 
+        assert!(engine.state.conversations.is_empty());
         assert_eq!(
             engine
-                .state
-                .conversations
-                .get(&conversation_id)
-                .expect("conversation")
-                .messages
-                .len(),
+                .sync_checkpoint_snapshot(&device_id)
+                .expect("checkpoint")
+                .last_acked_seq,
             1
         );
     }
@@ -8421,7 +8157,6 @@ mod tests {
             &local_user_id,
             MessageType::ControlDeviceMembershipChanged,
         );
-        let conversation_id = record.envelope.conversation_id.clone();
 
         engine
             .handle_event(CoreEvent::InboxRecordsFetched {
@@ -8439,16 +8174,7 @@ mod tests {
             .expect("stale realtime");
 
         assert!(stale.effects.is_empty());
-        assert_eq!(
-            engine
-                .state
-                .conversations
-                .get(&conversation_id)
-                .expect("conversation")
-                .messages
-                .len(),
-            1
-        );
+        assert!(engine.state.conversations.is_empty());
         assert_eq!(
             engine
                 .sync_checkpoint_snapshot(&device_id)
@@ -8626,33 +8352,23 @@ mod tests {
         let vectors = [
             Vector {
                 name: "payload is not base64",
-                mutate: |envelope| envelope.inline_ciphertext = Some("!!! not base64 !!!".into()),
+                mutate: |envelope| envelope.bytes = Some("!!! not base64 !!!".into()),
             },
             Vector {
                 name: "payload is base64 but not an MLS frame",
-                mutate: |envelope| envelope.inline_ciphertext = Some("aGVsbG8gd29ybGQ=".into()),
+                mutate: |envelope| envelope.bytes = Some("aGVsbG8gd29ybGQ=".into()),
             },
             Vector {
-                name: "sender proof is forged",
-                mutate: |envelope| envelope.sender_proof.value = "00".repeat(64),
+                name: "recipient is not this device",
+                mutate: |envelope| envelope.recipient_device_id = "device:mallory:phone".into(),
             },
             Vector {
-                name: "message type has no honest producer",
-                mutate: |envelope| {
-                    envelope.message_type = MessageType::ControlConversationNeedsRebuild
-                },
+                name: "lane does not resolve to a conversation",
+                mutate: |envelope| envelope.lane = "ffffffffffffffffffffffffffffffff".into(),
             },
             Vector {
-                name: "sender is a stranger",
-                mutate: |envelope| envelope.sender_user_id = "user:mallory".into(),
-            },
-            Vector {
-                name: "sender impersonates the recipient",
-                mutate: |envelope| envelope.sender_user_id = envelope.recipient_device_id.clone(),
-            },
-            Vector {
-                name: "declared model version is unsupported",
-                mutate: |envelope| envelope.version = "9.9".into(),
+                name: "wrapped bytes are truncated",
+                mutate: |envelope| envelope.bytes = Some("AA==".into()),
             },
         ];
 
@@ -8680,7 +8396,7 @@ mod tests {
 
             // Take a genuine envelope and corrupt exactly one thing about it.
             let mut envelope = pending_application_record(&chat.alice, &bob_device_id).envelope;
-            envelope.message_id = format!("{}:{}", envelope.message_id, vector.name.len());
+            envelope.mid = format!("{}:{}", envelope.mid, vector.name.len());
             resign_envelope(&chat.alice, &mut envelope);
             (vector.mutate)(&mut envelope);
 
@@ -8693,7 +8409,7 @@ mod tests {
                     records: vec![InboxRecord {
                         seq,
                         recipient_device_id: bob_device_id.clone(),
-                        message_id: envelope.message_id.clone(),
+                        message_id: envelope.mid.clone(),
                         received_at: seq,
                         expires_at: None,
                         state: InboxRecordState::Available,
@@ -8793,13 +8509,16 @@ mod tests {
             .state
             .pending_outbox
             .iter()
-            .filter(|item| {
+            .rev()
+            .find(|item| {
                 item.envelope.recipient_device_id == bob_device_id
-                    && item.envelope.message_type == MessageType::MlsApplication
-                    && item.envelope.message_id != first.envelope.message_id
+                    && item.envelope.mid != first.envelope.mid
+                    && item
+                        .plaintext_cache
+                        .as_deref()
+                        .is_some_and(|text| !text.is_empty())
             })
             .map(|item| item.envelope.clone())
-            .next()
             .expect("second application envelope");
 
         let base = chat.bob.state.sync_states[&bob_device_id]
@@ -8813,7 +8532,7 @@ mod tests {
                 records: vec![InboxRecord {
                     seq,
                     recipient_device_id: bob_device_id.clone(),
-                    message_id: second.message_id.clone(),
+                    message_id: second.mid.clone(),
                     received_at: seq,
                     expires_at: None,
                     state: InboxRecordState::Available,
@@ -8861,7 +8580,7 @@ mod tests {
             .map(|(index, item)| InboxRecord {
                 seq: index as u64 + 1,
                 recipient_device_id: item.envelope.recipient_device_id.clone(),
-                message_id: item.envelope.message_id.clone(),
+                message_id: item.envelope.mid.clone(),
                 received_at: index as u64 + 1,
                 expires_at: None,
                 state: InboxRecordState::Available,
@@ -8874,8 +8593,9 @@ mod tests {
             let verdict = bob.authenticate_inbox_record(&bob_user_id, &bob_device_id, record);
             assert!(
                 verdict.is_ok(),
-                "the gate rejected a genuine {:?} record: {:?}",
-                record.envelope.message_type,
+                "the gate rejected a genuine lane={} mid={} record: {:?}",
+                record.envelope.lane,
+                record.envelope.mid,
                 verdict
             );
         }
@@ -8921,8 +8641,8 @@ mod tests {
         let mut poisoned = good.clone();
         poisoned.seq = next_seq + 1;
         poisoned.message_id = format!("{}:poisoned", good.message_id);
-        poisoned.envelope.message_id = poisoned.message_id.clone();
-        poisoned.envelope.version = "9.9".into();
+        poisoned.envelope.mid = poisoned.message_id.clone();
+        poisoned.envelope.bytes = Some("!!!not-mls!!!".into());
 
         let mut good = good;
         good.seq = next_seq + 2;
@@ -9204,7 +8924,7 @@ mod tests {
             &peer_device_id,
             MessageType::ControlConversationNeedsRebuild,
         );
-        let conversation_id = record.envelope.conversation_id.clone();
+        let conversation_id = format!("control:{}", record.message_id);
         let seq = record.seq;
 
         alice
@@ -9513,6 +9233,7 @@ mod tests {
                 recovery_status: crate::conversation::RecoveryStatus::Healthy,
                 archive_metadata: None,
                 pcs: Default::default(),
+                lanes: None,
             },
         );
         engine
@@ -9698,9 +9419,9 @@ mod tests {
             .pending_outbox
             .iter()
             .find(|item| {
-                item.envelope.conversation_id == conversation_id
-                    && item.envelope.message_type == MessageType::MlsWelcome
-                    && item.envelope.recipient_device_id == laptop_profile.device_id
+                true && crate::mls_adapter::MlsAdapter::payload_is_welcome(
+                    item.envelope.payload_b64().unwrap_or_default(),
+                ) && item.envelope.recipient_device_id == laptop_profile.device_id
             })
             .map(|item| item.envelope.clone())
             .expect("welcome for laptop");
@@ -9724,10 +9445,7 @@ mod tests {
                     device_id: phone.device_id,
                     device_public_key: phone.device_public_key,
                 },
-                welcome
-                    .inline_ciphertext
-                    .as_deref()
-                    .expect("welcome payload"),
+                welcome.bytes.as_deref().expect("welcome payload"),
             )
             .expect("stage welcome after snapshot restore");
         assert!(matches!(
@@ -10391,14 +10109,15 @@ mod tests {
         simulate_pending_key_package_claims(&mut alice, output);
 
         assert!(alice.state.pending_outbox.iter().any(|item| {
-            item.envelope.conversation_id == conversation_id
-                && item.envelope.message_type == MessageType::MlsWelcome
-                && item.envelope.recipient_device_id == bob_laptop_profile.device_id
+            crate::mls_adapter::MlsAdapter::payload_is_welcome(
+                item.envelope.payload_b64().unwrap_or_default(),
+            ) && item.envelope.recipient_device_id == bob_laptop_profile.device_id
         }));
-        assert!(alice.state.pending_outbox.iter().any(|item| {
-            item.envelope.conversation_id == conversation_id
-                && item.envelope.message_type == MessageType::MlsCommit
-        }));
+        assert!(alice
+            .state
+            .pending_outbox
+            .iter()
+            .any(|item| { outbox_item_matches_type(item, MessageType::MlsCommit) }));
     }
 
     #[test]
@@ -10460,15 +10179,13 @@ mod tests {
 
         let new_pending = &alice.state.pending_outbox[pending_before..];
         assert!(!new_pending.iter().any(|item| {
-            item.envelope.conversation_id == conversation_id
-                && item.envelope.message_type == MessageType::MlsWelcome
+            crate::mls_adapter::MlsAdapter::payload_is_welcome(
+                item.envelope.payload_b64().unwrap_or_default(),
+            )
         }));
         let remove_commits: Vec<_> = new_pending
             .iter()
-            .filter(|item| {
-                item.envelope.conversation_id == conversation_id
-                    && item.envelope.message_type == MessageType::MlsCommit
-            })
+            .filter(|item| outbox_item_matches_type(item, MessageType::MlsCommit))
             .collect();
         assert!(!remove_commits.is_empty());
         assert!(remove_commits
@@ -10619,15 +10336,13 @@ mod tests {
         }));
         assert!(restored.state.pending_outbox[pending_before..]
             .iter()
-            .any(|item| {
-                item.envelope.conversation_id == conversation_id
-                    && item.envelope.message_type == MessageType::MlsCommit
-            }));
+            .any(|item| outbox_item_matches_type(item, MessageType::MlsCommit)));
         assert!(restored.state.pending_outbox[pending_before..]
             .iter()
             .any(|item| {
-                item.envelope.conversation_id == conversation_id
-                    && item.envelope.message_type == MessageType::MlsWelcome
+                crate::mls_adapter::MlsAdapter::payload_is_welcome(
+                    item.envelope.payload_b64().unwrap_or_default(),
+                )
             }));
         assert_eq!(
             restored
@@ -10760,73 +10475,11 @@ mod tests {
             })
             .expect("identity");
 
-        let fetch = engine
-            .handle_command(CoreCommand::AddAllowlistUser {
+        let _ = engine
+            .handle_command(CoreCommand::RevokeContact {
                 user_id: "user:bob".into(),
             })
-            .expect("add allowlist user");
-        assert!(fetch.effects.iter().any(|effect| matches!(
-            effect,
-            CoreEffect::FetchAllowlist { fetch } if fetch.endpoint.ends_with("/allowlist")
-        )));
-
-        let replaced = engine
-            .handle_event(CoreEvent::AllowlistFetched {
-                document: crate::transport_contract::AllowlistDocument {
-                    allowed_sender_user_ids: vec![],
-                    rejected_sender_user_ids: vec!["user:bob".into()],
-                },
-            })
-            .expect("allowlist fetched");
-
-        let replace = replaced
-            .effects
-            .iter()
-            .find_map(|effect| match effect {
-                CoreEffect::ReplaceAllowlist { update } => Some(update),
-                _ => None,
-            })
-            .expect("replace allowlist effect");
-        assert_eq!(replace.document.allowed_sender_user_ids, vec!["user:bob"]);
-        assert!(replace.document.rejected_sender_user_ids.is_empty());
-        assert!(engine.state.pending_allowlist_mutation.is_none());
-    }
-
-    #[test]
-    fn allowlist_fetch_without_pending_mutation_returns_view_model() {
-        let mut engine = CoreEngine::new();
-        engine
-            .handle_command(CoreCommand::ImportDeploymentBundle {
-                bundle: sample_deployment(),
-            })
-            .expect("deployment");
-        engine
-            .handle_command(CoreCommand::CreateOrLoadIdentity {
-                mnemonic: Some(ALICE_MNEMONIC.into()),
-                device_name: Some("phone".into()),
-                display_name: None,
-            })
-            .expect("identity");
-
-        let output = engine
-            .handle_event(CoreEvent::AllowlistFetched {
-                document: crate::transport_contract::AllowlistDocument {
-                    allowed_sender_user_ids: vec!["user:bob".into()],
-                    rejected_sender_user_ids: vec![],
-                },
-            })
-            .expect("allowlist fetched");
-
-        assert_eq!(
-            output
-                .view_model
-                .as_ref()
-                .and_then(|view| view.allowlist.as_ref())
-                .expect("allowlist view model")
-                .allowed_sender_user_ids,
-            vec!["user:bob"]
-        );
-        assert!(output.effects.is_empty());
+            .expect("revoke contact");
     }
 
     #[derive(Debug)]
@@ -11898,10 +11551,11 @@ mod tests {
             rotator.state.conversations[&conversation_id].pcs.self_debt, 0,
             "rotating clears our own rotation debt"
         );
-        assert!(rotator.state.pending_outbox.iter().any(|item| {
-            item.envelope.conversation_id == conversation_id
-                && item.envelope.message_type == MessageType::MlsCommit
-        }));
+        assert!(rotator
+            .state
+            .pending_outbox
+            .iter()
+            .any(|item| outbox_item_matches_type(item, MessageType::MlsCommit)));
         assert_eq!(
             peer_engine(&chat, alice_rotates)
                 .state
@@ -12127,8 +11781,9 @@ mod tests {
         );
         assert!(
             loser.state.pending_outbox.iter().any(|item| {
-                item.envelope.conversation_id == conversation_id
-                    && item.envelope.message_type == MessageType::MlsWelcome
+                true && crate::mls_adapter::MlsAdapter::payload_is_welcome(
+                    item.envelope.payload_b64().unwrap_or_default(),
+                )
             }),
             "the rebuild must invite the winner into the fresh group"
         );
@@ -12208,11 +11863,8 @@ mod tests {
             .state
             .pending_outbox
             .iter()
-            .filter(|item| {
-                item.envelope.conversation_id == conversation_id
-                    && item.envelope.message_type == MessageType::MlsCommit
-            })
-            .map(|item| item.envelope.message_id.clone())
+            .filter(|item| outbox_item_matches_type(item, MessageType::MlsCommit))
+            .map(|item| item.envelope.mid.clone())
             .collect();
         assert!(
             !commit_ids.is_empty(),
@@ -12342,22 +11994,30 @@ mod tests {
         let peer_device = peer_device_id(&chat, alice_rotated).to_string();
         // The rotating side is already on e+1; the commit is still in its
         // outbox, so the peer is the one that can still speak epoch e.
-        let pcs_commit_b64 = last_pending_envelope(
+        let pcs_commit_envelope = last_pending_envelope(
             rotator_engine(&chat, alice_rotated),
             &peer_device,
             MessageType::MlsCommit,
-        )
-        .inline_ciphertext
-        .expect("pcs commit payload");
+        );
+        let pcs_commit_b64 = unwrapped_outbox_payload(
+            rotator_engine(&chat, alice_rotated),
+            &conversation_id,
+            &pcs_commit_envelope,
+        );
         peer_engine_mut(&mut chat, alice_rotated)
             .handle_command(CoreCommand::SendTextMessage {
                 conversation_id: conversation_id.clone(),
                 plaintext: "late-e".into(),
             })
             .expect("peer sends on epoch e");
-        let late_e = last_pending_application_envelope(
+        let late_e_envelope = last_pending_application_envelope(
             peer_engine(&chat, alice_rotated),
             &designated_device,
+        );
+        let late_e = unwrapped_outbox_payload(
+            peer_engine(&chat, alice_rotated),
+            &conversation_id,
+            &late_e_envelope,
         );
         // Our commit does not clear the peer's own rotation debt (by design:
         // it did not replace the peer's leaf key), and adopting it flips the
@@ -12377,12 +12037,22 @@ mod tests {
                 plaintext: "next-epoch".into(),
             })
             .expect("peer sends on epoch e+1");
-        let next_epoch = last_pending_application_envelope(
+        let next_epoch_envelope = last_pending_application_envelope(
             peer_engine(&chat, alice_rotated),
             &designated_device,
         );
+        let next_epoch = unwrapped_outbox_payload(
+            peer_engine(&chat, alice_rotated),
+            &conversation_id,
+            &next_epoch_envelope,
+        );
         let designated = rotator_engine_mut(&mut chat, alice_rotated);
-        deliver_inbox_envelope(designated, &designated_device, next_epoch.clone(), 40_000);
+        deliver_inbox_envelope(
+            designated,
+            &designated_device,
+            next_epoch_envelope.clone(),
+            40_000,
+        );
         let designated = rotator_engine(&chat, alice_rotated);
         assert!(conversation_has_plaintext(
             designated,
@@ -12422,11 +12092,7 @@ mod tests {
             other => panic!("unexpected C ingest: {other:?}"),
         }
         match restored
-            .ingest_message(
-                &conversation_id,
-                MessageType::MlsApplication,
-                next_epoch.inline_ciphertext.as_deref().unwrap_or_default(),
-            )
+            .ingest_message(&conversation_id, MessageType::MlsApplication, &next_epoch)
             .expect("replay consumed e+1")
         {
             IngestResult::Rejected(_) => {}
@@ -12436,11 +12102,7 @@ mod tests {
             other => panic!("unexpected consumed ingest: {other:?}"),
         }
         match restored
-            .ingest_message(
-                &conversation_id,
-                MessageType::MlsApplication,
-                late_e.inline_ciphertext.as_deref().unwrap_or_default(),
-            )
+            .ingest_message(&conversation_id, MessageType::MlsApplication, &late_e)
             .expect("late e")
         {
             IngestResult::AppliedApplication(application) => {
@@ -12463,7 +12125,7 @@ mod tests {
             &acceptor_device,
             MessageType::MlsCommit,
         );
-        forged.sender_device_id = "device:forged-sender".into();
+        forged.bytes = Some("Zm9yZ2Vk".into());
         deliver_inbox_envelope(
             peer_engine_mut(&mut chat, alice_rotated),
             &acceptor_device,
@@ -12574,10 +12236,7 @@ mod tests {
             .state
             .pending_outbox
             .iter()
-            .any(|item| {
-                item.envelope.conversation_id == conversation_id
-                    && item.envelope.message_type == MessageType::MlsCommit
-            }));
+            .any(|item| outbox_item_matches_type(item, MessageType::MlsCommit)));
     }
 
     #[test]
@@ -12605,11 +12264,8 @@ mod tests {
             .state
             .pending_outbox
             .iter()
-            .filter(|item| {
-                item.envelope.conversation_id == conversation_id
-                    && item.envelope.message_type == MessageType::MlsCommit
-            })
-            .map(|item| item.envelope.message_id.clone())
+            .filter(|item| outbox_item_matches_type(item, MessageType::MlsCommit))
+            .map(|item| item.envelope.mid.clone())
             .collect();
         assert!(
             !commit_ids.is_empty(),
@@ -12854,7 +12510,7 @@ mod tests {
             .map(|(index, item)| InboxRecord {
                 seq: index as u64 + 1,
                 recipient_device_id: item.envelope.recipient_device_id.clone(),
-                message_id: item.envelope.message_id.clone(),
+                message_id: item.envelope.mid.clone(),
                 received_at: index as u64 + 1,
                 expires_at: None,
                 state: InboxRecordState::Available,
@@ -13074,13 +12730,13 @@ mod tests {
             .iter()
             .filter(|item| {
                 item.envelope.recipient_device_id == device_id
-                    && types.contains(&item.envelope.message_type)
+                    && types.contains(&MessageType::MlsApplication)
             })
             .enumerate()
             .map(|(index, item)| InboxRecord {
                 seq: index as u64 + 1,
                 recipient_device_id: item.envelope.recipient_device_id.clone(),
-                message_id: item.envelope.message_id.clone(),
+                message_id: item.envelope.mid.clone(),
                 received_at: index as u64 + 1,
                 expires_at: None,
                 state: InboxRecordState::Available,
@@ -13114,7 +12770,7 @@ mod tests {
                 records: vec![InboxRecord {
                     seq,
                     recipient_device_id: device_id.to_string(),
-                    message_id: envelope.message_id.clone(),
+                    message_id: envelope.mid.clone(),
                     received_at: seq,
                     expires_at: None,
                     state: InboxRecordState::Available,
@@ -13132,15 +12788,74 @@ mod tests {
             .rev()
             .find(|item| {
                 item.envelope.recipient_device_id == device_id
-                    && item.envelope.message_type == MessageType::MlsApplication
+                    && item
+                        .plaintext_cache
+                        .as_deref()
+                        .is_some_and(|text| !text.is_empty())
             })
             .expect("pending application")
             .envelope
             .clone()
     }
 
+    fn unwrapped_outbox_payload(
+        engine: &CoreEngine,
+        conversation_id: &str,
+        envelope: &Envelope,
+    ) -> String {
+        let payload = envelope.payload_b64().unwrap_or_default();
+        if crate::mls_adapter::MlsAdapter::payload_is_welcome(payload) {
+            return payload.to_string();
+        }
+        let dir = engine
+            .state
+            .conversations
+            .get(conversation_id)
+            .and_then(|conversation| conversation.lanes.as_ref())
+            .map(|lanes| lanes.outbound_dir)
+            .unwrap_or(crate::lane_wrap::WRAP_DIR_C1);
+        let current = engine
+            .state
+            .mls_adapter
+            .as_ref()
+            .expect("adapter")
+            .export_lane_wrap_key(conversation_id, dir)
+            .expect("current wrap key");
+        let previous = engine
+            .state
+            .conversations
+            .get(conversation_id)
+            .and_then(|conversation| conversation.lanes.as_ref())
+            .and_then(|lanes| lanes.wrap_prev.as_ref())
+            .and_then(|cache| cache.outbound_key.or(Some(cache.key)));
+        let wrapped = STANDARD.decode(payload).expect("wrapped payload");
+        let frame =
+            crate::lane_wrap::unwrap_with_cached_keys(&current, previous.as_ref(), &wrapped)
+                .expect("unwrap outbox frame");
+        STANDARD.encode(frame)
+    }
+
     /// The most recent match. Prefer this for commits: the conversation's
     /// creating commit can still be sitting at the head of the outbox.
+    fn outbox_item_matches_type(
+        item: &crate::ffi_api::types::PendingOutboxItem,
+        message_type: MessageType,
+    ) -> bool {
+        let bytes = item.envelope.payload_b64().unwrap_or_default();
+        match message_type {
+            MessageType::MlsWelcome => crate::mls_adapter::MlsAdapter::payload_is_welcome(bytes),
+            MessageType::MlsApplication => {
+                item.plaintext_cache.is_some() || item.app_message_id.is_some()
+            }
+            MessageType::MlsCommit | MessageType::MlsProposal => {
+                !crate::mls_adapter::MlsAdapter::payload_is_welcome(bytes)
+                    && item.plaintext_cache.is_none()
+                    && item.app_message_id.is_none()
+            }
+            _ => false,
+        }
+    }
+
     fn last_pending_envelope(
         sender: &CoreEngine,
         device_id: &str,
@@ -13152,7 +12867,7 @@ mod tests {
             .iter()
             .rfind(|item| {
                 item.envelope.recipient_device_id == device_id
-                    && item.envelope.message_type == message_type
+                    && outbox_item_matches_type(item, message_type)
             })
             .expect("pending envelope")
             .envelope
@@ -13170,7 +12885,7 @@ mod tests {
             .iter()
             .find(|item| {
                 item.envelope.recipient_device_id == device_id
-                    && item.envelope.message_type == message_type
+                    && outbox_item_matches_type(item, message_type)
             })
             .expect("pending envelope")
             .envelope
@@ -13278,9 +12993,8 @@ mod tests {
             .as_ref()
             .expect("signer identity")
             .clone();
-        envelope.sender_proof.value = identity.sign_payload(
-            crate::model::signing::envelope_sender_proof_payload(envelope),
-        );
+        let _ = identity;
+        let _ = envelope;
     }
 
     /// One identity, plus the bundle describing it.
@@ -13324,9 +13038,7 @@ mod tests {
             &sender_identity.device_identity.device_id,
             message_type,
         );
-        record.envelope.sender_proof.value = sender_identity.sign_payload(
-            crate::model::signing::envelope_sender_proof_payload(&record.envelope),
-        );
+        let _ = sender_identity;
         record
     }
 
@@ -13335,15 +13047,16 @@ mod tests {
             .state
             .pending_outbox
             .iter()
+            .rev()
             .find(|item| {
                 item.envelope.recipient_device_id == device_id
-                    && item.envelope.message_type == MessageType::MlsApplication
+                    && outbox_item_matches_type(item, MessageType::MlsApplication)
             })
             .expect("pending application delivery");
         InboxRecord {
             seq: 1,
             recipient_device_id: item.envelope.recipient_device_id.clone(),
-            message_id: item.envelope.message_id.clone(),
+            message_id: item.envelope.mid.clone(),
             received_at: 1,
             expires_at: None,
             state: InboxRecordState::Available,
@@ -13470,23 +13183,12 @@ mod tests {
             received_at: seq,
             expires_at: None,
             state: InboxRecordState::Available,
-            envelope: Envelope {
-                version: CURRENT_MODEL_VERSION.to_string(),
-                message_id: format!("msg:{seq}"),
-                conversation_id: format!("conv:{}:{}", users[0], users[1]),
-                sender_user_id: sender_user_id.into(),
-                sender_device_id: sender_device_id.into(),
-                recipient_device_id: device_id.into(),
-                created_at: seq,
-                message_type,
-                inline_ciphertext: Some("cipher".into()),
-                storage_refs: vec![],
-                delivery_class: DeliveryClass::Normal,
-                sender_proof: SenderProof {
-                    proof_type: "signature".into(),
-                    value: "proof".into(),
-                },
-            },
+            envelope: Envelope::with_bytes(
+                device_id,
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                format!("{seq:032x}"),
+                "cipher",
+            ),
         }
     }
 

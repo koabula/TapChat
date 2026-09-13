@@ -1016,8 +1016,7 @@ mod tests {
     use crate::conversation::{ConversationManager, RecoveryStatus};
     use crate::identity::IdentityManager;
     use crate::model::{
-        ConversationState, DeliveryClass, DeviceStatusKind, Envelope, MessageType, SenderProof,
-        CURRENT_MODEL_VERSION,
+        ConversationState, DeviceStatusKind, Envelope, CURRENT_MODEL_VERSION,
     };
     use base64::Engine as _;
 
@@ -1086,23 +1085,12 @@ mod tests {
             }],
             pending_outbox: vec![PersistedOutgoingEnvelope {
                 message_id: "msg:1".into(),
-                envelope: Envelope {
-                    version: CURRENT_MODEL_VERSION.to_string(),
-                    message_id: "msg:1".into(),
-                    conversation_id: "conv:one".into(),
-                    sender_user_id: identity.user_identity.user_id.clone(),
-                    sender_device_id: identity.device_identity.device_id.clone(),
-                    recipient_device_id: "device:bob:phone".into(),
-                    created_at: 1,
-                    message_type: MessageType::MlsApplication,
-                    inline_ciphertext: Some("cipher".into()),
-                    storage_refs: vec![],
-                    delivery_class: DeliveryClass::Normal,
-                    sender_proof: SenderProof {
-                        proof_type: "signature".into(),
-                        value: "proof".into(),
-                    },
-                },
+                envelope: Envelope::with_bytes(
+                    "device:bob:phone",
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "cipher",
+                ),
                 peer_user_id: "user:bob".into(),
                 retries: 0,
                 app_message_id: Some("app:conv:one:1:device:alice:phone".into()),
@@ -1140,7 +1128,6 @@ mod tests {
                 ack: Ack {
                     device_id: identity.device_identity.device_id.clone(),
                     ack_seq: 1,
-                    acked_message_ids: vec![],
                     acked_at: 1,
                 },
                 retries: 0,
@@ -1513,7 +1500,6 @@ mod tests {
                 target_device_id: device_id.into(),
                 endpoint: "https://example.com/inbox".into(),
                 operations: vec![crate::model::CapabilityOperation::Append],
-                conversation_scope: vec![],
                 expires_at: 999,
                 constraints: None,
                 signature: "cap-sig".into(),

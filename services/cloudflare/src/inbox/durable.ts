@@ -1,5 +1,4 @@
 import {
-  APPEND_AUTH_CONTEXT_HEADER,
   APPEND_AUTH_REASON_HEADER,
   HttpError
 } from "../auth/capability";
@@ -8,7 +7,6 @@ import { CONTROL_JSON_MAX_BYTES, DEFAULT_MESSAGE_REQUEST_MAX_BODY_BYTES, readJso
 import { InboxService } from "./service";
 import type {
   AckRequest,
-  AllowlistDocument,
   AppendEnvelopeRequest,
   FetchMessagesRequest
 } from "../types/contracts";
@@ -146,7 +144,6 @@ export async function handleInboxDurableRequest(
     rateLimitPerMinute: number;
     rateLimitPerHour: number;
     messageRequestMaxBodyBytes?: number;
-    messageRequestMaxPerSender?: number;
     messageRequestMaxSenders?: number;
     messageRequestMaxTotalBytes?: number;
     messageRequestTtlSeconds?: number;
@@ -165,7 +162,6 @@ export async function handleInboxDurableRequest(
     maxInlineBytes: deps.maxInlineBytes,
     rateLimitPerMinute: deps.rateLimitPerMinute,
     rateLimitPerHour: deps.rateLimitPerHour,
-    messageRequestMaxPerSender: deps.messageRequestMaxPerSender ?? 16,
     messageRequestMaxSenders: deps.messageRequestMaxSenders ?? 64,
     messageRequestMaxTotalBytes: deps.messageRequestMaxTotalBytes ?? 4 * 1024 * 1024,
     messageRequestTtlSeconds: deps.messageRequestTtlSeconds ?? 7 * 24 * 60 * 60,
@@ -198,18 +194,14 @@ export async function handleInboxDurableRequest(
       return jsonResponse(result);
     }
 
-    if (url.pathname.endsWith("/allowlist") && request.method === "GET") {
-      return jsonResponse(await service.getAllowlist(now));
+    const acceptedLaneMatch = url.pathname.match(/\/accepted-lanes\/([^/]+)$/);
+    if (acceptedLaneMatch && request.method === "PUT") {
+      const lane = decodeURIComponent(acceptedLaneMatch[1]);
+      return jsonResponse(await service.registerAcceptedLane(lane, now));
     }
-
-    if (url.pathname.endsWith("/allowlist") && request.method === "PUT") {
-      const body = await readJsonLimited<Partial<AllowlistDocument>>(request, CONTROL_JSON_MAX_BYTES);
-      const result = await service.replaceAllowlist(
-        body.allowedSenderUserIds ?? [],
-        body.rejectedSenderUserIds ?? [],
-        now
-      );
-      return jsonResponse(result);
+    if (acceptedLaneMatch && request.method === "DELETE") {
+      const lane = decodeURIComponent(acceptedLaneMatch[1]);
+      return jsonResponse(await service.revokeAcceptedLane(lane));
     }
 
     if (url.pathname.endsWith("/messages") && request.method === "POST") {
@@ -217,11 +209,8 @@ export async function handleInboxDurableRequest(
         request,
         deps.messageRequestMaxBodyBytes ?? DEFAULT_MESSAGE_REQUEST_MAX_BODY_BYTES
       );
-      const mode = request.headers.get(APPEND_AUTH_CONTEXT_HEADER) === "legacy_unverified"
-        ? "legacy_unverified"
-        : "verified";
       const result = await service.appendEnvelope(body, now, {
-        mode,
+        mode: "verified",
         reason: request.headers.get(APPEND_AUTH_REASON_HEADER) ?? undefined
       });
       return jsonResponse(result);
@@ -303,7 +292,6 @@ export class InboxDurableObject extends DurableObjectBase {
       rateLimitPerMinute: Number(this.envRef.RATE_LIMIT_PER_MINUTE ?? "60"),
       rateLimitPerHour: Number(this.envRef.RATE_LIMIT_PER_HOUR ?? "600"),
       messageRequestMaxBodyBytes: Number(this.envRef.MESSAGE_REQUEST_MAX_BODY_BYTES ?? String(DEFAULT_MESSAGE_REQUEST_MAX_BODY_BYTES)),
-      messageRequestMaxPerSender: Number(this.envRef.MESSAGE_REQUEST_MAX_PER_SENDER ?? "16"),
       messageRequestMaxSenders: Number(this.envRef.MESSAGE_REQUEST_MAX_SENDERS ?? "64"),
       messageRequestMaxTotalBytes: Number(this.envRef.MESSAGE_REQUEST_MAX_TOTAL_BYTES ?? String(4 * 1024 * 1024)),
       messageRequestTtlSeconds: Number(this.envRef.MESSAGE_REQUEST_TTL_SECONDS ?? String(7 * 24 * 60 * 60)),
@@ -348,7 +336,6 @@ export class InboxDurableObject extends DurableObjectBase {
         maxInlineBytes: Number(this.envRef.MAX_INLINE_BYTES ?? "4096"),
         rateLimitPerMinute: Number(this.envRef.RATE_LIMIT_PER_MINUTE ?? "60"),
         rateLimitPerHour: Number(this.envRef.RATE_LIMIT_PER_HOUR ?? "600"),
-        messageRequestMaxPerSender: Number(this.envRef.MESSAGE_REQUEST_MAX_PER_SENDER ?? "16"),
         messageRequestMaxSenders: Number(this.envRef.MESSAGE_REQUEST_MAX_SENDERS ?? "64"),
         messageRequestMaxTotalBytes: Number(this.envRef.MESSAGE_REQUEST_MAX_TOTAL_BYTES ?? String(4 * 1024 * 1024)),
         messageRequestTtlSeconds: Number(this.envRef.MESSAGE_REQUEST_TTL_SECONDS ?? String(7 * 24 * 60 * 60)),

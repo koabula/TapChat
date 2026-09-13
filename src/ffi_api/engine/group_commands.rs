@@ -246,6 +246,7 @@ impl CoreEngine {
                 recovery_status: RecoveryStatus::Healthy,
                 archive_metadata: None,
                 pcs: Default::default(),
+                lanes: None,
             },
         );
 

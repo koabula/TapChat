@@ -23,7 +23,7 @@ export interface CoreViewModel {
   identity?: LocalIdentitySummary | null;
   banners: SystemBanner[];
   message_requests: MessageRequestItem[];
-  allowlist?: AllowlistDocument;
+  revoked_contact_user_id?: string;
   group_invites?: unknown[];
 }
 
@@ -325,12 +325,6 @@ export interface MessageRequestActionOutput {
   conversation_id?: string;
 }
 
-// Allowlist
-export interface AllowlistDocument {
-  allowed_sender_user_ids: string[];
-  rejected_sender_user_ids: string[];
-}
-
 // System status
 export type SystemStatus =
   | "sync_in_progress"
@@ -525,8 +519,8 @@ export type CoreEffect =
   | { type: "fetch_identity_bundle"; fetch: FetchIdentityBundleRequest }
   | { type: "fetch_message_requests"; fetch: FetchMessageRequestsRequest }
   | { type: "act_on_message_request"; action: MessageRequestActionRequest }
-  | { type: "fetch_allowlist"; fetch: FetchAllowlistRequest }
-  | { type: "replace_allowlist"; update: ReplaceAllowlistRequest }
+  | { type: "register_accepted_lane"; register: RegisterAcceptedLaneRequest }
+  | { type: "revoke_accepted_lanes"; revoke: RevokeAcceptedLanesRequest }
   | { type: "publish_shared_state"; publish: PublishSharedStateRequest }
   | { type: "read_attachment_bytes"; read: ReadAttachmentBytesEffect }
   | { type: "prepare_blob_upload"; upload: PrepareBlobUploadRequest }
@@ -685,17 +679,18 @@ interface MessageRequestActionRequest {
   headers: Record<string, string>;
 }
 
-interface FetchAllowlistRequest {
+interface RegisterAcceptedLaneRequest {
   device_id: string;
+  lane: string;
   endpoint: string;
   headers: Record<string, string>;
 }
 
-interface ReplaceAllowlistRequest {
+interface RevokeAcceptedLanesRequest {
   device_id: string;
+  lanes: string[];
   endpoint: string;
   headers: Record<string, string>;
-  document: AllowlistDocument;
 }
 
 interface PublishSharedStateRequest {

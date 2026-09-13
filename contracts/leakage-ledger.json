@@ -109,64 +109,48 @@
   "entries": [
     {
       "surface": "append_request",
-      "path": "envelope.conversationId",
-      "bits": "inhabited",
-      "carries": [
-        "recipient_user",
-        "sender_user"
-      ],
-      "signed": true,
-      "table": "message_index"
-    },
-    {
-      "surface": "append_request",
-      "path": "envelope.createdAt",
+      "path": "envelope.bytes",
       "bits": "inhabited",
       "carries": [],
-      "signed": true,
-      "table": "envelope_metadata"
-    },
-    {
-      "surface": "append_request",
-      "path": "envelope.deliveryClass",
-      "bits": "constant",
-      "value": "normal",
-      "carries": [],
-      "signed": true,
-      "table": "envelope_metadata"
-    },
-    {
-      "surface": "append_request",
-      "path": "envelope.inlineCiphertext",
-      "bits": "inhabited",
-      "carries": [
-        "recipient_user",
-        "sender_user"
-      ],
-      "signed": true,
+      "signed": false,
       "table": "envelope_metadata",
-      "note": "Not a pure ciphertext: an MLS frame whose PrivateMessage header carries group_id (= conversation_id, which names both users), epoch and content_type in the clear (RFC 9420 §6.3). Identical at both ends of the conversation, so the two inboxes of one conversation share a token. Removed by the R3 frame wrap; until then this row is red on purpose."
+      "note": "Wrapped MLS frame (nonce || ChaCha20-Poly1305). Check X must stay empty: the wrap hides group_id / conversation_id / usernames."
     },
     {
       "surface": "append_request",
-      "path": "envelope.messageId",
+      "path": "envelope.lane",
       "bits": "inhabited",
-      "carries": [
-        "message_nonce",
-        "recipient_device",
-        "recipient_user",
-        "sender_user"
-      ],
-      "signed": true,
+      "carries": [],
+      "signed": false,
       "table": "message_index"
     },
     {
       "surface": "append_request",
-      "path": "envelope.messageType",
+      "path": "envelope.mid",
       "bits": "inhabited",
       "carries": [],
-      "signed": true,
-      "table": "envelope_metadata"
+      "signed": false,
+      "table": "message_index"
+    },
+    {
+      "surface": "append_request",
+      "path": "envelope.storageRef.ref",
+      "bits": "inhabited",
+      "carries": [
+        "sender_device",
+        "sender_user"
+      ],
+      "signed": false,
+      "table": "attachment_refs",
+      "note": "R4 still owns making storage_ref.ref opaque."
+    },
+    {
+      "surface": "append_request",
+      "path": "envelope.storageRef.size",
+      "bits": "inhabited",
+      "carries": [],
+      "signed": false,
+      "table": "attachment_refs"
     },
     {
       "surface": "append_request",
@@ -176,109 +160,8 @@
         "recipient_device",
         "recipient_user"
       ],
-      "signed": true,
+      "signed": false,
       "table": "transport_addressing"
-    },
-    {
-      "surface": "append_request",
-      "path": "envelope.senderDeviceId",
-      "bits": "inhabited",
-      "carries": [
-        "sender_device",
-        "sender_user"
-      ],
-      "signed": true,
-      "table": "sender_identity"
-    },
-    {
-      "surface": "append_request",
-      "path": "envelope.senderProof.type",
-      "bits": "constant",
-      "value": "signature",
-      "carries": [],
-      "signed": false,
-      "table": "non_repudiation"
-    },
-    {
-      "surface": "append_request",
-      "path": "envelope.senderProof.value",
-      "bits": "inhabited",
-      "carries": [],
-      "signed": false,
-      "table": "non_repudiation"
-    },
-    {
-      "surface": "append_request",
-      "path": "envelope.senderUserId",
-      "bits": "inhabited",
-      "carries": [
-        "sender_user"
-      ],
-      "signed": true,
-      "table": "sender_identity"
-    },
-    {
-      "surface": "append_request",
-      "path": "envelope.storageRefs[].expiresAt",
-      "bits": "inhabited",
-      "carries": [],
-      "signed": true,
-      "table": "attachment_refs"
-    },
-    {
-      "surface": "append_request",
-      "path": "envelope.storageRefs[].fileName",
-      "bits": "absent",
-      "carries": [
-        "attachment_file_name"
-      ],
-      "signed": true,
-      "table": "attachment_refs"
-    },
-    {
-      "surface": "append_request",
-      "path": "envelope.storageRefs[].kind",
-      "bits": "inhabited",
-      "carries": [],
-      "signed": true,
-      "table": "attachment_refs"
-    },
-    {
-      "surface": "append_request",
-      "path": "envelope.storageRefs[].mimeType",
-      "bits": "constant",
-      "value": "application/octet-stream",
-      "carries": [],
-      "signed": true,
-      "table": "attachment_refs"
-    },
-    {
-      "surface": "append_request",
-      "path": "envelope.storageRefs[].ref",
-      "bits": "inhabited",
-      "carries": [
-        "sender_device",
-        "sender_user"
-      ],
-      "signed": true,
-      "table": "attachment_refs"
-    },
-    {
-      "surface": "append_request",
-      "path": "envelope.storageRefs[].sizeBytes",
-      "bits": "inhabited",
-      "carries": [],
-      "signed": true,
-      "table": "attachment_refs"
-    },
-    {
-      "surface": "append_request",
-      "path": "envelope.version",
-      "bits": "constant",
-      "value": "0.1",
-      "carries": [],
-      "signed": true,
-      "table": "envelope_metadata"
     },
     {
       "surface": "append_request",
@@ -344,19 +227,6 @@
     },
     {
       "surface": "ack_request",
-      "path": "ack.ackedMessageIds[]",
-      "bits": "inhabited",
-      "carries": [
-        "message_nonce",
-        "recipient_device",
-        "recipient_user",
-        "sender_user"
-      ],
-      "signed": false,
-      "table": "message_index"
-    },
-    {
-      "surface": "ack_request",
       "path": "ack.deviceId",
       "bits": "inhabited",
       "carries": [
@@ -394,7 +264,7 @@
       "table": "transport_addressing"
     },
     {
-      "surface": "replace_allowlist_request",
+      "surface": "register_accepted_lane_request",
       "path": "auth.deviceId",
       "bits": "inhabited",
       "carries": [
@@ -405,7 +275,7 @@
       "table": "transport_addressing"
     },
     {
-      "surface": "replace_allowlist_request",
+      "surface": "register_accepted_lane_request",
       "path": "auth.runtimeId",
       "bits": "inhabited",
       "carries": [],
@@ -413,7 +283,7 @@
       "table": "transport_addressing"
     },
     {
-      "surface": "replace_allowlist_request",
+      "surface": "register_accepted_lane_request",
       "path": "auth.type",
       "bits": "constant",
       "value": "device_runtime",
@@ -422,7 +292,7 @@
       "table": "transport_addressing"
     },
     {
-      "surface": "replace_allowlist_request",
+      "surface": "register_accepted_lane_request",
       "path": "deviceId",
       "bits": "inhabited",
       "carries": [
@@ -433,27 +303,7 @@
       "table": "transport_addressing"
     },
     {
-      "surface": "replace_allowlist_request",
-      "path": "document.allowedSenderUserIds[]",
-      "bits": "inhabited",
-      "carries": [
-        "sender_user"
-      ],
-      "signed": false,
-      "table": "sender_identity"
-    },
-    {
-      "surface": "replace_allowlist_request",
-      "path": "document.rejectedSenderUserIds[]",
-      "bits": "inhabited",
-      "carries": [
-        "recipient_user"
-      ],
-      "signed": false,
-      "table": "sender_identity"
-    },
-    {
-      "surface": "replace_allowlist_request",
+      "surface": "register_accepted_lane_request",
       "path": "endpoint",
       "bits": "inhabited",
       "carries": [
@@ -462,6 +312,14 @@
       ],
       "signed": false,
       "table": "transport_addressing"
+    },
+    {
+      "surface": "register_accepted_lane_request",
+      "path": "lane",
+      "bits": "inhabited",
+      "carries": [],
+      "signed": false,
+      "table": "inbox_state_keys"
     },
     {
       "surface": "message_request_action_request",
@@ -560,10 +418,7 @@
       "surface": "prepare_blob_upload_request",
       "path": "conversationId",
       "bits": "inhabited",
-      "carries": [
-        "recipient_user",
-        "sender_user"
-      ],
+      "carries": [],
       "signed": false,
       "table": "message_index"
     },
@@ -582,8 +437,7 @@
       "carries": [
         "message_nonce",
         "recipient_device",
-        "recipient_user",
-        "sender_user"
+        "recipient_user"
       ],
       "signed": false,
       "table": "message_index"
@@ -630,12 +484,60 @@
     },
     {
       "surface": "inbox_do_key",
-      "path": "allowlist",
+      "path": "accepted-lane:{lane}",
+      "bits": "inhabited",
+      "carries": [],
+      "signed": false,
+      "table": "inbox_state_keys"
+    },
+    {
+      "surface": "inbox_do_key",
+      "path": "lane-seq:{lane}",
+      "bits": "inhabited",
+      "carries": [],
+      "signed": false,
+      "table": "inbox_state_keys"
+    },
+    {
+      "surface": "inbox_do_key",
+      "path": "idempotency:{mid}",
+      "bits": "inhabited",
+      "carries": [],
+      "signed": false,
+      "table": "message_index"
+    },
+    {
+      "surface": "inbox_do_key",
+      "path": "append-result:{mid}",
+      "bits": "inhabited",
+      "carries": [],
+      "signed": false,
+      "table": "message_index"
+    },
+    {
+      "surface": "inbox_do_key",
+      "path": "message-request:{lane}",
+      "bits": "inhabited",
+      "carries": [],
+      "signed": false,
+      "table": "inbox_state_keys"
+    },
+    {
+      "surface": "inbox_do_key",
+      "path": "rate-limit:{lane}",
       "bits": "inhabited",
       "carries": [],
       "signed": false,
       "table": "inbox_state_keys",
-      "note": "The document behind this key holds the recipient's full contact graph as plaintext user ids. R3 deletes it."
+      "note": "Accepted-lane buckets. Unknown lanes share rate-limit:first-contact."
+    },
+    {
+      "surface": "inbox_do_key",
+      "path": "rate-limit:first-contact",
+      "bits": "inhabited",
+      "carries": [],
+      "signed": false,
+      "table": "inbox_state_keys"
     },
     {
       "surface": "inbox_do_key",
@@ -647,50 +549,12 @@
     },
     {
       "surface": "inbox_do_key",
-      "path": "idempotency:{messageId}",
-      "bits": "inhabited",
-      "carries": [
-        "message_nonce",
-        "recipient_device",
-        "recipient_user",
-        "sender_user"
-      ],
-      "signed": false,
-      "table": "message_index",
-      "note": "message_id is msg:{conversation_id}:{nonce}:{recipient_device_id} and conversation_id is conv:{sortedA}:{sortedB}, so this key literally spells out both parties."
-    },
-    {
-      "surface": "inbox_do_key",
-      "path": "append-result:{messageId}",
-      "bits": "inhabited",
-      "carries": [
-        "message_nonce",
-        "recipient_device",
-        "recipient_user",
-        "sender_user"
-      ],
-      "signed": false,
-      "table": "message_index"
-    },
-    {
-      "surface": "inbox_do_key",
-      "path": "message-request:{senderUserId}",
-      "bits": "inhabited",
-      "carries": [
-        "sender_user"
-      ],
-      "signed": false,
-      "table": "sender_identity",
-      "note": "Keyed on a SELF-DECLARED identifier, so it is both a leak and poisonable."
-    },
-    {
-      "surface": "inbox_do_key",
       "path": "message-request:index",
       "bits": "inhabited",
       "carries": [],
       "signed": false,
       "table": "inbox_state_keys",
-      "note": "Holds the list of sender user ids that have attempted contact."
+      "note": "Holds the list of first-contact lanes that have attempted contact."
     },
     {
       "surface": "inbox_do_key",
@@ -707,17 +571,6 @@
       "carries": [],
       "signed": false,
       "table": "inbox_state_keys"
-    },
-    {
-      "surface": "inbox_do_key",
-      "path": "rate-limit:{senderUserId}",
-      "bits": "inhabited",
-      "carries": [
-        "sender_user"
-      ],
-      "signed": false,
-      "table": "sender_identity",
-      "note": "Self-declared and checked before authorization, so a capability holder can exhaust another sender's bucket. R3 closes this."
     },
     {
       "surface": "r2_key",
@@ -744,7 +597,7 @@
       ],
       "signed": false,
       "table": "storage_namespaces",
-      "note": "Stores the ENTIRE InboxRecord, cleartext envelope header included, for every record above maxInlineBytes (MlsWelcome routinely exceeds it). So L_ibx is a subset of L_stg. Never modelled. R4 does not reach it - the spill is already on the recipient's own storage."
+      "note": "Stores only ciphertext bytes for spilled records. The path still names the recipient device (C3 / R4)."
     },
     {
       "surface": "r2_key",
@@ -821,16 +674,12 @@
       "path": "record",
       "bits": "inhabited",
       "carries": [
-        "attachment_file_name",
-        "message_nonce",
         "recipient_device",
-        "recipient_user",
-        "sender_device",
-        "sender_user"
+        "recipient_user"
       ],
       "signed": false,
       "table": "realtime_push",
-      "note": "The full InboxRecord, so every envelope-header leak is pushed over the socket too."
+      "note": "InboxRecord with the four-field envelope; sender identifiers are no longer in the header."
     },
     {
       "surface": "realtime_event",
@@ -846,12 +695,10 @@
       "surface": "realtime_event",
       "path": "requestId",
       "bits": "inhabited",
-      "carries": [
-        "sender_user"
-      ],
+      "carries": [],
       "signed": false,
       "table": "sender_identity",
-      "note": "requestId is request:{senderUserId}."
+      "note": "Random request id; no longer request:{senderUserId}."
     },
     {
       "surface": "realtime_event",
@@ -874,7 +721,8 @@
     },
     {
       "field": "conversation_id",
-      "visibility": "duplicated_in_header"
+      "visibility": "confidential",
+      "note": "Random 128-bit local MLS group_id; no longer duplicated on the 1:1 envelope header."
     },
     {
       "field": "sender_user_id",
@@ -900,6 +748,10 @@
     },
     {
       "field": "body",
+      "visibility": "confidential"
+    },
+    {
+      "field": "sent_at",
       "visibility": "confidential"
     }
   ],
@@ -1021,7 +873,6 @@
         "DeviceStatusDocument",
         "DeviceStatusKind",
         "DeviceStatusRecord",
-        "FetchAllowlistRequest",
         "FetchIdentityBundleRequest",
         "FetchMessageRequestsRequest",
         "FetchWelcomePickupRequest",
@@ -1051,6 +902,7 @@
         "MlsStateStatus",
         "MlsStateSummary",
         "ModelModule",
+        "LaneRotationBody",
         "ProtectedAppMessage",
         "ProtectedPayloadKind",
         "SyncCheckpoint"

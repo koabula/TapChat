@@ -258,22 +258,7 @@ async fn act_on_message_request_impl(
 }
 
 #[tauri::command]
-pub async fn get_allowlist(
-    app: AppHandle,
-    state: State<'_, AppState>,
-) -> crate::errors::DesktopResult<CoreOutput> {
-    ensure_fresh_device_runtime_auth_for_state(state.inner())
-        .await
-        .map_err(|error| error.to_string())?;
-    Ok(
-        drive_core_with_handle(&app, CoreInput::Command(CoreCommand::ListAllowlist))
-            .await
-            .map_err(crate::errors::DesktopError::from)?,
-    )
-}
-
-#[tauri::command]
-pub async fn add_to_allowlist(
+pub async fn revoke_contact(
     app: AppHandle,
     state: State<'_, AppState>,
     user_id: String,
@@ -283,24 +268,7 @@ pub async fn add_to_allowlist(
         .map_err(|error| error.to_string())?;
     Ok(drive_core_with_handle(
         &app,
-        CoreInput::Command(CoreCommand::AddAllowlistUser { user_id }),
-    )
-    .await
-    .map_err(crate::errors::DesktopError::from)?)
-}
-
-#[tauri::command]
-pub async fn remove_from_allowlist(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    user_id: String,
-) -> crate::errors::DesktopResult<CoreOutput> {
-    ensure_fresh_device_runtime_auth_for_state(state.inner())
-        .await
-        .map_err(|error| error.to_string())?;
-    Ok(drive_core_with_handle(
-        &app,
-        CoreInput::Command(CoreCommand::RemoveAllowlistUser { user_id }),
+        CoreInput::Command(CoreCommand::RevokeContact { user_id }),
     )
     .await
     .map_err(crate::errors::DesktopError::from)?)

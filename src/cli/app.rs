@@ -14,12 +14,12 @@ use crate::ffi_api::{AttachmentDescriptor, CoreCommand, CoreEvent};
 use crate::model::{ConversationKind, DeploymentBundle, DeviceStatusKind, Validate};
 use crate::passphrase_strength::evaluate_passphrase_strength;
 use crate::persistence::CorePersistenceSnapshot;
-use crate::transport_contract::{AllowlistDocument, GetHeadResult};
+use crate::transport_contract::GetHeadResult;
 
 use super::args::{
     Cli, CloudflareProvisionCommand, CloudflareProvisionSubcommand, CloudflareRuntimeCommand,
-    CloudflareRuntimeSubcommand, Command, ContactAllowlistCommand, ContactAllowlistSubcommand,
-    ContactCommand, ContactRequestsCommand, ContactRequestsSubcommand, ContactSubcommand,
+    CloudflareRuntimeSubcommand, Command, ContactCommand, ContactRequestsCommand,
+    ContactRequestsSubcommand, ContactSubcommand,
     ConversationCommand, ConversationSubcommand, DeviceCommand, DeviceSubcommand, GroupCommand,
     GroupInviteCommand, GroupInviteSubcommand, GroupJoinCommand, GroupJoinSubcommand,
     GroupMemberCommand, GroupMemberSubcommand, GroupSubcommand, MessageCommand, MessageSubcommand,
@@ -388,7 +388,9 @@ impl CliApp {
                 self.print_value(&contacts)
             }
             ContactSubcommand::Requests(command) => self.run_contact_requests(command).await,
-            ContactSubcommand::Allowlist(command) => self.run_contact_allowlist(command).await,
+            ContactSubcommand::Revoke { profile, user_id } => {
+                self.run_contact_revoke(profile, user_id).await
+            }
         }
     }
 
@@ -446,45 +448,23 @@ impl CliApp {
         }
     }
 
-    async fn run_contact_allowlist(&self, command: ContactAllowlistCommand) -> Result<()> {
-        match command.command {
-            ContactAllowlistSubcommand::List { profile } => {
-                let profile = Profile::open(resolve_profile_path(profile)?)?;
-                let mut driver = load_driver(&profile)?;
-                let output = driver
-                    .run_command_until_idle(CoreCommand::ListAllowlist)
-                    .await?;
-                self.print_value(allowlist_from_output(&output)?)
-            }
-            ContactAllowlistSubcommand::Add { profile, user_id } => {
-                let profile = Profile::open(resolve_profile_path(profile)?)?;
-                let mut driver = load_driver(&profile)?;
-                let output = driver
-                    .run_command_until_idle(CoreCommand::AddAllowlistUser {
-                        user_id: user_id.clone(),
-                    })
-                    .await?;
-                self.print_value(&serde_json::json!({
-                    "updated": true,
-                    "user_id": user_id,
-                    "allowlist": allowlist_from_output(&output)?,
-                }))
-            }
-            ContactAllowlistSubcommand::Remove { profile, user_id } => {
-                let profile = Profile::open(resolve_profile_path(profile)?)?;
-                let mut driver = load_driver(&profile)?;
-                let output = driver
-                    .run_command_until_idle(CoreCommand::RemoveAllowlistUser {
-                        user_id: user_id.clone(),
-                    })
-                    .await?;
-                self.print_value(&serde_json::json!({
-                    "updated": true,
-                    "user_id": user_id,
-                    "allowlist": allowlist_from_output(&output)?,
-                }))
-            }
-        }
+    async fn run_contact_revoke(&self, profile: Option<PathBuf>, user_id: String) -> Result<()> {
+        let mut profile = Profile::open(resolve_profile_path(profile)?)?;
+        let mut driver = load_driver(&profile)?;
+        let output = driver
+            .run_command_until_idle(CoreCommand::RevokeContact {
+                user_id: user_id.clone(),
+            })
+            .await?;
+        persist_driver(&mut profile, &driver)?;
+        self.print_value(&serde_json::json!({
+            "revoked": true,
+            "user_id": user_id,
+            "revoked_contact_user_id": output
+                .view_model
+                .as_ref()
+                .and_then(|view| view.revoked_contact_user_id.clone()),
+        }))
     }
     async fn run_conversation(&self, command: ConversationCommand) -> Result<()> {
         match command.command {
@@ -2352,13 +2332,6 @@ fn local_user_id(driver: &CoreDriver) -> Result<String> {
         .ok_or_else(|| anyhow!("local identity is not initialized"))
 }
 
-fn allowlist_from_output(output: &crate::ffi_api::CoreOutput) -> Result<&AllowlistDocument> {
-    output
-        .view_model
-        .as_ref()
-        .and_then(|view| view.allowlist.as_ref())
-        .ok_or_else(|| anyhow!("allowlist document was not returned by core"))
-}
 
 fn latest_notification_since(
     driver: &crate::cli::driver::CoreDriver,

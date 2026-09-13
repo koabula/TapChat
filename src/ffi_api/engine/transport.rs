@@ -246,8 +246,10 @@ impl CoreEngine {
                     .pending_outbox
                     .iter()
                     .find(|item| {
-                        item.envelope.conversation_id == conversation_id
-                            && (item.envelope.message_id == message_id
+                        self.conversation_id_for_lane(&item.envelope.lane)
+                            .as_deref()
+                            == Some(conversation_id)
+                            && (item.envelope.mid == message_id
                                 || item.app_message_id.as_deref() == Some(message_id))
                     })
                     .and_then(|item| item.plaintext_cache.as_deref())
@@ -297,8 +299,10 @@ impl CoreEngine {
         let local_device_id = &local_identity.device_identity.device_id;
 
         let pending_is_local = self.state.pending_outbox.iter().any(|item| {
-            item.envelope.conversation_id == conversation_id
-                && (item.envelope.message_id == message_id
+            self.conversation_id_for_lane(&item.envelope.lane)
+                .as_deref()
+                == Some(conversation_id)
+                && (item.envelope.mid == message_id
                     || item.app_message_id.as_deref() == Some(message_id))
         }) || self.state.pending_group_outbox.iter().any(|item| {
             item.envelope.conversation_id == conversation_id
@@ -644,74 +648,23 @@ impl CoreEngine {
         })
     }
 
-    pub(super) fn list_allowlist(&mut self) -> CoreResult<CoreOutput> {
-        let device_id = self.local_device_id_required()?;
-        Ok(CoreOutput {
-            state_update: CoreStateUpdate::default(),
-            effects: vec![CoreEffect::FetchAllowlist {
-                fetch: FetchAllowlistRequest {
-                    device_id,
-                    endpoint: self.inbox_management_endpoint("allowlist")?,
-                    headers: BTreeMap::new(),
-                    auth: Some(self.device_runtime_auth_requirement()?),
-                },
-            }],
-            view_model: None,
-        })
-    }
-
-    pub(super) fn add_allowlist_user(&mut self, user_id: String) -> CoreResult<CoreOutput> {
-        let device_id = self.local_device_id_required()?;
-        self.state.pending_allowlist_mutation = Some(PendingAllowlistMutation::Add {
-            user_id: user_id.clone(),
-        });
-        Ok(CoreOutput {
-            state_update: CoreStateUpdate::default(),
-            effects: vec![CoreEffect::FetchAllowlist {
-                fetch: FetchAllowlistRequest {
-                    device_id,
-                    endpoint: self.inbox_management_endpoint("allowlist")?,
-                    headers: BTreeMap::new(),
-                    auth: Some(self.device_runtime_auth_requirement()?),
-                },
-            }],
-            view_model: None,
-        })
+    pub(super) fn add_allowlist_user(&mut self, _user_id: String) -> CoreResult<CoreOutput> {
+        Ok(CoreOutput::default())
     }
 
     pub(super) fn remove_allowlist_user(&mut self, user_id: String) -> CoreResult<CoreOutput> {
-        self.remove_allowlist_users(vec![user_id])
+        self.revoke_contact_lanes(user_id)
     }
 
     pub(super) fn remove_allowlist_users(
         &mut self,
-        mut user_ids: Vec<String>,
+        user_ids: Vec<String>,
     ) -> CoreResult<CoreOutput> {
-        user_ids.sort();
-        user_ids.dedup();
-        if user_ids.is_empty() {
-            return Ok(CoreOutput::default());
+        let mut output = CoreOutput::default();
+        for user_id in user_ids {
+            output = merge_outputs(output, self.revoke_contact_lanes(user_id)?);
         }
-        let device_id = self.local_device_id_required()?;
-        self.state.pending_allowlist_mutation = if user_ids.len() == 1 {
-            Some(PendingAllowlistMutation::Remove {
-                user_id: user_ids.remove(0),
-            })
-        } else {
-            Some(PendingAllowlistMutation::RemoveMany { user_ids })
-        };
-        Ok(CoreOutput {
-            state_update: CoreStateUpdate::default(),
-            effects: vec![CoreEffect::FetchAllowlist {
-                fetch: FetchAllowlistRequest {
-                    device_id,
-                    endpoint: self.inbox_management_endpoint("allowlist")?,
-                    headers: BTreeMap::new(),
-                    auth: Some(self.device_runtime_auth_requirement()?),
-                },
-            }],
-            view_model: None,
-        })
+        Ok(output)
     }
 
     pub(super) fn handle_realtime_event(
@@ -808,7 +761,7 @@ impl CoreEngine {
                 .state
                 .pending_outbox
                 .iter_mut()
-                .find(|item| item.envelope.message_id == message_id)
+                .find(|item| item.envelope.mid == message_id)
             {
                 item.in_flight = false;
             }
@@ -1182,7 +1135,7 @@ impl CoreEngine {
                 item.retries = 0;
                 item.identity_refresh_attempted = false;
                 persist_ops.push(PersistOp::SaveOutgoingEnvelope {
-                    message_id: item.envelope.message_id.clone(),
+                    message_id: item.envelope.mid.clone(),
                 });
             }
         }
@@ -1475,11 +1428,11 @@ impl CoreEngine {
             .find(|device| device.device_id == item.envelope.recipient_device_id)
             .ok_or_else(|| CoreError::invalid_input("recipient device profile is missing"))?
             .clone();
-        let request_id = self.next_request_id(&format!("append:{}", item.envelope.message_id));
+        let request_id = self.next_request_id(&format!("append:{}", item.envelope.mid));
         self.state.pending_requests.insert(
             request_id.clone(),
             PendingRequest::AppendEnvelope {
-                message_id: item.envelope.message_id.clone(),
+                message_id: item.envelope.mid.clone(),
                 peer_user_id: item.peer_user_id.clone(),
             },
         );
@@ -1690,7 +1643,7 @@ impl CoreEngine {
                 let append_delivery = self.handle_append_delivery_result(&message_id, &result);
                 self.state
                     .pending_outbox
-                    .retain(|item| item.envelope.message_id != message_id);
+                    .retain(|item| item.envelope.mid != message_id);
                 let mut persist_ops = vec![PersistOp::DeleteOutgoingEnvelope {
                     message_id: message_id.clone(),
                 }];
@@ -2085,7 +2038,7 @@ impl CoreEngine {
             .state
             .pending_outbox
             .iter()
-            .position(|item| item.envelope.message_id == message_id)
+            .position(|item| item.envelope.mid == message_id)
         else {
             return Ok(CoreOutput::default());
         };
@@ -2846,40 +2799,17 @@ impl CoreEngine {
     /// log does not distinguish "unknown signer" from "bad signature".
     pub(crate) fn authenticate_inbox_record(
         &self,
-        local_user_id: &str,
+        _local_user_id: &str,
         device_id: &str,
         record: &InboxRecord,
     ) -> Result<(), &'static str> {
         record.validate().map_err(|_| "malformed record")?;
-        if record.recipient_device_id != device_id {
+        if record.recipient_device_id != device_id
+            || record.envelope.recipient_device_id != device_id
+        {
             return Err("record is addressed to a different device");
         }
-        if !inbox_deliverable(record.envelope.message_type) {
-            return Err("message type is not deliverable over the direct inbox");
-        }
-        // Direct envelopes are never addressed to our own devices
-        // (`recipient_device_ids` filters the local user out), so a record
-        // claiming to be from us is a forgery by construction.
-        if record.envelope.sender_user_id == local_user_id {
-            return Err("record claims to come from the local user");
-        }
-        // `verify_device_signature` resolves non-local signers only through
-        // `state.contacts`, so this is also what makes the signature check
-        // meaningful: an unknown sender has no key to check against.
-        if !self
-            .state
-            .contacts
-            .contains_key(&record.envelope.sender_user_id)
-        {
-            return Err("sender is not an established contact");
-        }
-        self.verify_device_signature(
-            &record.envelope.sender_user_id,
-            &record.envelope.sender_device_id,
-            envelope_sender_proof_payload(&record.envelope),
-            &record.envelope.sender_proof.value,
-        )
-        .map_err(|_| "sender proof is not valid")
+        Ok(())
     }
 
     /// Hand an authenticated inbound MLS frame to the adapter.
@@ -2892,26 +2822,21 @@ impl CoreEngine {
     pub(super) fn ingest_inbound_mls(
         &mut self,
         conversation_id: &str,
-        envelope: &Envelope,
+        message_type: MessageType,
         payload_b64: &str,
+        welcome_author: Option<WelcomeAuthor>,
     ) -> CoreResult<IngestResult> {
-        let author = (envelope.message_type == MessageType::MlsWelcome)
-            .then(|| {
-                self.trusted_device_public_key(&envelope.sender_user_id, &envelope.sender_device_id)
-                    .map(|device_public_key| WelcomeAuthor {
-                        device_id: envelope.sender_device_id.clone(),
-                        device_public_key,
-                    })
-            })
-            .transpose()?;
         let adapter = self
             .state
             .mls_adapter
             .as_mut()
             .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?;
-        match author {
-            Some(author) => adapter.ingest_welcome(conversation_id, &author, payload_b64),
-            None => adapter.ingest_message(conversation_id, envelope.message_type, payload_b64),
+        match (message_type, welcome_author) {
+            (MessageType::MlsWelcome, Some(author)) => {
+                adapter.ingest_welcome(conversation_id, &author, payload_b64)
+            }
+            (MessageType::MlsWelcome, None) => Ok(IngestResult::Rejected(RejectReason::Malformed)),
+            _ => adapter.ingest_message(conversation_id, message_type, payload_b64),
         }
     }
 
@@ -3141,12 +3066,46 @@ impl CoreEngine {
                 processed_records.push(record);
                 continue;
             }
-            if record.envelope.message_type == MessageType::ControlContactRemoved {
+            let resolved = match self.resolve_inbound_frame(&local_user_id, &device_id, &record)? {
+                Some(resolved) => resolved,
+                None => {
+                    let known_session = self
+                        .conversation_id_for_lane(&record.envelope.lane)
+                        .is_some();
+                    {
+                        let sync_state = self
+                            .state
+                            .sync_states
+                            .entry(device_id.clone())
+                            .or_insert_with(|| SyncEngine::new_device_state(&device_id));
+                        if known_session {
+                            // Known session, but the bytes did not unwrap and
+                            // are not a Welcome: R2 ack + drop, no quarantine.
+                            SyncEngine::release_quarantined(sync_state, record.seq);
+                        } else {
+                            SyncEngine::quarantine_record(sync_state, &record);
+                        }
+                    }
+                    advance_contiguous_ack(
+                        &mut contiguous_ack,
+                        &mut deferred_ackable_seqs,
+                        record.seq,
+                    );
+                    processed_records.push(record);
+                    continue;
+                }
+            };
+            let conversation_id = resolved.conversation_id.clone();
+            let inbound_message_type = resolved.message_type;
+            let inbound_payload_b64 = resolved.payload_b64.clone();
+            let inbound_peer_user_id = resolved.peer_user_id.clone();
+            let welcome_author = resolved.welcome_author.clone();
+            if inbound_message_type == MessageType::ControlContactRemoved {
                 if self.should_ignore_idempotent_contact_removed_record(&local_user_id, &record) {
                     log::info!(
                         "handle_inbox_records: acking and ignoring idempotent ControlContactRemoved for archived relationship conversation_id={} sender_user_id={} message_id={}",
-                        record.envelope.conversation_id,
-                        record.envelope.sender_user_id,
+                        conversation_id,
+                        inbound_peer_user_id,
                         record.message_id
                     );
                     {
@@ -3181,7 +3140,7 @@ impl CoreEngine {
                 processed_records.push(record);
                 continue;
             }
-            if record.envelope.message_type == MessageType::ControlContactAccepted {
+            if inbound_message_type == MessageType::ControlContactAccepted {
                 output = merge_outputs(
                     output,
                     self.handle_contact_accepted_record(&local_user_id, &record)?,
@@ -3201,9 +3160,9 @@ impl CoreEngine {
             if self.should_ignore_closed_relationship_record(&local_user_id, &record) {
                 log::info!(
                     "handle_inbox_records: acking and ignoring {:?} for closed relationship conversation_id={} sender_user_id={} message_id={}",
-                    record.envelope.message_type,
-                    record.envelope.conversation_id,
-                    record.envelope.sender_user_id,
+                    inbound_message_type,
+                    conversation_id,
+                    inbound_peer_user_id,
                     record.message_id
                 );
                 {
@@ -3219,14 +3178,9 @@ impl CoreEngine {
                 continue;
             }
             self.ensure_local_conversation_for_record(&device_id, &local_user_id, &record);
-            let conversation_id = record.envelope.conversation_id.clone();
             touched_conversation_ids.insert(conversation_id.clone());
-            if record.envelope.message_type == MessageType::MlsApplication {
-                let inline_ciphertext = record
-                    .envelope
-                    .inline_ciphertext
-                    .as_deref()
-                    .unwrap_or_default();
+            if inbound_message_type == MessageType::MlsApplication {
+                let inline_ciphertext = inbound_payload_b64.as_str();
                 let ciphertext_sha256 =
                     format!("{:x}", Sha256::digest(inline_ciphertext.as_bytes()));
                 let duplicate_delivery = self
@@ -3243,8 +3197,9 @@ impl CoreEngine {
                 if !duplicate_delivery {
                     match self.ingest_inbound_mls(
                         &conversation_id,
-                        &record.envelope,
+                        inbound_message_type,
                         inline_ciphertext,
+                        welcome_author.clone(),
                     )? {
                         IngestResult::AppliedApplication(application) => {
                             log::info!(
@@ -3277,17 +3232,17 @@ impl CoreEngine {
                                             .push(MessageSummary {
                                                 conversation_id: conversation_id.clone(),
                                                 message_id: record.message_id.clone(),
-                                                message_type: record.envelope.message_type,
+                                                message_type: inbound_message_type,
                                             });
                                     }
                                     if self.direct_relationship_open_for_record(
-                                        &record.envelope.sender_user_id,
+                                        &inbound_peer_user_id,
                                         &conversation_id,
                                     ) {
                                         output = merge_outputs(
                                             output,
                                             self.promote_pending_outbound_contact(
-                                                &record.envelope.sender_user_id,
+                                                &inbound_peer_user_id,
                                                 "verified_inbound_mls_application",
                                             )?,
                                         );
@@ -3428,7 +3383,15 @@ impl CoreEngine {
                     .conversations
                     .get_mut(&conversation_id)
                     .ok_or_else(|| CoreError::invalid_input("conversation does not exist"))?;
-                ConversationManager::apply_incoming_envelope(conversation_state, &record.envelope)?
+                ConversationManager::apply_incoming_envelope(
+                    conversation_state,
+                    &record.envelope,
+                    &inbound_peer_user_id,
+                    "",
+                    inbound_message_type,
+                    record.received_at,
+                    Vec::new(),
+                )?
             };
 
             output.state_update.messages_changed = true;
@@ -3440,17 +3403,17 @@ impl CoreEngine {
                 .push(MessageSummary {
                     conversation_id: conversation_id.clone(),
                     message_id: record.message_id.clone(),
-                    message_type: record.envelope.message_type,
+                    message_type: inbound_message_type,
                 });
 
             let mut retention = RecordRetention::Discarded;
             if !apply_effect.duplicate_message
                 || matches!(
-                    record.envelope.message_type,
+                    inbound_message_type,
                     MessageType::MlsCommit | MessageType::MlsWelcome
                 )
             {
-                match record.envelope.message_type {
+                match inbound_message_type {
                     MessageType::MlsApplication
                     | MessageType::MlsCommit
                     | MessageType::MlsWelcome => {
@@ -3458,7 +3421,7 @@ impl CoreEngine {
                         // settled here, before ingest: the winner discards it
                         // with no state change, the loser repairs itself.
                         let mut arbitrated = false;
-                        if record.envelope.message_type == MessageType::MlsCommit {
+                        if inbound_message_type == MessageType::MlsCommit {
                             if let Some(extra) =
                                 self.direct_pcs_arbitration(&conversation_id, &record)?
                             {
@@ -3478,12 +3441,9 @@ impl CoreEngine {
                         } else {
                             match self.ingest_inbound_mls(
                                 &conversation_id,
-                                &record.envelope,
-                                record
-                                    .envelope
-                                    .inline_ciphertext
-                                    .as_deref()
-                                    .unwrap_or_default(),
+                                inbound_message_type,
+                                &inbound_payload_b64,
+                                welcome_author.clone(),
                             )? {
                                 IngestResult::AppliedApplication(application) => {
                                     log::info!(
@@ -3542,13 +3502,13 @@ impl CoreEngine {
                                     touched_mls_conversation_ids.insert(conversation_id.clone());
                                     touched_recovery_context_ids.insert(conversation_id.clone());
                                     if self.direct_relationship_open_for_record(
-                                        &record.envelope.sender_user_id,
+                                        &inbound_peer_user_id,
                                         &conversation_id,
                                     ) {
                                         output = merge_outputs(
                                             output,
                                             self.promote_pending_outbound_contact(
-                                                &record.envelope.sender_user_id,
+                                                &inbound_peer_user_id,
                                                 "verified_inbound_mls_application",
                                             )?,
                                         );
@@ -3597,13 +3557,13 @@ impl CoreEngine {
                                     touched_mls_conversation_ids.insert(conversation_id.clone());
                                     touched_recovery_context_ids.insert(conversation_id.clone());
                                     if self.direct_relationship_open_for_record(
-                                        &record.envelope.sender_user_id,
+                                        &inbound_peer_user_id,
                                         &conversation_id,
                                     ) {
                                         output = merge_outputs(
                                             output,
                                             self.promote_pending_outbound_contact(
-                                                &record.envelope.sender_user_id,
+                                                &inbound_peer_user_id,
                                                 "verified_inbound_mls_commit",
                                             )?,
                                         );
@@ -3611,6 +3571,10 @@ impl CoreEngine {
                                 }
                                 IngestResult::AppliedProposal => {}
                                 IngestResult::AppliedWelcome { epoch } => {
+                                    self.adopt_welcome_lanes(
+                                        &conversation_id,
+                                        &record.envelope.lane,
+                                    );
                                     self.initialize_direct_pcs_from_mls(&conversation_id)?;
                                     log::info!(
                                         "handle_inbox_records: AppliedWelcome for message {} in conversation {}, epoch={}",
@@ -3647,22 +3611,18 @@ impl CoreEngine {
                                     touched_recovery_context_ids.insert(conversation_id.clone());
                                     output.effects.extend(
                                         self.rotate_local_key_package_after_welcome(
-                                            record
-                                                .envelope
-                                                .inline_ciphertext
-                                                .as_deref()
-                                                .unwrap_or_default(),
+                                            &inbound_payload_b64,
                                         )?,
                                     );
                                     output.state_update.contacts_changed = true;
                                     if self.direct_relationship_open_for_record(
-                                        &record.envelope.sender_user_id,
+                                        &inbound_peer_user_id,
                                         &conversation_id,
                                     ) {
                                         output = merge_outputs(
                                             output,
                                             self.promote_pending_outbound_contact(
-                                                &record.envelope.sender_user_id,
+                                                &inbound_peer_user_id,
                                                 "verified_inbound_mls_welcome",
                                             )?,
                                         );
@@ -3686,16 +3646,14 @@ impl CoreEngine {
                         }
                     }
                     _ => {
-                        if record.envelope.message_type == MessageType::ControlGroupWelcomePickup {
+                        if false && inbound_message_type == MessageType::ControlGroupWelcomePickup {
                             log::info!(
                                 "handle_inbox_records: received group welcome control message_id={} conversation_id={}",
                                 record.message_id,
                                 conversation_id
                             );
-                            let payload_b64 = record
-                                .envelope
-                                .inline_ciphertext
-                                .as_deref()
+                            let payload_b64 = Some(inbound_payload_b64.as_str())
+                                .filter(|value| !value.is_empty())
                                 .ok_or_else(|| {
                                     CoreError::invalid_input(
                                         "group welcome pickup control is missing payload",
@@ -4127,7 +4085,7 @@ impl CoreEngine {
             .state
             .pending_outbox
             .iter()
-            .find(|item| item.envelope.message_id == message_id);
+            .find(|item| item.envelope.mid == message_id);
 
         let peer_user_id = pending_item
             .map(|item| item.peer_user_id.clone())
@@ -4140,17 +4098,9 @@ impl CoreEngine {
 
         let append_result = AppendResultSummary {
             accepted: result.accepted,
-            delivered_to: result.delivered_to.clone(),
-            queued_as_request: result.queued_as_request,
-            request_id: result.request_id.clone(),
             seq: Some(result.seq),
         };
-        let protocol_only_contact_control = envelope.as_ref().is_some_and(|env| {
-            matches!(
-                env.message_type,
-                MessageType::ControlContactRemoved | MessageType::ControlContactAccepted
-            )
-        });
+        let protocol_only_contact_control = false;
         let current_relationship_removed = self
             .state
             .contacts
@@ -4159,14 +4109,7 @@ impl CoreEngine {
         let contact_changed = if protocol_only_contact_control || current_relationship_removed {
             false
         } else {
-            let relationship_status = match result.delivered_to {
-                AppendDeliveryDisposition::Inbox => ContactRelationshipStatus::Available,
-                AppendDeliveryDisposition::MessageRequest => {
-                    ContactRelationshipStatus::PendingOutbound
-                }
-                AppendDeliveryDisposition::Rejected => ContactRelationshipStatus::Rejected,
-            };
-            self.set_contact_relationship_status(&peer_user_id, relationship_status)
+            false
         };
         let contacts = if contact_changed {
             self.contact_summaries()
@@ -4193,22 +4136,14 @@ impl CoreEngine {
         }
 
         let mut saved_conversation_id = None;
-        let desired_delivery_state = match result.delivered_to {
-            AppendDeliveryDisposition::Inbox => {
-                crate::conversation::StoredMessageDeliveryState::Sent
-            }
-            AppendDeliveryDisposition::MessageRequest => {
-                crate::conversation::StoredMessageDeliveryState::PendingApproval
-            }
-            AppendDeliveryDisposition::Rejected => {
-                crate::conversation::StoredMessageDeliveryState::Failed
-            }
-        };
+        let desired_delivery_state = crate::conversation::StoredMessageDeliveryState::Sent;
         // A successful append result consumes its outbox row. Persist the local
         // bubble for every terminal disposition so refresh/restart cannot make
         // the sender's message disappear.
         let messages_changed = envelope.as_ref().is_some_and(|env| {
-            let conversation_id = env.conversation_id.clone();
+            let Some(conversation_id) = self.conversation_id_for_lane(&env.lane) else {
+                return false;
+            };
             let Some(conv) = self.state.conversations.get_mut(&conversation_id) else {
                 return false;
             };
@@ -4231,47 +4166,71 @@ impl CoreEngine {
                     ) => current,
                     _ => Some(desired_delivery_state),
                 };
-                let request_id = if merged
-                    == Some(crate::conversation::StoredMessageDeliveryState::PendingApproval)
-                {
-                    result
-                        .request_id
-                        .clone()
-                        .or_else(|| stored.message_request_id.clone())
-                } else {
-                    None
-                };
+                let request_id = stored.message_request_id.clone();
+                let storage_refs = env
+                    .storage_ref
+                    .as_ref()
+                    .map(|reference| {
+                        vec![StorageRef {
+                            kind: "attachment".into(),
+                            object_ref: reference.object_ref.clone(),
+                            size_bytes: reference.size,
+                            mime_type: "application/octet-stream".into(),
+                            file_name: None,
+                            expires_at: None,
+                        }]
+                    })
+                    .unwrap_or_default();
                 let changed = stored.delivery_state != merged
-                    || stored.message_request_id != request_id
                     || stored.plaintext != plaintext_cache
-                    || stored.storage_refs != env.storage_refs;
+                    || stored.storage_refs != storage_refs;
                 stored.delivery_state = merged;
                 stored.message_request_id = request_id;
                 stored.plaintext = plaintext_cache.clone();
-                stored.storage_refs = env.storage_refs.clone();
-                stored.sender_user_id = Some(env.sender_user_id.clone());
-                stored.sender_device_id = env.sender_device_id.clone();
                 stored.recipient_device_id = env.recipient_device_id.clone();
+                if !storage_refs.is_empty() {
+                    stored.storage_refs = storage_refs;
+                }
                 changed
             } else {
+                let storage_refs = env
+                    .storage_ref
+                    .as_ref()
+                    .map(|reference| {
+                        vec![StorageRef {
+                            kind: "attachment".into(),
+                            object_ref: reference.object_ref.clone(),
+                            size_bytes: reference.size,
+                            mime_type: "application/octet-stream".into(),
+                            file_name: None,
+                            expires_at: None,
+                        }]
+                    })
+                    .unwrap_or_default();
                 conv.messages.push(crate::conversation::StoredMessage {
                     message_id: message_id.to_string(),
                     app_message_id: app_message_id.clone(),
                     mls_ciphertext_sha256: None,
-                    sender_user_id: Some(env.sender_user_id.clone()),
-                    sender_device_id: env.sender_device_id.clone(),
+                    sender_user_id: self
+                        .state
+                        .local_identity
+                        .as_ref()
+                        .map(|identity| identity.user_identity.user_id.clone()),
+                    sender_device_id: self
+                        .state
+                        .local_identity
+                        .as_ref()
+                        .map(|identity| identity.device_identity.device_id.clone())
+                        .unwrap_or_default(),
                     recipient_device_id: env.recipient_device_id.clone(),
-                    message_type: env.message_type,
-                    created_at: env.created_at,
+                    message_type: MessageType::MlsApplication,
+                    created_at: current_unix_millis(0),
                     plaintext: plaintext_cache.clone(),
-                    storage_refs: env.storage_refs.clone(),
+                    storage_refs,
                     delivery_state: Some(desired_delivery_state),
-                    message_request_id: (desired_delivery_state
-                        == crate::conversation::StoredMessageDeliveryState::PendingApproval)
-                        .then(|| result.request_id.clone())
-                        .flatten(),
+                    message_request_id: None,
                 });
-                conv.last_message_type = Some(env.message_type);
+                conv.last_message_type = Some(MessageType::MlsApplication);
                 true
             };
             if changed {
@@ -4280,37 +4239,30 @@ impl CoreEngine {
             changed
         });
 
-        let (status, message, banner) = match result.delivered_to {
-            AppendDeliveryDisposition::Inbox => {
-                return AppendDeliveryOutput {
-                    output: CoreOutput {
-                        state_update: CoreStateUpdate {
-                            messages_changed,
-                            conversations_changed: messages_changed,
-                            contacts_changed: contact_changed,
-                            ..CoreStateUpdate::default()
-                        },
-                        effects: vec![],
-                        view_model: Some(CoreViewModel {
-                            append_result: Some(append_result),
-                            contacts,
-                            ..CoreViewModel::default()
-                        }),
+        if result.accepted {
+            return AppendDeliveryOutput {
+                output: CoreOutput {
+                    state_update: CoreStateUpdate {
+                        messages_changed,
+                        conversations_changed: messages_changed,
+                        contacts_changed: contact_changed,
+                        ..CoreStateUpdate::default()
                     },
-                    saved_conversation_id,
-                };
-            }
-            AppendDeliveryDisposition::MessageRequest => (
-                SystemStatus::MessageQueuedForApproval,
-                "Your message is waiting for the contact to accept the request.".to_string(),
-                "Waiting for contact approval.".to_string(),
-            ),
-            AppendDeliveryDisposition::Rejected => (
-                SystemStatus::MessageRejectedByPolicy,
-                "The contact did not accept this message.".to_string(),
-                "Message not accepted by the contact.".to_string(),
-            ),
-        };
+                    effects: vec![],
+                    view_model: Some(CoreViewModel {
+                        append_result: Some(append_result),
+                        contacts,
+                        ..CoreViewModel::default()
+                    }),
+                },
+                saved_conversation_id,
+            };
+        }
+        let (status, message, banner) = (
+            SystemStatus::TemporaryNetworkFailure,
+            "TapChat could not confirm delivery.".to_string(),
+            "Delivery was not confirmed.".to_string(),
+        );
         AppendDeliveryOutput {
             output: CoreOutput {
                 state_update: CoreStateUpdate {
@@ -4392,7 +4344,7 @@ impl CoreEngine {
         }
         let message_ids = envelopes
             .iter()
-            .map(|envelope| envelope.message_id.clone())
+            .map(|envelope| envelope.mid.clone())
             .collect::<Vec<_>>();
         self.enqueue_envelopes(result.sender_user_id.clone(), envelopes);
         let mut output = CoreOutput {
@@ -4452,77 +4404,6 @@ impl CoreEngine {
             return Ok(merge_outputs(output, status_output));
         }
         Ok(status_output)
-    }
-
-    pub(super) fn allowlist_output(
-        &self,
-        document: AllowlistDocument,
-        _updated: bool,
-    ) -> CoreOutput {
-        CoreOutput {
-            state_update: CoreStateUpdate::default(),
-            effects: vec![],
-            view_model: Some(CoreViewModel {
-                allowlist: Some(document),
-                banners: Vec::new(),
-                ..CoreViewModel::default()
-            }),
-        }
-    }
-
-    pub(super) fn handle_allowlist_fetched(
-        &mut self,
-        mut document: AllowlistDocument,
-    ) -> CoreResult<CoreOutput> {
-        let Some(mutation) = self.state.pending_allowlist_mutation.take() else {
-            return Ok(self.allowlist_output(document, false));
-        };
-        match mutation {
-            PendingAllowlistMutation::Add { user_id } => {
-                if !document
-                    .allowed_sender_user_ids
-                    .iter()
-                    .any(|existing| existing == &user_id)
-                {
-                    document.allowed_sender_user_ids.push(user_id.clone());
-                    document.allowed_sender_user_ids.sort();
-                    document.allowed_sender_user_ids.dedup();
-                }
-                document
-                    .rejected_sender_user_ids
-                    .retain(|existing| existing != &user_id);
-            }
-            PendingAllowlistMutation::Remove { user_id } => {
-                document
-                    .allowed_sender_user_ids
-                    .retain(|existing| existing != &user_id);
-                document
-                    .rejected_sender_user_ids
-                    .retain(|existing| existing != &user_id);
-            }
-            PendingAllowlistMutation::RemoveMany { user_ids } => {
-                let user_ids = user_ids.into_iter().collect::<BTreeSet<_>>();
-                document
-                    .allowed_sender_user_ids
-                    .retain(|existing| !user_ids.contains(existing));
-                document
-                    .rejected_sender_user_ids
-                    .retain(|existing| !user_ids.contains(existing));
-            }
-        }
-        Ok(CoreOutput {
-            state_update: CoreStateUpdate::default(),
-            effects: vec![CoreEffect::ReplaceAllowlist {
-                update: ReplaceAllowlistRequest {
-                    device_id: self.local_device_id_required()?,
-                    endpoint: self.inbox_management_endpoint("allowlist")?,
-                    headers: BTreeMap::new(),
-                    auth: Some(self.device_runtime_auth_requirement()?),
-                    document,
-                },
-            }],
-            view_model: None,
-        })
     }
 }
 

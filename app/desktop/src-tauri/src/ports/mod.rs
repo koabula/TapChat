@@ -30,7 +30,7 @@ use tapchat_core::transport_contract::{
     BlobUploadRequest, ClaimGroupJoinRequest, ClaimGroupJoinResult, ClaimGroupLeaveRequest,
     ClaimGroupLeaveResult, CompleteGroupJoinRequest, CompleteGroupJoinResult,
     CreateGroupInviteRequest, CreateGroupInviteResult, DecideGroupJoinRequest,
-    DecideGroupJoinResult, FetchAllowlistRequest, FetchGroupInviteRequest, FetchGroupInviteResult,
+    DecideGroupJoinResult, FetchGroupInviteRequest, FetchGroupInviteResult,
     FetchGroupOutboxRequest, FetchGroupOutboxResult, FetchIdentityBundleRequest,
     FetchMessageRequestsRequest, FetchWelcomePickupRequest, FetchWelcomePickupResult,
     GetGroupAuthorizationStateRequest, GetGroupAuthorizationStateResult,
@@ -41,7 +41,8 @@ use tapchat_core::transport_contract::{
     ListGroupJoinRequestsResult, ListGroupLeaveRequestsRequest, ListGroupLeaveRequestsResult,
     MessageRequestActionRequest, PrepareBlobUploadRequest, PublishSharedStateRequest,
     PutWelcomePickupRequest, PutWelcomePickupResult, RealtimeSubscriptionRequest,
-    ReplaceAllowlistRequest, RevokeGroupInviteRequest, RevokeGroupInviteResult,
+    RegisterAcceptedLaneRequest, RevokeAcceptedLanesRequest, RevokeGroupInviteRequest,
+    RevokeGroupInviteResult,
     SealGroupOutboxRequest, SealGroupOutboxResult, SubmitGroupJoinRequest, SubmitGroupJoinResult,
     SubmitGroupLeaveRequest, SubmitGroupLeaveResult, TransportAuthRequirement,
 };
@@ -466,38 +467,38 @@ impl TransportPort for DesktopPlatformPorts {
         transport::act_on_message_request(&self.client, retry).await
     }
 
-    async fn fetch_allowlist(
+    async fn register_accepted_lane(
         &mut self,
-        mut fetch: FetchAllowlistRequest,
+        mut register: RegisterAcceptedLaneRequest,
     ) -> Result<Vec<CoreEvent>> {
-        let original = fetch.clone();
-        self.inject_runtime_authorization(&mut fetch.headers, fetch.auth.as_ref(), false)
+        let original = register.clone();
+        self.inject_runtime_authorization(&mut register.headers, register.auth.as_ref(), false)
             .await?;
-        let events = transport::fetch_allowlist(&self.client, fetch).await?;
+        let events = transport::register_accepted_lane(&self.client, register).await?;
         if !events_report_runtime_auth_expired(&events) {
             return Ok(events);
         }
         let mut retry = original;
         self.inject_runtime_authorization(&mut retry.headers, retry.auth.as_ref(), true)
             .await?;
-        transport::fetch_allowlist(&self.client, retry).await
+        transport::register_accepted_lane(&self.client, retry).await
     }
 
-    async fn replace_allowlist(
+    async fn revoke_accepted_lanes(
         &mut self,
-        mut update: ReplaceAllowlistRequest,
+        mut revoke: RevokeAcceptedLanesRequest,
     ) -> Result<Vec<CoreEvent>> {
-        let original = update.clone();
-        self.inject_runtime_authorization(&mut update.headers, update.auth.as_ref(), false)
+        let original = revoke.clone();
+        self.inject_runtime_authorization(&mut revoke.headers, revoke.auth.as_ref(), false)
             .await?;
-        let events = transport::replace_allowlist(&self.client, update).await?;
+        let events = transport::revoke_accepted_lanes(&self.client, revoke).await?;
         if !events_report_runtime_auth_expired(&events) {
             return Ok(events);
         }
         let mut retry = original;
         self.inject_runtime_authorization(&mut retry.headers, retry.auth.as_ref(), true)
             .await?;
-        transport::replace_allowlist(&self.client, retry).await
+        transport::revoke_accepted_lanes(&self.client, retry).await
     }
 
     async fn publish_shared_state(
@@ -1687,8 +1688,8 @@ fn events_report_runtime_auth_expired(events: &[CoreEvent]) -> bool {
     events.iter().any(|event| match event {
         CoreEvent::MessageRequestsFetchFailed { failure, .. }
         | CoreEvent::MessageRequestActionFailed { failure, .. }
-        | CoreEvent::AllowlistFetchFailed { failure, .. }
-        | CoreEvent::AllowlistReplaceFailed { failure, .. }
+        | CoreEvent::AcceptedLaneRegisterFailed { failure, .. }
+        | CoreEvent::AcceptedLanesRevokeFailed { failure, .. }
         | CoreEvent::BlobTransferFailed { failure, .. } => failure.code == "runtime_auth_expired",
         CoreEvent::SharedStatePublishFailed { failure, .. } => {
             failure.code == "runtime_auth_expired"

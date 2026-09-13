@@ -49,12 +49,6 @@ impl Default for AppendDeliveryDisposition {
 pub struct AppendEnvelopeResult {
     pub accepted: bool,
     pub seq: u64,
-    #[serde(default)]
-    pub delivered_to: AppendDeliveryDisposition,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub queued_as_request: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub request_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -710,14 +704,9 @@ pub struct MessageRequestActionResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AllowlistDocument {
-    pub allowed_sender_user_ids: Vec<String>,
-    pub rejected_sender_user_ids: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FetchAllowlistRequest {
+pub struct RegisterAcceptedLaneRequest {
     pub device_id: String,
+    pub lane: String,
     pub endpoint: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub headers: BTreeMap<String, String>,
@@ -726,14 +715,14 @@ pub struct FetchAllowlistRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReplaceAllowlistRequest {
+pub struct RevokeAcceptedLanesRequest {
     pub device_id: String,
+    pub lanes: Vec<String>,
     pub endpoint: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub headers: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<TransportAuthRequirement>,
-    pub document: AllowlistDocument,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -788,30 +777,12 @@ mod tests {
         let append = AppendEnvelopeRequest {
             version: CURRENT_MODEL_VERSION.to_string(),
             recipient_device_id: "device:bob:phone".into(),
-            envelope: Envelope {
-                version: CURRENT_MODEL_VERSION.to_string(),
-                message_id: "msg:1".into(),
-                conversation_id: "conv:alice:bob".into(),
-                sender_user_id: "user:alice".into(),
-                sender_device_id: "device:alice:phone".into(),
-                recipient_device_id: "device:bob:phone".into(),
-                created_at: 1,
-                message_type: MessageType::MlsApplication,
-                inline_ciphertext: Some("cipher".into()),
-                storage_refs: vec![StorageRef {
-                    kind: "attachment".into(),
-                    object_ref: "blob:1".into(),
-                    size_bytes: 1,
-                    mime_type: "application/octet-stream".into(),
-                    file_name: None,
-                    expires_at: Some(10),
-                }],
-                delivery_class: DeliveryClass::Normal,
-                sender_proof: SenderProof {
-                    proof_type: "signature".into(),
-                    value: "proof".into(),
-                },
-            },
+            envelope: Envelope::with_bytes(
+                "device:bob:phone",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "cipher",
+            ),
             sender_bundle_share_url: None,
             sender_bundle_hash: None,
             sender_display_name: None,
@@ -824,48 +795,42 @@ mod tests {
     }
 
     #[test]
-    fn append_result_round_trips_policy_outcome() {
+    fn append_result_round_trips_unified_acceptance() {
         let result = AppendEnvelopeResult {
             accepted: true,
-            seq: 0,
-            delivered_to: AppendDeliveryDisposition::MessageRequest,
-            queued_as_request: Some(true),
-            request_id: Some("request:user:alice".into()),
+            seq: 7,
         };
 
         let json = serde_json::to_string(&result).expect("serialize");
         let decoded: AppendEnvelopeResult = serde_json::from_str(&json).expect("deserialize");
 
-        assert_eq!(
-            decoded.delivered_to,
-            AppendDeliveryDisposition::MessageRequest
-        );
-        assert_eq!(decoded.queued_as_request, Some(true));
-        assert_eq!(decoded.request_id.as_deref(), Some("request:user:alice"));
+        assert!(decoded.accepted);
+        assert_eq!(decoded.seq, 7);
+        assert!(!json.contains("delivered"));
+        assert!(!json.contains("queued"));
+        assert!(!json.contains("request_id"));
     }
 
     #[test]
     fn management_contract_types_round_trip_without_platform_fields() {
-        let request = ReplaceAllowlistRequest {
+        let request = RegisterAcceptedLaneRequest {
             device_id: "device:bob:phone".into(),
-            endpoint: "https://transport.example/v1/inbox/device%3Abob%3Aphone/allowlist".into(),
+            lane: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            endpoint: "https://transport.example/v1/inbox/device%3Abob%3Aphone/accepted-lanes"
+                .into(),
             headers: BTreeMap::new(),
             auth: Some(TransportAuthRequirement::DeviceRuntime {
                 runtime_id: "runtime:test".into(),
                 device_id: "device:bob:phone".into(),
             }),
-            document: AllowlistDocument {
-                allowed_sender_user_ids: vec!["user:alice".into()],
-                rejected_sender_user_ids: vec!["user:mallory".into()],
-            },
         };
 
         let json = serde_json::to_string(&request).expect("serialize");
         assert!(!json.contains("cloudflare"));
         assert!(!json.contains("durable"));
 
-        let decoded: ReplaceAllowlistRequest = serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(decoded.document.allowed_sender_user_ids, vec!["user:alice"]);
+        let decoded: RegisterAcceptedLaneRequest = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded.lane, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
     }
 
     #[test]

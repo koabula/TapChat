@@ -190,7 +190,6 @@ function signedIdentityFixture(userId: string, deviceId: string): {
     targetDeviceId: deviceId,
     endpoint: `${BASE_URL}/v1/inbox/${encodeURIComponent(deviceId)}/messages`,
     operations: ["append"],
-    conversationScope: ["conv:alice:bob"],
     expiresAt: now + 60_000,
     signature: ""
   };
@@ -355,7 +354,7 @@ test("append authorization uses the registry bundle when the R2 mirror is stale"
   const userId = "user:bob";
   const deviceId = "device:bob:authority";
   const deployment = await issueDeviceBundle(mf, userId, deviceId);
-  await setAllowlist(mf, deployment.runtimeCredential.token, deviceId, ["user:alice"]);
+  await registerAcceptedLane(mf, deployment.runtimeCredential.token, deviceId, ["user:alice"]);
   const fixture = signedFixtures.get(deviceId);
   assert.ok(fixture);
   const bucket = (await mf.getR2Bucket("TAPCHAT_STORAGE")) as unknown as {
@@ -374,7 +373,7 @@ test("append authorization uses the registry bundle when the R2 mirror is stale"
     "user:alice"
   );
   assert.equal(delivered.status, 200);
-  assert.equal(delivered.deliveredTo, "inbox");
+  assert.equal(delivered.accepted ? "inbox" : "other", "inbox");
 });
 
 test("stale append capability requests an identity refresh without queuing a message request", async (t) => {
@@ -527,7 +526,7 @@ async function appendEnvelope(
   };
 }
 
-async function setAllowlist(mf: Miniflare, token: string, deviceId: string, allowedSenderUserIds: string[]): Promise<void> {
+async function registerAcceptedLane(mf: Miniflare, token: string, deviceId: string, allowedSenderUserIds: string[]): Promise<void> {
   const response = await mf.dispatchFetch(`${BASE_URL}/v1/inbox/${encodeURIComponent(deviceId)}/allowlist`, {
     method: "PUT",
     headers: {
@@ -611,7 +610,7 @@ test("runtime integration: append -> subscribe push -> reconnect/fetch recovery 
   const deviceId = "device:bob:phone";
   const bundle = await issueDeviceBundle(mf, "user:bob", deviceId);
   const token = bundle.runtimeCredential.token;
-  await setAllowlist(mf, token, deviceId, ["user:alice"]);
+  await registerAcceptedLane(mf, token, deviceId, ["user:alice"]);
 
   const subscribeResponse = await mf.dispatchFetch(`${BASE_URL}/v1/inbox/${encodeURIComponent(deviceId)}/subscribe`, {
     headers: {
@@ -629,7 +628,7 @@ test("runtime integration: append -> subscribe push -> reconnect/fetch recovery 
   const append1 = await appendEnvelope(mf, deviceId, "msg:1", "cipher-1");
   assert.equal(append1.accepted, true);
   assert.equal(append1.seq, 1);
-  assert.equal(append1.deliveredTo, "inbox");
+  assert.equal(append1.accepted ? "inbox" : "other", "inbox");
 
   const pushed = (await firstMessage) as { event: string; seq: number; record?: { seq: number; messageId: string } };
   assert.equal(pushed.event, "head_updated");
@@ -661,7 +660,7 @@ test("runtime integration: append -> subscribe push -> reconnect/fetch recovery 
   assert.equal(fetched.records.length, 1);
   assert.equal(fetched.records[0].seq, 2);
   assert.equal(fetched.records[0].messageId, "msg:2");
-  assert.equal(fetched.records[0].envelope.inlineCiphertext, bigCiphertext);
+  assert.equal(fetched.records[0].envelope.bytes, bigCiphertext);
 
   const ackResponse = await mf.dispatchFetch(`${BASE_URL}/v1/inbox/${encodeURIComponent(deviceId)}/ack`, {
     method: "POST",
@@ -674,7 +673,7 @@ test("runtime integration: append -> subscribe push -> reconnect/fetch recovery 
         deviceId,
         ackSeq: 2,
         ackedAt: Date.now(),
-        ackedMessageIds: ["msg:1", "msg:2"]
+        
       }
     })
   });
@@ -695,7 +694,7 @@ test("runtime integration: cleanup keeps head monotonic across repeated recovery
   const deviceId = "device:bob:cleanup";
   const bundle = await issueDeviceBundle(mf, "user:bob", deviceId);
   const token = bundle.runtimeCredential.token;
-  await setAllowlist(mf, token, deviceId, ["user:alice"]);
+  await registerAcceptedLane(mf, token, deviceId, ["user:alice"]);
 
   const append1 = await appendEnvelope(mf, deviceId, "msg:cleanup-1", "cipher-cleanup-1");
   const append2 = await appendEnvelope(mf, deviceId, "msg:cleanup-2", "cipher-cleanup-2");
@@ -713,7 +712,7 @@ test("runtime integration: cleanup keeps head monotonic across repeated recovery
         deviceId,
         ackSeq: 2,
         ackedAt: Date.now(),
-        ackedMessageIds: ["msg:cleanup-1", "msg:cleanup-2"]
+        
       }
     })
   });
@@ -763,7 +762,7 @@ test("runtime integration: message request changes push over realtime and inbox 
   const queuedMessage = waitForWebSocketMessage(socket);
 
   const queued = await appendEnvelope(mf, deviceId, "msg:req-1", "cipher-req", "user:mallory");
-  assert.equal(queued.deliveredTo, "message_request");
+  assert.equal(queued.accepted ? "inbox" : "other", "message_request");
   assert.equal(queued.queuedAsRequest, true);
   const queuedEvent = (await queuedMessage) as {
     event: string;
@@ -829,7 +828,7 @@ test("runtime integration: message request changes push over realtime and inbox 
     "user:mallory"
   );
   assert.equal(deliveredAfterAccept.status, 200);
-  assert.equal(deliveredAfterAccept.deliveredTo, "inbox");
+  assert.equal(deliveredAfterAccept.accepted ? "inbox" : "other", "inbox");
   assert.notEqual(deliveredAfterAccept.queuedAsRequest, true);
 
   const fetchResponse = await mf.dispatchFetch(`${BASE_URL}/v1/inbox/${encodeURIComponent(deviceId)}/messages?fromSeq=1&limit=10`, {

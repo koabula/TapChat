@@ -12,14 +12,15 @@ use crate::ffi_api::{
 use crate::transport_contract::{
     AppendGroupEnvelopeRequest, AppendGroupTransitionRequest, BlobDownloadRequest,
     BlobUploadRequest, ClaimGroupJoinRequest, ClaimGroupLeaveRequest, CompleteGroupJoinRequest,
-    CreateGroupInviteRequest, DecideGroupJoinRequest, FetchAllowlistRequest,
-    FetchGroupInviteRequest, FetchGroupOutboxRequest, FetchIdentityBundleRequest,
-    FetchMessageRequestsRequest, FetchWelcomePickupRequest, GetGroupAuthorizationStateRequest,
-    GetGroupJoinRequestStatusRequest, GetGroupOutboxHeadRequest, GroupRealtimeSubscriptionRequest,
+    CreateGroupInviteRequest, DecideGroupJoinRequest, FetchGroupInviteRequest,
+    FetchGroupOutboxRequest, FetchIdentityBundleRequest, FetchMessageRequestsRequest,
+    FetchWelcomePickupRequest, GetGroupAuthorizationStateRequest, GetGroupJoinRequestStatusRequest,
+    GetGroupOutboxHeadRequest, GroupRealtimeSubscriptionRequest,
     InitializeGroupAuthorizationRequest, ListGroupInvitesRequest, ListGroupJoinRequestsRequest,
     ListGroupLeaveRequestsRequest, MessageRequestActionRequest, PrepareBlobUploadRequest,
     PublishSharedStateRequest, PutWelcomePickupRequest, RealtimeSubscriptionRequest,
-    ReplaceAllowlistRequest, RevokeGroupInviteRequest, SealGroupOutboxRequest,
+    RegisterAcceptedLaneRequest, RevokeAcceptedLanesRequest, RevokeGroupInviteRequest,
+    SealGroupOutboxRequest,
     SubmitGroupJoinRequest, SubmitGroupLeaveRequest,
 };
 
@@ -44,11 +45,14 @@ pub trait TransportPort {
         action: MessageRequestActionRequest,
     ) -> Result<Vec<CoreEvent>>;
 
-    async fn fetch_allowlist(&mut self, fetch: FetchAllowlistRequest) -> Result<Vec<CoreEvent>>;
-
-    async fn replace_allowlist(
+    async fn register_accepted_lane(
         &mut self,
-        update: ReplaceAllowlistRequest,
+        register: RegisterAcceptedLaneRequest,
+    ) -> Result<Vec<CoreEvent>>;
+
+    async fn revoke_accepted_lanes(
+        &mut self,
+        revoke: RevokeAcceptedLanesRequest,
     ) -> Result<Vec<CoreEvent>>;
 
     async fn publish_shared_state(
@@ -313,8 +317,12 @@ where
             CoreEffect::ActOnMessageRequest { action } => {
                 ports.act_on_message_request(action).await
             }
-            CoreEffect::FetchAllowlist { fetch } => ports.fetch_allowlist(fetch).await,
-            CoreEffect::ReplaceAllowlist { update } => ports.replace_allowlist(update).await,
+            CoreEffect::RegisterAcceptedLane { register } => {
+                ports.register_accepted_lane(register).await
+            }
+            CoreEffect::RevokeAcceptedLanes { revoke } => {
+                ports.revoke_accepted_lanes(revoke).await
+            }
             CoreEffect::PublishSharedState { publish } => ports.publish_shared_state(publish).await,
             CoreEffect::OpenGroupRealtimeConnection { subscription } => {
                 ports.open_group_realtime(subscription).await
@@ -447,19 +455,19 @@ mod tests {
             Ok(Vec::new())
         }
 
-        async fn fetch_allowlist(
+        async fn register_accepted_lane(
             &mut self,
-            _fetch: FetchAllowlistRequest,
+            _register: RegisterAcceptedLaneRequest,
         ) -> Result<Vec<CoreEvent>> {
-            self.calls.push("fetch_allowlist");
+            self.calls.push("register_accepted_lane");
             Ok(Vec::new())
         }
 
-        async fn replace_allowlist(
+        async fn revoke_accepted_lanes(
             &mut self,
-            _update: ReplaceAllowlistRequest,
+            _revoke: RevokeAcceptedLanesRequest,
         ) -> Result<Vec<CoreEvent>> {
-            self.calls.push("replace_allowlist");
+            self.calls.push("revoke_accepted_lanes");
             Ok(Vec::new())
         }
 

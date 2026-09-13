@@ -39,7 +39,6 @@ impl CapabilityManager {
             target_device_id: local_identity.device_identity.device_id.clone(),
             endpoint,
             operations: vec![CapabilityOperation::Append],
-            conversation_scope: vec![],
             expires_at,
             constraints: Some(CapabilityConstraints {
                 max_bytes: Some(256 * 1024),
@@ -188,9 +187,9 @@ impl CapabilityManager {
 /// Every variable-length field is length-prefixed and every list carries a
 /// count, so no field value can shift a boundary. The previous encoding
 /// joined the fields with `|` and took two of them from Rust `Debug` output:
-/// an `endpoint` or a `conversation_scope` entry containing `|` could reframe
-/// the capability into a different one bearing the same signature, and the
-/// worker had to reconstruct `Debug` formatting by hand to verify anything.
+/// an `endpoint` containing `|` could reframe the capability into a different
+/// one bearing the same signature, and the worker had to reconstruct `Debug`
+/// formatting by hand to verify anything.
 ///
 /// `constraints` needs a presence byte of its own because it is an `Option`
 /// wrapping two more: the old encoding collapsed absent, empty and zero into
@@ -205,10 +204,6 @@ pub fn inbox_append_capability_payload(capability: &InboxAppendCapability) -> Si
     payload.push_u32(capability.operations.len() as u32);
     for operation in &capability.operations {
         payload.push_str(operation.wire_name());
-    }
-    payload.push_u32(capability.conversation_scope.len() as u32);
-    for conversation_id in &capability.conversation_scope {
-        payload.push_str(conversation_id);
     }
     payload.push_u64(capability.expires_at);
     match &capability.constraints {
@@ -241,7 +236,6 @@ mod tests {
             target_device_id: "device:alice:phone".into(),
             endpoint: "https://example.com/v1/inbox/device/messages".into(),
             operations: vec![CapabilityOperation::Append],
-            conversation_scope: vec![],
             expires_at: 1_775_004_800_000,
             constraints: Some(CapabilityConstraints {
                 max_bytes: Some(256 * 1024),
@@ -278,20 +272,6 @@ mod tests {
         right.target_device_id = "device:alice:phone".into();
 
         assert_ne!(payload_bytes(&left), payload_bytes(&right));
-    }
-
-    /// The scope list was `join(",")`, so one entry containing a comma and two
-    /// entries split on it were the same bytes. It is length-prefixed per
-    /// entry now.
-    #[test]
-    fn capability_scope_entries_cannot_be_merged() {
-        let mut joined = sample_capability();
-        joined.conversation_scope = vec!["conv:one,conv:two".into()];
-
-        let mut split = sample_capability();
-        split.conversation_scope = vec!["conv:one".into(), "conv:two".into()];
-
-        assert_ne!(payload_bytes(&joined), payload_bytes(&split));
     }
 
     /// Unlike the two above, these three states were already distinguishable

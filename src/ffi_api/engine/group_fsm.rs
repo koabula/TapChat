@@ -17,18 +17,9 @@ impl CoreEngine {
         )
     }
 
-    /// Build and sign an outbound envelope.
-    ///
-    /// The signature covers the canonical encoding of the whole envelope
-    /// header plus a hash of the payload (see
-    /// [`crate::model::signing::envelope_sender_proof_payload`]), not just the
-    /// payload. Signing the payload alone let a legitimately signed ciphertext
-    /// be re-appended under a different `conversation_id`, `message_id` or
-    /// `message_type` and still verify.
-    ///
-    /// Because the signature covers `storage_refs`, they must be supplied here
-    /// rather than assigned to the returned envelope: anything set after this
-    /// function returns is outside the signature.
+    /// Build a host-visible 1:1 envelope: lane, mid, recipient, bytes.
+    /// Welcome travels unwrapped. Every other MLS frame is wrapped under
+    /// the current epoch's exporter so the host never sees a group_id.
     pub(super) fn build_envelope_with_storage_refs(
         &mut self,
         conversation_id: &str,
@@ -37,40 +28,53 @@ impl CoreEngine {
         payload_b64: String,
         storage_refs: Vec<StorageRef>,
     ) -> CoreResult<Envelope> {
-        let identity = self
+        let mid = crate::model::random_opaque_id();
+        let lane = self
             .state
-            .local_identity
-            .as_ref()
-            .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))?
-            .clone();
-        let sender_user_id = identity.user_identity.user_id.clone();
-        let sender_device_id = identity.device_identity.device_id.clone();
-        let message_nonce = self.next_message_nonce();
-        let created_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(message_nonce);
-        let mut envelope = Envelope {
-            version: crate::model::CURRENT_MODEL_VERSION.to_string(),
-            message_id: self.next_message_id(conversation_id, recipient_device_id, message_nonce),
-            conversation_id: conversation_id.to_string(),
-            sender_user_id,
-            sender_device_id,
-            recipient_device_id: recipient_device_id.to_string(),
-            created_at,
-            message_type,
-            inline_ciphertext: Some(payload_b64),
-            storage_refs,
-            delivery_class: DeliveryClass::Normal,
-            sender_proof: SenderProof {
-                proof_type: "device_signature".into(),
-                value: String::new(),
-            },
+            .conversations
+            .get(conversation_id)
+            .and_then(|conversation| conversation.lanes.as_ref())
+            .map(|lanes| lanes.outbound_lane.clone())
+            .unwrap_or_else(crate::model::random_opaque_id);
+        let bytes = if message_type == MessageType::MlsWelcome {
+            payload_b64
+        } else {
+            self.wrap_outbound_frame(conversation_id, &payload_b64)?
         };
-        // Signed last, over the finished envelope.
-        envelope.sender_proof.value =
-            identity.sign_payload(envelope_sender_proof_payload(&envelope));
+        let mut envelope = Envelope::with_bytes(recipient_device_id, lane, mid, bytes);
+        if let Some(reference) = storage_refs.into_iter().next() {
+            envelope.storage_ref = Some(crate::model::EnvelopeStorageRef {
+                object_ref: reference.object_ref,
+                size: reference.size_bytes,
+            });
+        }
         Ok(envelope)
+    }
+
+    fn wrap_outbound_frame(
+        &mut self,
+        conversation_id: &str,
+        payload_b64: &str,
+    ) -> CoreResult<String> {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        let dir = self
+            .state
+            .conversations
+            .get(conversation_id)
+            .and_then(|conversation| conversation.lanes.as_ref())
+            .map(|lanes| lanes.outbound_dir)
+            .unwrap_or(crate::lane_wrap::WRAP_DIR_C1);
+        let adapter = self
+            .state
+            .mls_adapter
+            .as_mut()
+            .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?;
+        let key = adapter.export_lane_wrap_key(conversation_id, dir)?;
+        let frame = STANDARD.decode(payload_b64).map_err(|error| {
+            CoreError::invalid_input(format!("outbound MLS frame is not base64: {error}"))
+        })?;
+        let wrapped = crate::lane_wrap::wrap_frame(&key, &frame)?;
+        Ok(STANDARD.encode(wrapped))
     }
 
     pub(super) fn build_group_manifest(

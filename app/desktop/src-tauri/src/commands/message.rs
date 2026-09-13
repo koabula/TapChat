@@ -533,7 +533,7 @@ pub async fn send_text(
         .pending_outbox
         .iter()
         .find(|item| item.app_message_id.as_deref() == Some(&message_id))
-        .map(|item| item.envelope.created_at)
+        .map(|_| 0)
         .or_else(|| {
             snapshot
                 .conversations
@@ -2029,9 +2029,8 @@ async fn attachment_metadata_from_snapshot(
                 .pending_outbox
                 .iter()
                 .find(|item| {
-                    item.envelope.conversation_id == conversation_id
-                        && (item.envelope.message_id == message_id
-                            || item.app_message_id.as_deref() == Some(message_id))
+                    item.envelope.mid == message_id
+                        || item.app_message_id.as_deref() == Some(message_id)
                 })
                 .and_then(|item| item.plaintext_cache.as_deref())
                 .and_then(|plaintext| {
@@ -2372,9 +2371,8 @@ fn snapshot_has_attachment_metadata(
             .pending_outbox
             .iter()
             .find(|item| {
-                item.envelope.conversation_id == conversation_id
-                    && (item.envelope.message_id == message_id
-                        || item.app_message_id.as_deref() == Some(message_id))
+                item.envelope.mid == message_id
+                    || item.app_message_id.as_deref() == Some(message_id)
             })
             .and_then(|item| item.plaintext_cache.as_deref())
             .is_some_and(is_attachment_metadata)

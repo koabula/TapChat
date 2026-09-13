@@ -9,7 +9,6 @@
     "operations": [
       "append"
     ],
-    "conversationScope": [],
     "expiresAt": 1775004800000,
     "constraints": {
       "maxBytes": 262144,
@@ -35,7 +34,7 @@
     "expiresAt": 1775004800000
   },
   "expected": {
-    "inboxAppendCapabilitySha256": "ef59c2a508c08cb1990b02f0d60c9e506345d52b91dd01c24d4e80faf9cc38b3",
+    "inboxAppendCapabilitySha256": "5f7500b30f0ebb61fc6aaa6b202740e188300e777c63e163e2c547b5460d28d4",
     "deviceBindingSha256": "fbf03d7eec288e60e0425e6835522ed26c6588f3b371590e153b08543aef7e83",
     "deviceRuntimeChallengeSha256": "c2a6a0a3b823eac398bf80e5ac243e083a4aec3b60a159418cb6cc33f8567606"
   }

@@ -106,9 +106,7 @@ impl CoreEngine {
             effects: vec![persist_effect(&self.state, persist_ops)],
             view_model: None,
         };
-        if self.state.deployment_bundle.is_some() {
-            output = merge_outputs(output, self.add_allowlist_user(user_id)?);
-        }
+        let _ = user_id;
         Ok(output)
     }
 
@@ -1008,12 +1006,13 @@ impl CoreEngine {
             &peer_user_id,
             &peer_device_ids,
         )?;
+        let (c1, c2) = super::lanes::new_lane_pair();
         let artifacts = self
             .state
             .mls_adapter
             .as_mut()
             .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
-            .create_conversation(&conversation_id, &peer_keypackages)?;
+            .create_conversation_with_reply_lane(&conversation_id, &peer_keypackages, Some(&c2))?;
         let summary = self
             .state
             .mls_adapter
@@ -1026,7 +1025,9 @@ impl CoreEngine {
         self.state
             .conversations
             .insert(conversation_id.clone(), local_conversation);
+        self.assign_initiator_lanes(&conversation_id, c1, c2.clone());
         self.initialize_direct_pcs_from_mls(&conversation_id)?;
+        let register_c2 = self.register_accepted_lane(c2)?;
 
         let mut generated = Vec::new();
         for device_id in &peer_device_ids {
@@ -1054,41 +1055,44 @@ impl CoreEngine {
                 conversation_id: conversation_id.clone(),
             },
         ];
-        self.merge_with_transport_flush(CoreOutput {
-            state_update: CoreStateUpdate {
-                conversations_changed: true,
-                messages_changed: true,
-                ..CoreStateUpdate::default()
+        self.merge_with_transport_flush(merge_outputs(
+            register_c2,
+            CoreOutput {
+                state_update: CoreStateUpdate {
+                    conversations_changed: true,
+                    messages_changed: true,
+                    ..CoreStateUpdate::default()
+                },
+                effects: vec![persist_effect(&self.state, persist_ops)],
+                view_model: Some(CoreViewModel {
+                    conversations: vec![ConversationSummary {
+                        conversation_id: conversation_id.clone(),
+                        peer_user_id: peer_user_id.clone(),
+                        state: "active".into(),
+                        kind: Some(ConversationKind::Direct),
+                        title: None,
+                        display_name: self.contact_archive_display_name(&peer_user_id),
+                        group_id: None,
+                        member_count: None,
+                        group_role: None,
+                        group_cursor: None,
+                        last_message_preview: None,
+                        last_message_type: Some(MessageType::MlsCommit),
+                        message_count: None,
+                        recovery: None,
+                    }],
+                    messages: generated
+                        .iter()
+                        .map(|envelope| MessageSummary {
+                            conversation_id: conversation_id.clone(),
+                            message_id: envelope.mid.clone(),
+                            message_type: MessageType::MlsWelcome,
+                        })
+                        .collect(),
+                    ..CoreViewModel::default()
+                }),
             },
-            effects: vec![persist_effect(&self.state, persist_ops)],
-            view_model: Some(CoreViewModel {
-                conversations: vec![ConversationSummary {
-                    conversation_id,
-                    peer_user_id: peer_user_id.clone(),
-                    state: "active".into(),
-                    kind: Some(ConversationKind::Direct),
-                    title: None,
-                    display_name: self.contact_archive_display_name(&peer_user_id),
-                    group_id: None,
-                    member_count: None,
-                    group_role: None,
-                    group_cursor: None,
-                    last_message_preview: None,
-                    last_message_type: Some(MessageType::MlsCommit),
-                    message_count: None,
-                    recovery: None,
-                }],
-                messages: generated
-                    .iter()
-                    .map(|envelope| MessageSummary {
-                        conversation_id: envelope.conversation_id.clone(),
-                        message_id: envelope.message_id.clone(),
-                        message_type: envelope.message_type,
-                    })
-                    .collect(),
-                ..CoreViewModel::default()
-            }),
-        })
+        ))
     }
 
     pub(super) fn send_text_message(
@@ -1112,6 +1116,7 @@ impl CoreEngine {
         let app_message_nonce = self.next_message_nonce();
         let app_message_id =
             self.next_app_message_id(&conversation_id, &sender_device_id, app_message_nonce);
+        let sent_at = current_unix_millis(app_message_nonce);
         let protected_message = ProtectedAppMessage::new_text(
             app_message_id.clone(),
             conversation_id.clone(),
@@ -1120,6 +1125,7 @@ impl CoreEngine {
             peer_user_id.clone(),
             recipient_device_ids.clone(),
             plaintext.clone(),
+            sent_at,
         )?;
         let protected_bytes = protected_message.to_json_bytes()?;
         let payload = self
@@ -1487,13 +1493,10 @@ impl CoreEngine {
 
     pub(super) fn new_direct_relationship_conversation_id(
         &mut self,
-        local_user_id: &str,
-        peer_user_id: &str,
+        _local_user_id: &str,
+        _peer_user_id: &str,
     ) -> String {
-        let mut parts = [local_user_id.to_string(), peer_user_id.to_string()];
-        parts.sort();
-        let nonce = self.next_message_nonce();
-        format!("conv:{}:{}:rel:{}", parts[0], parts[1], nonce)
+        crate::model::random_opaque_id()
     }
 
     pub(super) fn migrate_legacy_removed_relationships(&mut self) -> CoreResult<CoreOutput> {
@@ -1739,28 +1742,41 @@ impl CoreEngine {
                 reason: "MLS sender identity is malformed".into(),
             };
         };
-        if mls_sender.user_id != record.envelope.sender_user_id
-            || mls_sender.device_id != record.envelope.sender_device_id
-        {
+        let Some(conversation_id) = self.conversation_id_for_lane(&record.envelope.lane) else {
             return ApplicationPlaintextDecision::RejectedProtocol {
-                reason: "MLS sender identity does not match envelope sender".into(),
+                reason: "envelope lane does not match a local conversation".into(),
+            };
+        };
+        let Some(peer_user_id) = self
+            .state
+            .conversations
+            .get(&conversation_id)
+            .map(|conversation| conversation.peer_user_id.clone())
+        else {
+            return ApplicationPlaintextDecision::RejectedProtocol {
+                reason: "envelope lane does not match a local conversation".into(),
+            };
+        };
+        if mls_sender.user_id != peer_user_id {
+            return ApplicationPlaintextDecision::RejectedProtocol {
+                reason: "MLS sender identity does not match conversation peer".into(),
             };
         }
 
         match ProtectedAppMessage::from_json_slice(&application.plaintext) {
             Ok(protected) => {
-                if protected.sender_user_id != record.envelope.sender_user_id
-                    || protected.sender_device_id != record.envelope.sender_device_id
-                    || protected.sender_user_id != mls_sender.user_id
+                if protected.sender_user_id != mls_sender.user_id
                     || protected.sender_device_id != mls_sender.device_id
+                    || protected.sender_user_id != peer_user_id
                 {
                     return ApplicationPlaintextDecision::RejectedProtocol {
-                        reason: "protected sender does not match MLS/envelope sender".into(),
+                        reason: "protected sender does not match MLS sender".into(),
                     };
                 }
-                if protected.conversation_id != record.envelope.conversation_id {
+                if protected.conversation_id != conversation_id {
                     return ApplicationPlaintextDecision::RejectedProtocol {
-                        reason: "protected conversation_id does not match envelope".into(),
+                        reason: "protected conversation_id does not match local conversation"
+                            .into(),
                     };
                 }
                 if protected.recipient_user_id != local_user_id {
@@ -1782,6 +1798,12 @@ impl CoreEngine {
                         reason: "local device is not in protected audience".into(),
                     };
                 }
+                if protected.payload_kind == ProtectedPayloadKind::LaneRotation {
+                    return ApplicationPlaintextDecision::Accepted {
+                        plaintext: String::new(),
+                        app_message_id: Some(protected.app_message_id),
+                    };
+                }
                 if protected.payload_kind != ProtectedPayloadKind::Text {
                     return ApplicationPlaintextDecision::RejectedProtocol {
                         reason: "unsupported protected payload kind".into(),
@@ -1797,10 +1819,7 @@ impl CoreEngine {
                             .into(),
                     };
                 }
-                if self.conversation_has_app_message(
-                    &record.envelope.conversation_id,
-                    &protected.app_message_id,
-                ) {
+                if self.conversation_has_app_message(&conversation_id, &protected.app_message_id) {
                     return ApplicationPlaintextDecision::DuplicateAppMessage {
                         app_message_id: protected.app_message_id,
                     };
@@ -1880,11 +1899,38 @@ impl CoreEngine {
         app_message_id: Option<String>,
         mls_ciphertext_sha256: String,
     ) -> CoreResult<bool> {
-        let conversation_id = &record.envelope.conversation_id;
+        if plaintext.is_empty() {
+            return Ok(false);
+        }
+        let conversation_id = self
+            .conversation_id_for_lane(&record.envelope.lane)
+            .ok_or_else(|| CoreError::invalid_input("conversation does not exist"))?;
+        let peer_user_id = self
+            .state
+            .conversations
+            .get(&conversation_id)
+            .map(|conversation| conversation.peer_user_id.clone())
+            .ok_or_else(|| CoreError::invalid_input("conversation does not exist"))?;
+        let created_at = current_unix_millis(record.seq);
+        let storage_refs = record
+            .envelope
+            .storage_ref
+            .as_ref()
+            .map(|reference| {
+                vec![StorageRef {
+                    kind: "overflow".into(),
+                    object_ref: reference.object_ref.clone(),
+                    size_bytes: reference.size,
+                    mime_type: "application/octet-stream".into(),
+                    file_name: None,
+                    expires_at: None,
+                }]
+            })
+            .unwrap_or_default();
         let state = self
             .state
             .conversations
-            .get_mut(conversation_id)
+            .get_mut(&conversation_id)
             .ok_or_else(|| CoreError::invalid_input("conversation does not exist"))?;
         let duplicate = state.messages.iter().any(|message| {
             message.message_id == record.message_id
@@ -1899,21 +1945,18 @@ impl CoreEngine {
             message_id: record.message_id.clone(),
             app_message_id,
             mls_ciphertext_sha256: Some(mls_ciphertext_sha256),
-            sender_user_id: Some(record.envelope.sender_user_id.clone()),
-            sender_device_id: record.envelope.sender_device_id.clone(),
+            sender_user_id: Some(peer_user_id),
+            sender_device_id: String::new(),
             recipient_device_id: record.envelope.recipient_device_id.clone(),
-            message_type: record.envelope.message_type,
-            created_at: record.envelope.created_at,
+            message_type: MessageType::MlsApplication,
+            created_at,
             plaintext: Some(plaintext),
-            storage_refs: record.envelope.storage_refs.clone(),
+            storage_refs,
             delivery_state: None,
             message_request_id: None,
         });
-        state.last_message_type = Some(record.envelope.message_type);
-        state.conversation.updated_at = record.envelope.created_at;
-        state
-            .last_known_peer_active_devices
-            .insert(record.envelope.sender_device_id.clone());
+        state.last_message_type = Some(MessageType::MlsApplication);
+        state.conversation.updated_at = created_at;
         Ok(true)
     }
 
@@ -2416,20 +2459,23 @@ impl CoreEngine {
         self.state.mls_summaries.remove(conversation_id);
         self.state.recovery_contexts.remove(conversation_id);
 
+        let matching_outbox_lanes: Vec<String> = self
+            .state
+            .pending_outbox
+            .iter()
+            .map(|item| item.envelope.lane.clone())
+            .filter(|lane| self.conversation_id_for_lane(lane).as_deref() == Some(conversation_id))
+            .collect();
         let removed_outbox_message_ids: Vec<String> = self
             .state
             .pending_outbox
             .iter()
-            .filter(|item| {
-                item.envelope.conversation_id == conversation_id
-                    && item.envelope.message_type != MessageType::ControlContactRemoved
-            })
-            .map(|item| item.envelope.message_id.clone())
+            .filter(|item| matching_outbox_lanes.contains(&item.envelope.lane))
+            .map(|item| item.envelope.mid.clone())
             .collect();
-        self.state.pending_outbox.retain(|item| {
-            item.envelope.conversation_id != conversation_id
-                || item.envelope.message_type == MessageType::ControlContactRemoved
-        });
+        self.state
+            .pending_outbox
+            .retain(|item| !matching_outbox_lanes.contains(&item.envelope.lane));
 
         let removed_blob_task_ids: Vec<String> = self
             .state
@@ -2456,18 +2502,20 @@ impl CoreEngine {
             .state
             .pending_acks
             .iter()
-            .filter(|(_, ack)| {
-                ack.ack
-                    .acked_message_ids
-                    .iter()
-                    .any(|message_id| conversation_message_ids.contains(message_id))
-            })
+            .filter(|(_, ack)| conversation_message_ids.contains(&ack.ack.device_id))
             .map(|(device_id, _)| device_id.clone())
             .collect();
         for device_id in &removed_ack_device_ids {
             self.state.pending_acks.remove(device_id);
         }
 
+        let inbound_lanes = self
+            .state
+            .conversations
+            .get(conversation_id)
+            .and_then(|conversation| conversation.lanes.as_ref())
+            .map(|lanes| BTreeSet::from([lanes.inbound_lane.clone(), lanes.outbound_lane.clone()]))
+            .unwrap_or_default();
         let changed_sync_device_ids: Vec<String> = self
             .state
             .sync_states
@@ -2476,7 +2524,7 @@ impl CoreEngine {
                 let before = sync_state.quarantine.len();
                 sync_state
                     .quarantine
-                    .retain(|_, record| record.envelope.conversation_id != conversation_id);
+                    .retain(|_, record| !inbound_lanes.contains(&record.envelope.lane));
                 (sync_state.quarantine.len() != before).then(|| device_id.clone())
             })
             .collect();
@@ -2520,43 +2568,12 @@ impl CoreEngine {
         &mut self,
         peer_user_id: &str,
         conversation_id: &str,
-        created_at: u64,
+        _created_at: u64,
     ) -> CoreResult<Vec<Envelope>> {
-        let Some(contact) = self.state.contacts.get(peer_user_id) else {
-            return Ok(Vec::new());
-        };
-        let peer_device_ids = contact
-            .bundle
-            .devices
-            .iter()
-            .filter(|device| matches!(device.status, DeviceStatusKind::Active))
-            .map(|device| device.device_id.clone())
-            .collect::<Vec<_>>();
-        if peer_device_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        let local_user_id = self.local_identity_user_id()?;
-        let payload = ContactRemovedControl {
-            version: crate::model::CURRENT_MODEL_VERSION.to_string(),
-            conversation_id: conversation_id.to_string(),
-            actor_user_id: local_user_id,
-            removed_user_id: peer_user_id.to_string(),
-            created_at,
-        };
-        let payload_b64 = STANDARD.encode(serde_json::to_vec(&payload).map_err(|error| {
-            CoreError::invalid_input(format!("failed to encode contact removed control: {error}"))
-        })?);
-        peer_device_ids
-            .iter()
-            .map(|device_id| {
-                self.build_envelope(
-                    conversation_id,
-                    device_id,
-                    MessageType::ControlContactRemoved,
-                    payload_b64.clone(),
-                )
-            })
-            .collect()
+        let _ = (peer_user_id, conversation_id);
+        // Control envelopes are no longer expressible on the 1:1 wire.
+        // Submit 2 carries them as MLS payload_kind.
+        Ok(Vec::new())
     }
 
     pub(super) fn contact_accepted_conversation_ids(
@@ -2590,51 +2607,13 @@ impl CoreEngine {
     pub(super) fn build_contact_accepted_envelopes(
         &mut self,
         peer_user_id: &str,
-        request_id: &str,
-        promoted_conversation_ids: &[String],
-        created_at: u64,
+        _request_id: &str,
+        _promoted_conversation_ids: &[String],
+        _created_at: u64,
     ) -> CoreResult<Vec<Envelope>> {
-        let Some(contact) = self.state.contacts.get(peer_user_id) else {
-            return Ok(Vec::new());
-        };
-        let peer_device_ids = contact
-            .bundle
-            .devices
-            .iter()
-            .filter(|device| matches!(device.status, DeviceStatusKind::Active))
-            .map(|device| device.device_id.clone())
-            .collect::<Vec<_>>();
-        if peer_device_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        let local_user_id = self.local_identity_user_id()?;
-        let conversation_ids =
-            self.contact_accepted_conversation_ids(peer_user_id, promoted_conversation_ids)?;
-        let mut envelopes = Vec::new();
-        for conversation_id in conversation_ids {
-            let payload = ContactAcceptedControl {
-                version: crate::model::CURRENT_MODEL_VERSION.to_string(),
-                conversation_id: conversation_id.clone(),
-                actor_user_id: local_user_id.clone(),
-                accepted_user_id: peer_user_id.to_string(),
-                request_id: request_id.to_string(),
-                created_at,
-            };
-            let payload_b64 = STANDARD.encode(serde_json::to_vec(&payload).map_err(|error| {
-                CoreError::invalid_input(format!(
-                    "failed to encode contact accepted control: {error}"
-                ))
-            })?);
-            for device_id in &peer_device_ids {
-                envelopes.push(self.build_envelope(
-                    &conversation_id,
-                    device_id,
-                    MessageType::ControlContactAccepted,
-                    payload_b64.clone(),
-                )?);
-            }
-        }
-        Ok(envelopes)
+        let _ = peer_user_id;
+        // Control envelopes are no longer expressible on the 1:1 wire.
+        Ok(Vec::new())
     }
 
     pub(super) fn direct_relationship_open_for_record(
@@ -2697,79 +2676,41 @@ impl CoreEngine {
 
     pub(super) fn should_ignore_closed_relationship_record(
         &self,
-        local_user_id: &str,
+        _local_user_id: &str,
         record: &InboxRecord,
     ) -> bool {
-        if record.envelope.message_type == MessageType::ControlContactRemoved {
+        let Some(conversation_id) = self.conversation_id_for_lane(&record.envelope.lane) else {
             return false;
-        }
-        let peer_user_id = record.envelope.sender_user_id.as_str();
-        if peer_user_id == local_user_id {
+        };
+        let Some(conversation) = self.state.conversations.get(&conversation_id) else {
             return false;
-        }
+        };
         let contact_removed = self
             .state
             .contacts
-            .get(peer_user_id)
+            .get(&conversation.peer_user_id)
             .is_some_and(|contact| Self::relationship_is_removed(&contact.relationship_status));
-        let conversation_closed = self
-            .state
-            .conversations
-            .get(&record.envelope.conversation_id)
-            .is_some_and(|conversation| {
-                matches!(
-                    conversation.conversation.state,
-                    ConversationState::Closed | ConversationState::Archived
-                )
-            });
+        let conversation_closed = matches!(
+            conversation.conversation.state,
+            ConversationState::Closed | ConversationState::Archived
+        );
         contact_removed || conversation_closed
     }
 
     pub(super) fn should_ignore_idempotent_contact_removed_record(
         &self,
-        local_user_id: &str,
-        record: &InboxRecord,
+        _local_user_id: &str,
+        _record: &InboxRecord,
     ) -> bool {
-        if record.envelope.message_type != MessageType::ControlContactRemoved {
-            return false;
-        }
-        let peer_user_id = record.envelope.sender_user_id.as_str();
-        if peer_user_id == local_user_id || self.state.contacts.contains_key(peer_user_id) {
-            return false;
-        }
-        self.state
-            .conversations
-            .get(&record.envelope.conversation_id)
-            .map(|conversation| {
-                conversation.conversation.kind == ConversationKind::Direct
-                    && conversation.peer_user_id == peer_user_id
-                    && matches!(
-                        conversation.conversation.state,
-                        ConversationState::Closed | ConversationState::Archived
-                    )
-            })
-            .unwrap_or(true)
+        false
     }
 
     pub(super) fn should_ignore_contact_accepted_record(
         &self,
-        local_user_id: &str,
-        record: &InboxRecord,
+        _local_user_id: &str,
+        _record: &InboxRecord,
     ) -> bool {
-        if record.envelope.message_type != MessageType::ControlContactAccepted {
-            return false;
-        }
-        let peer_user_id = record.envelope.sender_user_id.as_str();
-        if peer_user_id == local_user_id {
-            return true;
-        }
-        let Some(contact) = self.state.contacts.get(peer_user_id) else {
-            return true;
-        };
-        if Self::relationship_is_removed(&contact.relationship_status) {
-            return true;
-        }
-        false
+        true
     }
 
     pub(super) fn ensure_archived_direct_conversation_for_control(
@@ -2814,232 +2755,19 @@ impl CoreEngine {
 
     pub(super) fn handle_contact_removed_record(
         &mut self,
-        local_user_id: &str,
-        local_device_id: &str,
-        record: &InboxRecord,
+        _local_user_id: &str,
+        _local_device_id: &str,
+        _record: &InboxRecord,
     ) -> CoreResult<CoreOutput> {
-        let envelope = &record.envelope;
-        let payload_b64 = envelope.inline_ciphertext.as_deref().ok_or_else(|| {
-            CoreError::invalid_input("contact removed control is missing payload")
-        })?;
-        self.verify_device_signature(
-            &envelope.sender_user_id,
-            &envelope.sender_device_id,
-            envelope_sender_proof_payload(envelope),
-            &envelope.sender_proof.value,
-        )?;
-        let payload = STANDARD.decode(payload_b64).map_err(|error| {
-            CoreError::invalid_input(format!("failed to decode contact removed control: {error}"))
-        })?;
-        let control: ContactRemovedControl = serde_json::from_slice(&payload).map_err(|error| {
-            CoreError::invalid_input(format!("failed to parse contact removed control: {error}"))
-        })?;
-        if control.conversation_id != envelope.conversation_id {
-            return Err(CoreError::invalid_input(
-                "contact removed control conversation_id mismatch",
-            ));
-        }
-        if control.actor_user_id != envelope.sender_user_id {
-            return Err(CoreError::invalid_input(
-                "contact removed control actor_user_id mismatch",
-            ));
-        }
-        if control.removed_user_id != local_user_id {
-            return Err(CoreError::invalid_input(
-                "contact removed control is not addressed to local user",
-            ));
-        }
-
-        let peer_user_id = envelope.sender_user_id.clone();
-        if !self.state.contacts.contains_key(&peer_user_id) {
-            return Err(CoreError::invalid_input("peer contact is missing"));
-        }
-
-        let peer_label = self.contact_label(&peer_user_id);
-        let created_conversation = self.ensure_archived_direct_conversation_for_control(
-            &envelope.conversation_id,
-            &peer_user_id,
-            local_user_id,
-            local_device_id,
-        )?;
-        let system_message = StoredMessage {
-            message_id: envelope.message_id.clone(),
-            app_message_id: None,
-            mls_ciphertext_sha256: None,
-            sender_user_id: Some(peer_user_id.clone()),
-            sender_device_id: envelope.sender_device_id.clone(),
-            recipient_device_id: envelope.recipient_device_id.clone(),
-            message_type: MessageType::ControlContactRemoved,
-            created_at: envelope.created_at,
-            plaintext: Some(format!("{peer_label} removed you. This chat was archived.")),
-            storage_refs: Vec::new(),
-            delivery_state: None,
-            message_request_id: None,
-        };
-        let message_summary = self.archive_conversation_with_message(
-            &envelope.conversation_id,
-            system_message,
-            "removed_by_peer",
-        );
-        self.state.contacts.remove(&peer_user_id);
-        let mut persist_ops = vec![PersistOp::DeleteContact {
-            user_id: peer_user_id.clone(),
-        }];
-        persist_ops.extend(self.clear_direct_runtime_state(&envelope.conversation_id)?);
-        persist_ops.push(PersistOp::SaveConversation {
-            conversation_id: envelope.conversation_id.clone(),
-        });
-
-        let mut output = CoreOutput {
-            state_update: CoreStateUpdate {
-                contacts_changed: true,
-                conversations_changed: true,
-                messages_changed: message_summary.is_some(),
-                ..CoreStateUpdate::default()
-            },
-            effects: vec![persist_effect(&self.state, persist_ops)],
-            view_model: Some(CoreViewModel {
-                contacts: self.contact_summaries(),
-                messages: message_summary.into_iter().collect(),
-                ..CoreViewModel::default()
-            }),
-        };
-        if self.state.deployment_bundle.is_some() {
-            output = merge_outputs(output, self.remove_allowlist_user(peer_user_id)?);
-        }
-        if created_conversation {
-            log::info!(
-                "handle_contact_removed_record: created archived direct conversation shell {}",
-                envelope.conversation_id
-            );
-        }
-        Ok(output)
+        Ok(CoreOutput::default())
     }
 
     pub(super) fn handle_contact_accepted_record(
         &mut self,
-        local_user_id: &str,
-        record: &InboxRecord,
+        _local_user_id: &str,
+        _record: &InboxRecord,
     ) -> CoreResult<CoreOutput> {
-        let envelope = &record.envelope;
-        if self.should_ignore_contact_accepted_record(local_user_id, record) {
-            log::info!(
-                "handle_contact_accepted_record: acking and ignoring ControlContactAccepted for non-open relationship conversation_id={} sender_user_id={} message_id={}",
-                envelope.conversation_id,
-                envelope.sender_user_id,
-                record.message_id
-            );
-            return Ok(CoreOutput::default());
-        }
-
-        let payload_b64 = envelope.inline_ciphertext.as_deref().ok_or_else(|| {
-            CoreError::invalid_input("contact accepted control is missing payload")
-        })?;
-        self.verify_device_signature(
-            &envelope.sender_user_id,
-            &envelope.sender_device_id,
-            envelope_sender_proof_payload(envelope),
-            &envelope.sender_proof.value,
-        )?;
-        let payload = STANDARD.decode(payload_b64).map_err(|error| {
-            CoreError::invalid_input(format!(
-                "failed to decode contact accepted control: {error}"
-            ))
-        })?;
-        let control: ContactAcceptedControl =
-            serde_json::from_slice(&payload).map_err(|error| {
-                CoreError::invalid_input(format!(
-                    "failed to parse contact accepted control: {error}"
-                ))
-            })?;
-        if control.conversation_id != envelope.conversation_id {
-            return Err(CoreError::invalid_input(
-                "contact accepted control conversation_id mismatch",
-            ));
-        }
-        if control.actor_user_id != envelope.sender_user_id {
-            return Err(CoreError::invalid_input(
-                "contact accepted control actor_user_id mismatch",
-            ));
-        }
-        if control.accepted_user_id != local_user_id {
-            return Err(CoreError::invalid_input(
-                "contact accepted control is not addressed to local user",
-            ));
-        }
-        if control.request_id.trim().is_empty() {
-            return Err(CoreError::invalid_input(
-                "contact accepted control request_id is empty",
-            ));
-        }
-        let exact_conversation_is_open = self.direct_relationship_open_for_record(
-            &envelope.sender_user_id,
-            &envelope.conversation_id,
-        );
-        let request_matches_local_message = self.state.conversations.values().any(|conversation| {
-            conversation.conversation.kind == ConversationKind::Direct
-                && conversation.peer_user_id == envelope.sender_user_id
-                && conversation.messages.iter().any(|message| {
-                    message.message_request_id.as_deref() == Some(control.request_id.as_str())
-                })
-        });
-        if !exact_conversation_is_open && !request_matches_local_message {
-            log::info!(
-                "handle_contact_accepted_record: acking and ignoring unmatched accepted control conversation_id={} sender_user_id={} message_id={}",
-                envelope.conversation_id,
-                envelope.sender_user_id,
-                record.message_id
-            );
-            return Ok(CoreOutput::default());
-        }
-
-        let mut output = self.promote_pending_outbound_contact(
-            &envelope.sender_user_id,
-            "contact_accepted_control",
-        )?;
-        let mut changed_conversations = Vec::new();
-        for (conversation_id, conversation) in &mut self.state.conversations {
-            if conversation.conversation.kind != ConversationKind::Direct
-                || conversation.peer_user_id != envelope.sender_user_id
-            {
-                continue;
-            }
-            let mut changed = false;
-            for message in &mut conversation.messages {
-                if message.message_request_id.as_deref() == Some(control.request_id.as_str())
-                    && message.delivery_state
-                        == Some(crate::conversation::StoredMessageDeliveryState::PendingApproval)
-                {
-                    message.delivery_state =
-                        Some(crate::conversation::StoredMessageDeliveryState::Sent);
-                    changed = true;
-                }
-            }
-            if changed {
-                changed_conversations.push(conversation_id.clone());
-            }
-        }
-        if !changed_conversations.is_empty() {
-            output = merge_outputs(
-                output,
-                CoreOutput {
-                    state_update: CoreStateUpdate {
-                        messages_changed: true,
-                        conversations_changed: true,
-                        ..CoreStateUpdate::default()
-                    },
-                    effects: vec![persist_effect(
-                        &self.state,
-                        changed_conversations
-                            .into_iter()
-                            .map(|conversation_id| PersistOp::SaveConversation { conversation_id })
-                            .collect(),
-                    )],
-                    view_model: None,
-                },
-            );
-        }
-        Ok(output)
+        Ok(CoreOutput::default())
     }
 
     pub(super) fn delete_contact(&mut self, user_id: String) -> CoreResult<CoreOutput> {
@@ -3056,23 +2784,36 @@ impl CoreEngine {
                 .pending_outbox
                 .iter()
                 .filter(|item| item.peer_user_id == user_id)
-                .map(|item| item.envelope.conversation_id.clone()),
+                .filter_map(|item| self.conversation_id_for_lane(&item.envelope.lane)),
+        );
+        conversation_ids.extend(
+            self.state
+                .mls_summaries
+                .keys()
+                .filter(|conversation_id| {
+                    self.state
+                        .conversations
+                        .get(*conversation_id)
+                        .is_some_and(|conversation| conversation.peer_user_id == user_id)
+                })
+                .cloned(),
         );
         conversation_ids.sort();
         conversation_ids.dedup();
-        let control_conversation_id = conversation_ids
-            .first()
-            .cloned()
-            .unwrap_or_else(|| direct_conversation_id(&local_user_id, &user_id));
+        let control_conversation_id = conversation_ids.first().cloned().unwrap_or_default();
         let control_created_at = current_unix_millis(self.next_message_nonce());
-        let control_envelopes = self.build_contact_removed_envelopes(
-            &user_id,
-            &control_conversation_id,
-            control_created_at,
-        )?;
+        let control_envelopes = if control_conversation_id.is_empty() {
+            Vec::new()
+        } else {
+            self.build_contact_removed_envelopes(
+                &user_id,
+                &control_conversation_id,
+                control_created_at,
+            )?
+        };
         let control_message_ids = control_envelopes
             .iter()
-            .map(|envelope| envelope.message_id.clone())
+            .map(|envelope| envelope.mid.clone())
             .collect::<Vec<_>>();
 
         let mut persist_ops: Vec<PersistOp> = Vec::new();
@@ -3101,10 +2842,6 @@ impl CoreEngine {
                 });
             }
         }
-        if conversation_ids.is_empty() {
-            persist_ops.extend(self.clear_direct_runtime_state(&control_conversation_id)?);
-        }
-
         self.enqueue_envelopes(user_id.clone(), control_envelopes.clone());
         persist_ops.extend(
             control_message_ids
@@ -3149,23 +2886,9 @@ impl CoreEngine {
         peer_user_id: &str,
         peer_active_device_ids: &[String],
     ) -> CoreResult<Vec<Envelope>> {
-        let payload = format!(
-            "membership_changed:{}:{}:{}",
-            conversation_id,
-            peer_user_id,
-            peer_active_device_ids.len()
-        );
-        peer_active_device_ids
-            .iter()
-            .map(|device_id| {
-                self.build_envelope(
-                    conversation_id,
-                    device_id,
-                    MessageType::ControlDeviceMembershipChanged,
-                    payload.clone(),
-                )
-            })
-            .collect()
+        let _ = (conversation_id, peer_user_id, peer_active_device_ids);
+        // Control envelopes are no longer expressible on the 1:1 wire.
+        Ok(Vec::new())
     }
 
     pub(super) fn commit_envelopes_for_artifacts(
@@ -3334,6 +3057,8 @@ impl CoreEngine {
         // the pending commit is consumed.
         let peer_user_id = self.peer_user_for_conversation(conversation_id)?;
         let recipient_device_ids = self.recipient_device_ids(conversation_id)?;
+        let outbound_prev = self.export_outbound_wrap_key(conversation_id)?;
+        self.snapshot_wrap_prev(conversation_id)?;
         let rotated = self
             .state
             .mls_adapter
@@ -3359,18 +3084,82 @@ impl CoreEngine {
                 now_ms,
             );
         }
-        let envelopes = recipient_device_ids
-            .iter()
-            .map(|device_id| {
-                self.build_envelope(
+        let mut envelopes = Vec::new();
+        for device_id in &recipient_device_ids {
+            let mut envelope = self.build_envelope(
+                conversation_id,
+                device_id,
+                MessageType::MlsCommit,
+                rotated.commit_b64.clone(),
+            )?;
+            // `build_envelope` wraps with the post-merge key. The peer is
+            // still on the previous epoch, so re-wrap with the outbound key
+            // we exported before the self-update.
+            let frame = STANDARD
+                .decode(rotated.commit_b64.as_bytes())
+                .map_err(|error| {
+                    CoreError::invalid_input(format!("PCS commit is not base64: {error}"))
+                })?;
+            envelope.bytes =
+                Some(STANDARD.encode(crate::lane_wrap::wrap_frame(&outbound_prev, &frame)?));
+            envelopes.push(envelope);
+        }
+        self.enqueue_envelopes(peer_user_id.clone(), envelopes);
+        let rotation_lanes = self
+            .state
+            .conversations
+            .get(conversation_id)
+            .and_then(|conversation| conversation.lanes.clone());
+        let rotation_identity = self.state.local_identity.clone();
+        let rotation_bundle = self.state.local_bundle.clone();
+        if let (Some(lanes), Some(identity), Some(bundle)) =
+            (rotation_lanes, rotation_identity, rotation_bundle)
+        {
+            let nonce = self.next_message_nonce();
+            let sent_at = current_unix_millis(nonce);
+            let rotation = crate::model::ProtectedAppMessage::new_lane_rotation(
+                self.next_app_message_id(
                     conversation_id,
-                    device_id,
-                    MessageType::MlsCommit,
-                    rotated.commit_b64.clone(),
-                )
-            })
-            .collect::<CoreResult<Vec<_>>>()?;
-        self.enqueue_envelopes(peer_user_id, envelopes);
+                    &identity.device_identity.device_id,
+                    nonce,
+                ),
+                conversation_id.to_string(),
+                identity.user_identity.user_id.clone(),
+                identity.device_identity.device_id.clone(),
+                peer_user_id.clone(),
+                recipient_device_ids.clone(),
+                lanes.inbound_lane,
+                bundle.identity_bundle_ref.clone().unwrap_or_default(),
+                sent_at,
+            );
+            if let Ok(rotation) = rotation {
+                if let Ok(bytes) = rotation.to_json_bytes() {
+                    if let Ok(payload) = self
+                        .state
+                        .mls_adapter
+                        .as_mut()
+                        .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))
+                        .and_then(|adapter| adapter.encrypt_application(conversation_id, &bytes))
+                    {
+                        let mut rotation_envelopes = Vec::new();
+                        for device_id in &recipient_device_ids {
+                            rotation_envelopes.push(self.build_envelope(
+                                conversation_id,
+                                device_id,
+                                MessageType::MlsApplication,
+                                payload.payload_b64.clone(),
+                            )?);
+                        }
+                        self.enqueue_envelopes_with_plaintext(
+                            peer_user_id,
+                            rotation_envelopes,
+                            String::new(),
+                            Some(rotation.app_message_id.clone()),
+                        );
+                    }
+                }
+            }
+        }
         Ok(true)
     }
 
@@ -3390,11 +3179,13 @@ impl CoreEngine {
         if !self.conversation_is_direct(conversation_id) {
             return Ok(None);
         }
-        let payload_b64 = record
-            .envelope
-            .inline_ciphertext
-            .as_deref()
-            .unwrap_or_default();
+        let Some(payload_b64) = self.unwrap_inbound_bytes(
+            conversation_id,
+            record.envelope.payload_b64().unwrap_or_default(),
+        ) else {
+            return Ok(None);
+        };
+        let payload_b64 = payload_b64.as_str();
         let (Ok(incoming_epoch), Ok(incoming_hash)) = (
             MlsAdapter::protocol_message_epoch(payload_b64),
             commit_hash_from_b64(payload_b64),
@@ -3450,9 +3241,13 @@ impl CoreEngine {
             },
         ];
         ops.extend(self.state.pending_outbox.iter().filter_map(|item| {
-            if item.envelope.conversation_id == conversation_id {
+            if self
+                .conversation_id_for_lane(&item.envelope.lane)
+                .as_deref()
+                == Some(conversation_id)
+            {
                 Some(PersistOp::SaveOutgoingEnvelope {
-                    message_id: item.envelope.message_id.clone(),
+                    message_id: item.envelope.mid.clone(),
                 })
             } else {
                 None

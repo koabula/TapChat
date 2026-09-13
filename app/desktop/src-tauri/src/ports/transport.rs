@@ -1,7 +1,7 @@
 //! Transport port stub implementations
 //!
 //! These functions implement the TransportPort methods that were previously stubs.
-//! They handle HTTP requests to the backend for message requests, allowlist, and shared state.
+//! They handle HTTP requests to the backend for message requests, accepted lanes, and shared state.
 
 use anyhow::Result;
 use reqwest::Client;
@@ -9,8 +9,8 @@ use reqwest::Client;
 use tapchat_core::ffi_api::CoreEvent;
 use tapchat_core::model::IdentityBundle;
 use tapchat_core::transport_contract::{
-    FetchAllowlistRequest, FetchMessageRequestsRequest, MessageRequestAction,
-    MessageRequestActionRequest, PublishSharedStateRequest, ReplaceAllowlistRequest,
+    FetchMessageRequestsRequest, MessageRequestAction, MessageRequestActionRequest,
+    PublishSharedStateRequest, RegisterAcceptedLaneRequest, RevokeAcceptedLanesRequest,
 };
 use tapchat_core::{AppErrorV1, ErrorDomain, RecoveryAction};
 
@@ -223,71 +223,77 @@ pub async fn act_on_message_request(
     }
 }
 
-/// Fetch allowlist from backend.
-pub async fn fetch_allowlist(
+pub async fn register_accepted_lane(
     client: &Client,
-    fetch: FetchAllowlistRequest,
+    register: RegisterAcceptedLaneRequest,
 ) -> Result<Vec<CoreEvent>> {
-    let mut request = client.get(&fetch.endpoint);
-    for (key, value) in &fetch.headers {
+    let endpoint = format!(
+        "{}/{}",
+        register.endpoint.trim_end_matches('/'),
+        register.lane
+    );
+    let mut request = client.put(endpoint);
+    for (key, value) in &register.headers {
         request = request.header(key, value);
     }
 
     match request.send().await {
         Ok(response) if response.status().is_success() => {
-            let body = response.text().await?;
-            let document = serde_json::from_str(&to_snake_case_json_string(&body)?)?;
-            Ok(vec![CoreEvent::AllowlistFetched { document }])
+            Ok(vec![CoreEvent::AcceptedLaneRegistered {
+                lane: register.lane,
+            }])
         }
         Ok(response) => {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            Ok(vec![CoreEvent::AllowlistFetchFailed {
+            Ok(vec![CoreEvent::AcceptedLaneRegisterFailed {
+                lane: register.lane,
                 failure: AppErrorV1::from_http_response(status.as_u16(), &body),
             }])
         }
-        Err(_error) => Ok(vec![CoreEvent::AllowlistFetchFailed {
+        Err(_error) => Ok(vec![CoreEvent::AcceptedLaneRegisterFailed {
+            lane: register.lane,
             failure: AppErrorV1::network_unavailable(),
         }]),
     }
 }
 
-/// Replace allowlist on backend.
-pub async fn replace_allowlist(
+pub async fn revoke_accepted_lanes(
     client: &Client,
-    update: ReplaceAllowlistRequest,
+    revoke: RevokeAcceptedLanesRequest,
 ) -> Result<Vec<CoreEvent>> {
-    let mut request = client.put(&update.endpoint);
-    for (key, value) in &update.headers {
-        request = request.header(key, value);
+    let mut last_ok = true;
+    let mut last_failure = None;
+    for lane in &revoke.lanes {
+        let endpoint = format!("{}/{}", revoke.endpoint.trim_end_matches('/'), lane);
+        let mut request = client.delete(endpoint);
+        for (key, value) in &revoke.headers {
+            request = request.header(key, value);
+        }
+        match request.send().await {
+            Ok(response) if response.status().is_success() => {}
+            Ok(response) => {
+                last_ok = false;
+                last_failure = Some(AppErrorV1::from_http_response(
+                    response.status().as_u16(),
+                    &response.text().await.unwrap_or_default(),
+                ));
+            }
+            Err(_error) => {
+                last_ok = false;
+                last_failure = Some(AppErrorV1::network_unavailable());
+            }
+        }
     }
-
-    let body = serde_json::to_string(&serde_json::json!({
-        "allowedSenderUserIds": update.document.allowed_sender_user_ids,
-        "rejectedSenderUserIds": update.document.rejected_sender_user_ids,
-    }))?;
-
-    match request
-        .header("Content-Type", "application/json")
-        .body(body)
-        .send()
-        .await
-    {
-        Ok(response) if response.status().is_success() => {
-            let body = response.text().await?;
-            let document = serde_json::from_str(&to_snake_case_json_string(&body)?)?;
-            Ok(vec![CoreEvent::AllowlistReplaced { document }])
-        }
-        Ok(response) => {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            Ok(vec![CoreEvent::AllowlistReplaceFailed {
-                failure: AppErrorV1::from_http_response(status.as_u16(), &body),
-            }])
-        }
-        Err(_error) => Ok(vec![CoreEvent::AllowlistReplaceFailed {
-            failure: AppErrorV1::network_unavailable(),
-        }]),
+    if last_ok {
+        Ok(vec![CoreEvent::AcceptedLanesRevoked {
+            lanes: revoke.lanes,
+        }])
+    } else {
+        Ok(vec![CoreEvent::AcceptedLanesRevokeFailed {
+            lanes: revoke.lanes,
+            failure: last_failure.unwrap_or_else(AppErrorV1::network_unavailable),
+        }])
     }
 }
 

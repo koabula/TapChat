@@ -13,6 +13,7 @@ pub mod ffi_api;
 pub(crate) mod fs_util;
 pub mod group_pcs;
 pub mod identity;
+pub mod lane_wrap;
 #[cfg(test)]
 mod leakage_ledger;
 pub mod local_store;

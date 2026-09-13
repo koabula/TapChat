@@ -3,6 +3,7 @@ mod group_commands;
 mod group_fsm;
 mod group_sync;
 mod keypackage_claim;
+mod lanes;
 mod recovery;
 mod transport;
 
@@ -36,8 +37,7 @@ use crate::mls_adapter::{
     MlsAdapter, PeerDeviceKeyPackage, RejectReason, RemoveMembersArtifacts, WelcomeAuthor,
 };
 use crate::model::signing::{
-    envelope_sender_proof_payload, group_envelope_sender_proof_payload, SignatureDomain,
-    SigningPayload,
+    group_envelope_sender_proof_payload, SignatureDomain, SigningPayload,
 };
 use crate::model::{
     Ack, CapabilityService, Conversation, ConversationKind, ConversationMember, ConversationState,
@@ -64,11 +64,11 @@ use crate::persistence::{
 };
 use crate::sync_engine::{SyncDecision, SyncEngine};
 use crate::transport_contract::{
-    AckRequest, AckResult, AllowlistDocument, AppendDeliveryDisposition, AppendEnvelopeRequest,
+    AckRequest, AckResult, AppendDeliveryDisposition, AppendEnvelopeRequest,
     AppendEnvelopeResult, AppendGroupEnvelopeRequest, AppendGroupEnvelopeResult,
     AppendGroupTransitionRequest, BlobDownloadRequest, BlobUploadRequest, ClaimGroupJoinRequest,
     ClaimGroupLeaveRequest, CompleteGroupJoinRequest, CreateGroupInviteRequest,
-    DecideGroupJoinRequest, DeviceStatusDocument, DeviceStatusRecord, FetchAllowlistRequest,
+    DecideGroupJoinRequest, DeviceStatusDocument, DeviceStatusRecord, RegisterAcceptedLaneRequest,
     FetchGroupInviteRequest, FetchGroupOutboxRequest, FetchGroupOutboxResult,
     FetchIdentityBundleRequest, FetchMessageRequestsRequest, FetchMessagesRequest,
     FetchMessagesResult, FetchWelcomePickupRequest, FetchWelcomePickupResult,
@@ -78,7 +78,7 @@ use crate::transport_contract::{
     ListGroupLeaveRequestsRequest, MessageRequestAction, MessageRequestActionRequest,
     MessageRequestActionResult, MessageRequestItem, PrepareBlobUploadRequest,
     PrepareBlobUploadResult, PublishSharedStateRequest, PutWelcomePickupRequest,
-    PutWelcomePickupResult, RealtimeSubscriptionRequest, ReplaceAllowlistRequest,
+    PutWelcomePickupResult, RealtimeSubscriptionRequest, RevokeAcceptedLanesRequest,
     RevokeGroupInviteRequest, SealGroupOutboxRequest, SharedStateDocumentKind,
     SubmitGroupJoinRequest, SubmitGroupLeaveRequest, TransportAuthRequirement,
 };
@@ -718,6 +718,7 @@ impl CoreEngine {
                     .map(|deployment| deployment.deployment_bundle.clone()),
                 contacts,
                 conversations,
+                lane_index: BTreeMap::new(),
                 sync_states,
                 outbox,
                 pending_outbox,
@@ -832,6 +833,7 @@ impl CoreEngine {
             );
         }
 
+        engine.rebuild_lane_index();
         Ok(engine)
     }
 
@@ -1270,9 +1272,7 @@ impl CoreEngine {
             CoreCommand::ActOnMessageRequest { request_id, action } => {
                 self.act_on_message_request(request_id, action)
             }
-            CoreCommand::ListAllowlist => self.list_allowlist(),
-            CoreCommand::AddAllowlistUser { user_id } => self.add_allowlist_user(user_id),
-            CoreCommand::RemoveAllowlistUser { user_id } => self.remove_allowlist_user(user_id),
+            CoreCommand::RevokeContact { user_id } => self.revoke_contact_lanes(user_id),
             CoreCommand::CreateAdditionalDeviceIdentity {
                 mnemonic,
                 device_name,
@@ -1412,8 +1412,8 @@ impl CoreEngine {
                 }],
                 view_model: None,
             }),
-            CoreEvent::AllowlistFetched { document } => self.handle_allowlist_fetched(document),
-            CoreEvent::AllowlistFetchFailed { failure: _ } => Ok(CoreOutput {
+            CoreEvent::AcceptedLaneRegistered { .. } => Ok(CoreOutput::default()),
+            CoreEvent::AcceptedLaneRegisterFailed { lane: _, failure: _ } => Ok(CoreOutput {
                 state_update: CoreStateUpdate {
                     system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
                     ..CoreStateUpdate::default()
@@ -1421,13 +1421,13 @@ impl CoreEngine {
                 effects: vec![CoreEffect::EmitUserNotification {
                     notification: UserNotificationEffect {
                         status: SystemStatus::TemporaryNetworkFailure,
-                        message: "TapChat couldn't refresh the allowlist. Try again.".into(),
+                        message: "TapChat couldn't register the inbox lane. Try again.".into(),
                     },
                 }],
                 view_model: None,
             }),
-            CoreEvent::AllowlistReplaced { document } => Ok(self.allowlist_output(document, true)),
-            CoreEvent::AllowlistReplaceFailed { failure: _ } => Ok(CoreOutput {
+            CoreEvent::AcceptedLanesRevoked { .. } => Ok(CoreOutput::default()),
+            CoreEvent::AcceptedLanesRevokeFailed { lanes: _, failure: _ } => Ok(CoreOutput {
                 state_update: CoreStateUpdate {
                     system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
                     ..CoreStateUpdate::default()
@@ -1435,7 +1435,7 @@ impl CoreEngine {
                 effects: vec![CoreEffect::EmitUserNotification {
                     notification: UserNotificationEffect {
                         status: SystemStatus::TemporaryNetworkFailure,
-                        message: "TapChat couldn't update the allowlist. Try again.".into(),
+                        message: "TapChat couldn't revoke the contact. Try again.".into(),
                     },
                 }],
                 view_model: None,
@@ -3149,7 +3149,7 @@ fn build_persistence_snapshot(state: &CoreState) -> CorePersistenceSnapshot {
             .pending_outbox
             .iter()
             .map(|item| PersistedOutgoingEnvelope {
-                message_id: item.envelope.message_id.clone(),
+                message_id: item.envelope.mid.clone(),
                 envelope: item.envelope.clone(),
                 peer_user_id: item.peer_user_id.clone(),
                 retries: item.retries,
@@ -3332,8 +3332,8 @@ fn merge_outputs(mut base: CoreOutput, mut next: CoreOutput) -> CoreOutput {
             base_view
                 .operation_results
                 .append(&mut next_view.operation_results);
-            if next_view.allowlist.is_some() {
-                base_view.allowlist = next_view.allowlist.take();
+            if next_view.revoked_contact_user_id.is_some() {
+                base_view.revoked_contact_user_id = next_view.revoked_contact_user_id.take();
             }
             if next_view.message_request_action.is_some() {
                 base_view.message_request_action = next_view.message_request_action.take();
@@ -3376,32 +3376,67 @@ mod protected_application_message_tests {
         format!("{user_id}|{device_id}")
     }
 
+    const SAMPLE_LANE: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
     fn sample_record() -> InboxRecord {
         InboxRecord {
             seq: 1,
             recipient_device_id: "device:bob:phone".into(),
-            message_id: "msg:conv:alice:bob:1:device:bob:phone".into(),
+            message_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
             received_at: 1,
             expires_at: None,
             state: InboxRecordState::Available,
-            envelope: Envelope {
-                version: CURRENT_MODEL_VERSION.to_string(),
-                message_id: "msg:conv:alice:bob:1:device:bob:phone".into(),
-                conversation_id: "conv:alice:bob".into(),
-                sender_user_id: "user:alice".into(),
-                sender_device_id: "device:alice:phone".into(),
-                recipient_device_id: "device:bob:phone".into(),
-                created_at: 1,
-                message_type: MessageType::MlsApplication,
-                inline_ciphertext: Some("cipher".into()),
-                storage_refs: Vec::new(),
-                delivery_class: DeliveryClass::Normal,
-                sender_proof: SenderProof {
-                    proof_type: "signature".into(),
-                    value: "proof".into(),
-                },
-            },
+            envelope: Envelope::with_bytes(
+                "device:bob:phone",
+                SAMPLE_LANE,
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "cipher",
+            ),
         }
+    }
+
+    fn seed_direct_conversation(engine: &mut CoreEngine) {
+        engine.state.conversations.insert(
+            "conv:alice:bob".into(),
+            LocalConversationState {
+                conversation: Conversation {
+                    conversation_id: "conv:alice:bob".into(),
+                    kind: ConversationKind::Direct,
+                    member_users: vec!["user:alice".into(), "user:bob".into()],
+                    member_devices: vec![
+                        ConversationMember {
+                            user_id: "user:alice".into(),
+                            device_id: "device:alice:phone".into(),
+                            status: DeviceStatusKind::Active,
+                        },
+                        ConversationMember {
+                            user_id: "user:bob".into(),
+                            device_id: "device:bob:phone".into(),
+                            status: DeviceStatusKind::Active,
+                        },
+                    ],
+                    state: ConversationState::Active,
+                    updated_at: 1,
+                },
+                messages: Vec::new(),
+                last_message_type: Some(MessageType::MlsApplication),
+                peer_user_id: "user:alice".into(),
+                last_known_peer_active_devices: Default::default(),
+                recovery_status: RecoveryStatus::Healthy,
+                archive_metadata: None,
+                pcs: Default::default(),
+                lanes: Some(crate::conversation::ConversationLanes {
+                    inbound_lane: SAMPLE_LANE.into(),
+                    outbound_lane: "cccccccccccccccccccccccccccccccc".into(),
+                    outbound_dir: crate::lane_wrap::WRAP_DIR_C2,
+                    wrap_prev: None,
+                }),
+            },
+        );
+        engine
+            .state
+            .lane_index
+            .insert(SAMPLE_LANE.into(), "conv:alice:bob".into());
     }
 
     #[test]
@@ -3409,8 +3444,8 @@ mod protected_application_message_tests {
         let mut engine = CoreEngine::default();
         let mut second = sample_record();
         second.seq = 2;
-        second.message_id = "msg:conv:alice:bob:2:device:bob:phone".into();
-        second.envelope.message_id = second.message_id.clone();
+        second.message_id = "cccccccccccccccccccccccccccccccc".into();
+        second.envelope.mid = second.message_id.clone();
         let first = sample_record();
 
         let error = engine
@@ -3430,6 +3465,7 @@ mod protected_application_message_tests {
             "user:bob".into(),
             audience,
             "hello protected".into(),
+            1,
         )
         .expect("protected message")
         .to_json_bytes()
@@ -3450,7 +3486,8 @@ mod protected_application_message_tests {
 
     #[test]
     fn protected_wrapper_accepts_body_and_app_message_id() {
-        let engine = CoreEngine::default();
+        let mut engine = CoreEngine::default();
+        seed_direct_conversation(&mut engine);
         let record = sample_record();
         let decision = engine.evaluate_direct_application_plaintext(
             &record,
@@ -3480,7 +3517,8 @@ mod protected_application_message_tests {
 
     #[test]
     fn protected_wrapper_rejects_context_mismatch() {
-        let engine = CoreEngine::default();
+        let mut engine = CoreEngine::default();
+        seed_direct_conversation(&mut engine);
         let record = sample_record();
         let sender_mismatch = engine.evaluate_direct_application_plaintext(
             &record,
@@ -3516,50 +3554,27 @@ mod protected_application_message_tests {
     #[test]
     fn duplicate_app_message_id_is_not_accepted_again() {
         let mut engine = CoreEngine::default();
-        engine.state.conversations.insert(
-            "conv:alice:bob".into(),
-            LocalConversationState {
-                conversation: Conversation {
-                    conversation_id: "conv:alice:bob".into(),
-                    kind: ConversationKind::Direct,
-                    member_users: vec!["user:alice".into(), "user:bob".into()],
-                    member_devices: vec![
-                        ConversationMember {
-                            user_id: "user:alice".into(),
-                            device_id: "device:alice:phone".into(),
-                            status: DeviceStatusKind::Active,
-                        },
-                        ConversationMember {
-                            user_id: "user:bob".into(),
-                            device_id: "device:bob:phone".into(),
-                            status: DeviceStatusKind::Active,
-                        },
-                    ],
-                    state: ConversationState::Active,
-                    updated_at: 1,
-                },
-                messages: vec![StoredMessage {
-                    message_id: "msg:existing".into(),
-                    app_message_id: Some("app:conv:alice:bob:1:device:alice:phone".into()),
-                    mls_ciphertext_sha256: None,
-                    sender_user_id: Some("user:alice".into()),
-                    sender_device_id: "device:alice:phone".into(),
-                    recipient_device_id: "device:bob:phone".into(),
-                    message_type: MessageType::MlsApplication,
-                    created_at: 1,
-                    plaintext: Some("hello protected".into()),
-                    storage_refs: Vec::new(),
-                    delivery_state: None,
-                    message_request_id: None,
-                }],
-                last_message_type: Some(MessageType::MlsApplication),
-                peer_user_id: "user:alice".into(),
-                last_known_peer_active_devices: Default::default(),
-                recovery_status: RecoveryStatus::Healthy,
-                archive_metadata: None,
-                pcs: Default::default(),
-            },
-        );
+        seed_direct_conversation(&mut engine);
+        engine
+            .state
+            .conversations
+            .get_mut("conv:alice:bob")
+            .expect("seeded conversation")
+            .messages
+            .push(StoredMessage {
+                message_id: "msg:existing".into(),
+                app_message_id: Some("app:conv:alice:bob:1:device:alice:phone".into()),
+                mls_ciphertext_sha256: None,
+                sender_user_id: Some("user:alice".into()),
+                sender_device_id: "device:alice:phone".into(),
+                recipient_device_id: "device:bob:phone".into(),
+                message_type: MessageType::MlsApplication,
+                created_at: 1,
+                plaintext: Some("hello protected".into()),
+                storage_refs: Vec::new(),
+                delivery_state: None,
+                message_request_id: None,
+            });
 
         let decision = engine.evaluate_direct_application_plaintext(
             &sample_record(),
@@ -3579,7 +3594,8 @@ mod protected_application_message_tests {
 
     #[test]
     fn legacy_plaintext_is_accepted_but_malformed_wrapper_is_rejected() {
-        let engine = CoreEngine::default();
+        let mut engine = CoreEngine::default();
+        seed_direct_conversation(&mut engine);
         let record = sample_record();
         let legacy = engine.evaluate_direct_application_plaintext(
             &record,

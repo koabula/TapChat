@@ -81,24 +81,28 @@ const sentinelsIn = (value: string): string[] =>
     .sort();
 
 /** Every key template, paired with the real builder rendered on sentinel input. */
+const LANE = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const MID = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
 const RENDERED: ReadonlyArray<{ surface: string; template: string; key: string }> = [
   { surface: "inbox_do_key", template: "meta", key: INBOX_DO_KEYS.meta },
-  { surface: "inbox_do_key", template: "allowlist", key: INBOX_DO_KEYS.allowlist },
+  { surface: "inbox_do_key", template: "accepted-lane:{lane}", key: INBOX_DO_KEYS.acceptedLane(LANE) },
+  { surface: "inbox_do_key", template: "lane-seq:{lane}", key: INBOX_DO_KEYS.laneSeq(LANE) },
   { surface: "inbox_do_key", template: "record:{seq}", key: INBOX_DO_KEYS.record(7) },
   {
     surface: "inbox_do_key",
-    template: "idempotency:{messageId}",
-    key: INBOX_DO_KEYS.idempotency(messageId)
+    template: "idempotency:{mid}",
+    key: INBOX_DO_KEYS.idempotency(MID)
   },
   {
     surface: "inbox_do_key",
-    template: "append-result:{messageId}",
-    key: INBOX_DO_KEYS.appendResult(messageId)
+    template: "append-result:{mid}",
+    key: INBOX_DO_KEYS.appendResult(MID)
   },
   {
     surface: "inbox_do_key",
-    template: "message-request:{senderUserId}",
-    key: INBOX_DO_KEYS.messageRequest(senderUserId)
+    template: "message-request:{lane}",
+    key: INBOX_DO_KEYS.messageRequest(LANE)
   },
   {
     surface: "inbox_do_key",
@@ -117,8 +121,13 @@ const RENDERED: ReadonlyArray<{ surface: string; template: string; key: string }
   },
   {
     surface: "inbox_do_key",
-    template: "rate-limit:{senderUserId}",
-    key: INBOX_DO_KEYS.rateLimit(senderUserId)
+    template: "rate-limit:{lane}",
+    key: INBOX_DO_KEYS.rateLimit(LANE)
+  },
+  {
+    surface: "inbox_do_key",
+    template: "rate-limit:first-contact",
+    key: INBOX_DO_KEYS.rateLimitFirstContact
   },
   {
     surface: "r2_key",
