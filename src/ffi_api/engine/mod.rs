@@ -35,7 +35,10 @@ use crate::mls_adapter::{
     CreateConversationArtifacts, DecryptedApplicationMessage, DeferReason, IngestResult,
     MlsAdapter, PeerDeviceKeyPackage, RejectReason, RemoveMembersArtifacts, WelcomeAuthor,
 };
-use crate::model::signing::{envelope_sender_proof_payload, SignatureDomain, SigningPayload};
+use crate::model::signing::{
+    envelope_sender_proof_payload, group_envelope_sender_proof_payload, SignatureDomain,
+    SigningPayload,
+};
 use crate::model::{
     Ack, CapabilityService, Conversation, ConversationKind, ConversationMember, ConversationState,
     DeliveryClass, DeviceStatusKind, Envelope, GroupCapability, GroupCursor, GroupEnvelope,
@@ -1010,9 +1013,6 @@ impl CoreEngine {
             .local_identity
             .as_ref()
             .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))?;
-        event_envelope.sender_proof.value = identity.sign_payload(
-            Self::group_envelope_sender_proof_payload(&encrypted_event.payload_b64),
-        );
         proof.state_event_message_id = Some(event_envelope.message_id.clone());
         proof.signature = identity.sign_payload(Self::membership_proof_payload(&proof));
         proof.validate()?;
@@ -1024,7 +1024,7 @@ impl CoreEngine {
         }
         event_envelope.membership_proof = Some(proof.clone());
         let capability = self.group_capability_for_state(&proposed)?;
-        self.enqueue_group_envelope(event_envelope, capability, Some(event_plaintext));
+        self.enqueue_group_envelope(&mut event_envelope, capability, Some(event_plaintext))?;
         let new_items: Vec<_> = self.state.pending_group_outbox[pending_start..].to_vec();
         let welcomes: Vec<PutWelcomePickupRequest> = output
             .effects

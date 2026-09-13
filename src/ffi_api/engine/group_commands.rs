@@ -312,9 +312,6 @@ impl CoreEngine {
             .local_identity
             .as_ref()
             .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))?;
-        state_event.sender_proof.value = identity.sign_payload(
-            Self::group_envelope_sender_proof_payload(&protected_state_event.payload_b64),
-        );
         membership_proof.state_event_message_id = Some(state_event.message_id.clone());
         membership_proof.signature =
             identity.sign_payload(Self::membership_proof_payload(&membership_proof));
@@ -323,13 +320,13 @@ impl CoreEngine {
         commit.membership_proof = Some(membership_proof.clone());
         control.membership_proof = Some(membership_proof.clone());
         state_event.membership_proof = Some(membership_proof);
-        self.enqueue_group_envelope(commit.clone(), capability.clone(), None);
-        self.enqueue_group_envelope(control.clone(), capability.clone(), None);
+        self.enqueue_group_envelope(&mut commit, capability.clone(), None)?;
+        self.enqueue_group_envelope(&mut control, capability.clone(), None)?;
         self.enqueue_group_envelope(
-            state_event.clone(),
+            &mut state_event,
             capability.clone(),
             Some(state_event_plaintext.clone()),
-        );
+        )?;
 
         self.state.group_states.insert(
             group_id.clone(),
@@ -475,7 +472,7 @@ impl CoreEngine {
         let group_id = self
             .group_id_for_conversation(&conversation_id)?
             .to_string();
-        let envelope = self.build_group_envelope(
+        let mut envelope = self.build_group_envelope(
             &group_id,
             &conversation_id,
             GroupMessageType::MlsApplication,
@@ -483,7 +480,7 @@ impl CoreEngine {
             payload.payload_b64,
         )?;
         let capability = self.group_capability(&group_id, self.local_group_role(&group_id)?)?;
-        self.enqueue_group_envelope(envelope.clone(), capability, Some(plaintext));
+        self.enqueue_group_envelope(&mut envelope, capability, Some(plaintext))?;
         self.note_group_application_message(&group_id);
         self.merge_with_transport_flush(CoreOutput {
             state_update: CoreStateUpdate {
@@ -1099,8 +1096,8 @@ impl CoreEngine {
         )?;
         commit.membership_proof = Some(membership_proof.clone());
         control.membership_proof = Some(membership_proof);
-        self.enqueue_group_envelope(commit.clone(), capability.clone(), None);
-        self.enqueue_group_envelope(control.clone(), capability.clone(), None);
+        self.enqueue_group_envelope(&mut commit, capability.clone(), None)?;
+        self.enqueue_group_envelope(&mut control, capability.clone(), None)?;
         self.state.group_states.insert(
             group_id.clone(),
             PersistedGroupState {
@@ -1410,8 +1407,8 @@ impl CoreEngine {
         )?;
         commit.membership_proof = Some(membership_proof.clone());
         control.membership_proof = Some(membership_proof);
-        self.enqueue_group_envelope(commit.clone(), capability.clone(), None);
-        self.enqueue_group_envelope(control.clone(), capability.clone(), None);
+        self.enqueue_group_envelope(&mut commit, capability.clone(), None)?;
+        self.enqueue_group_envelope(&mut control, capability.clone(), None)?;
         self.state.group_states.insert(
             group_id.clone(),
             PersistedGroupState {
@@ -1643,8 +1640,8 @@ impl CoreEngine {
         )?;
         commit.membership_proof = Some(membership_proof.clone());
         control.membership_proof = Some(membership_proof);
-        self.enqueue_group_envelope(commit.clone(), capability.clone(), None);
-        self.enqueue_group_envelope(control.clone(), capability.clone(), None);
+        self.enqueue_group_envelope(&mut commit, capability.clone(), None)?;
+        self.enqueue_group_envelope(&mut control, capability.clone(), None)?;
         self.state.group_states.insert(
             group_id.clone(),
             PersistedGroupState {
@@ -1962,7 +1959,7 @@ impl CoreEngine {
             &envelope.message_id,
         )?;
         envelope.membership_proof = Some(membership_proof);
-        self.enqueue_group_envelope(envelope.clone(), capability.clone(), None);
+        self.enqueue_group_envelope(&mut envelope, capability.clone(), None)?;
         self.state.group_states.insert(
             group_id.clone(),
             PersistedGroupState {
@@ -2110,7 +2107,7 @@ impl CoreEngine {
             &envelope.message_id,
         )?;
         envelope.membership_proof = Some(membership_proof);
-        self.enqueue_group_envelope(envelope.clone(), capability, None);
+        self.enqueue_group_envelope(&mut envelope, capability.clone(), None)?;
         self.merge_with_transport_flush(CoreOutput {
             state_update: CoreStateUpdate {
                 conversations_changed: true,
@@ -2245,7 +2242,7 @@ impl CoreEngine {
                 &envelope.message_id,
             )?,
         );
-        self.enqueue_group_envelope(envelope.clone(), capability, None);
+        self.enqueue_group_envelope(&mut envelope, capability.clone(), None)?;
         self.merge_with_transport_flush(CoreOutput {
             state_update: CoreStateUpdate {
                 conversations_changed: true,
@@ -2421,7 +2418,7 @@ impl CoreEngine {
         // Build any MLS commit envelope first so its message_id can be
         // referenced by the membership proof and manifest chain.
         let commit_message_id: Option<String> = if let Some(artifacts) = artifacts {
-            let commit = self.build_group_envelope(
+            let mut commit = self.build_group_envelope(
                 &group_id,
                 &group_state.conversation_id,
                 GroupMessageType::MlsCommit,
@@ -2430,8 +2427,10 @@ impl CoreEngine {
             )?;
             let commit_message_id = commit.message_id.clone();
             // A staged commit envelope does not yet carry a membership proof;
-            // it will be patched below once the proof is constructed.
-            self.enqueue_group_envelope(commit, capability.clone(), None);
+            // it will be patched below once the proof is constructed. The
+            // proof is outside the signing domain, so patching it after this
+            // does not invalidate the signature applied here.
+            self.enqueue_group_envelope(&mut commit, capability.clone(), None)?;
             persist_ops.push(PersistOp::SaveOutgoingGroupEnvelope {
                 message_id: commit_message_id.clone(),
             });
@@ -2498,10 +2497,10 @@ impl CoreEngine {
         }
         control.membership_proof = Some(membership_proof);
         self.enqueue_group_envelope(
-            control,
+            &mut control,
             capability.clone(),
             Some("control_group_dissolved".into()),
-        );
+        )?;
         persist_ops.push(PersistOp::SaveOutgoingGroupEnvelope {
             message_id: control_message_id.clone(),
         });
@@ -2743,8 +2742,8 @@ impl CoreEngine {
         )?;
         commit.membership_proof = Some(membership_proof.clone());
         control.membership_proof = Some(membership_proof);
-        self.enqueue_group_envelope(commit.clone(), capability.clone(), None);
-        self.enqueue_group_envelope(control.clone(), capability.clone(), None);
+        self.enqueue_group_envelope(&mut commit, capability.clone(), None)?;
+        self.enqueue_group_envelope(&mut control, capability.clone(), None)?;
         self.state.group_states.insert(
             group_id.clone(),
             PersistedGroupState {
@@ -2998,8 +2997,8 @@ impl CoreEngine {
         )?;
         commit.membership_proof = Some(membership_proof.clone());
         control.membership_proof = Some(membership_proof);
-        self.enqueue_group_envelope(commit.clone(), capability.clone(), None);
-        self.enqueue_group_envelope(control.clone(), capability.clone(), None);
+        self.enqueue_group_envelope(&mut commit, capability.clone(), None)?;
+        self.enqueue_group_envelope(&mut control, capability.clone(), None)?;
         self.state.group_states.insert(
             group_id.clone(),
             PersistedGroupState {
@@ -3417,7 +3416,7 @@ impl CoreEngine {
             .as_mut()
             .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
             .propose_self_update(&group_state.conversation_id)?;
-        let envelope = self.build_group_envelope(
+        let mut envelope = self.build_group_envelope(
             group_id,
             &group_state.conversation_id,
             GroupMessageType::MlsProposal,
@@ -3425,7 +3424,7 @@ impl CoreEngine {
             payload.payload_b64,
         )?;
         let capability = self.group_capability(group_id, self.local_group_role(group_id)?)?;
-        self.enqueue_group_envelope(envelope.clone(), capability, None);
+        self.enqueue_group_envelope(&mut envelope, capability, None)?;
         if let Some(state) = self.state.group_states.get_mut(group_id) {
             state.pcs.mark_proposal_in_flight();
         }
@@ -3527,8 +3526,8 @@ impl CoreEngine {
         )?;
         commit.membership_proof = Some(membership_proof.clone());
         control.membership_proof = Some(membership_proof);
-        self.enqueue_group_envelope(commit.clone(), capability.clone(), None);
-        self.enqueue_group_envelope(control.clone(), capability, None);
+        self.enqueue_group_envelope(&mut commit, capability.clone(), None)?;
+        self.enqueue_group_envelope(&mut control, capability.clone(), None)?;
         if let Some(state) = self.state.group_states.get_mut(&group_id) {
             state.manifest = manifest;
         }

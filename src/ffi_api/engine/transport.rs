@@ -2381,7 +2381,7 @@ impl CoreEngine {
             envelope.message_id = message_id.clone();
             envelope.created_at = task.created_at;
             envelope.storage_refs = storage_refs;
-            self.enqueue_group_envelope(envelope.clone(), capability, Some(manifest_json));
+            self.enqueue_group_envelope(&mut envelope, capability, Some(manifest_json))?;
             persist_ops.push(PersistOp::SaveOutgoingGroupEnvelope {
                 message_id: envelope.message_id,
             });

@@ -131,6 +131,19 @@ impl CoreEngine {
         Ok(manifest)
     }
 
+    /// Build an *unsigned* group envelope.
+    ///
+    /// The `sender_proof` is left empty on purpose: it is applied by
+    /// [`Self::enqueue_group_envelope`], the single chokepoint every outbound
+    /// group envelope passes through, so that the signature is by construction
+    /// the last thing that happens to an envelope. Callers are therefore free
+    /// to keep editing the envelope after this returns — several must, since
+    /// `membership_proof` cannot be built until `message_id` exists, which is
+    /// also why the identifier is allocated here rather than at enqueue.
+    ///
+    /// The previous arrangement signed here and left twenty-odd call sites to
+    /// remember not to touch a covered field afterwards; one of them (the
+    /// attachment path) did not.
     pub(super) fn build_group_envelope(
         &mut self,
         group_id: &str,
@@ -147,8 +160,6 @@ impl CoreEngine {
             .clone();
         let message_nonce = self.next_message_nonce();
         let created_at = current_unix_millis(message_nonce);
-        let sender_proof =
-            identity.sign_payload(Self::group_envelope_sender_proof_payload(&payload_b64));
         let message_id = format!(
             "msg:{conversation_id}:{}:{message_nonce}:group",
             identity.device_identity.device_id
@@ -167,27 +178,53 @@ impl CoreEngine {
             storage_refs: Vec::new(),
             sender_proof: SenderProof {
                 proof_type: "device_signature".into(),
-                value: sender_proof,
+                value: String::new(),
             },
             membership_proof: None,
             transition_id: None,
         })
     }
 
+    /// Sign a finished group envelope and queue it.
+    ///
+    /// Signing happens here, not in `build_group_envelope`, because this is
+    /// the only way an envelope reaches the outbox. That makes "the signature
+    /// covers the envelope as sent" structural rather than a rule every call
+    /// site has to remember.
+    ///
+    /// The envelope is signed **in place** so that the caller's copy is the
+    /// sent copy. Several call sites keep the envelope after queueing it — to
+    /// stash in `PersistedPendingGroupTransition.envelopes`, or to echo
+    /// locally — and an unsigned leftover would be a second, subtly different
+    /// version of a record that is supposed to be unique.
+    ///
+    /// Two fields are still assigned after this point — `membership_proof` in
+    /// `dissolve_group`, and `membership_proof`/`transition_id` in
+    /// `run_staged_group_mutation` — and both are deliberately outside the
+    /// signing domain, so patching them does not invalidate the signature; see
+    /// [`crate::model::signing::group_envelope_sender_proof_payload`].
     pub(super) fn enqueue_group_envelope(
         &mut self,
-        envelope: GroupEnvelope,
+        envelope: &mut GroupEnvelope,
         _capability: GroupCapability,
         plaintext: Option<String>,
-    ) {
+    ) -> CoreResult<()> {
+        let identity = self
+            .state
+            .local_identity
+            .as_ref()
+            .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))?;
+        envelope.sender_proof.value =
+            identity.sign_payload(group_envelope_sender_proof_payload(envelope));
         self.state
             .pending_group_outbox
             .push(PendingGroupOutboxItem {
-                envelope,
+                envelope: envelope.clone(),
                 retries: 0,
                 in_flight: false,
                 plaintext_cache: plaintext,
             });
+        Ok(())
     }
 
     pub(super) fn group_outbox_messages_endpoint(&self, group_id: &str) -> CoreResult<String> {
@@ -248,22 +285,6 @@ impl CoreEngine {
     #[cfg(test)]
     pub(crate) fn signing_payload_sha256(payload: SigningPayload) -> String {
         hex_lower(&Sha256::digest(payload.into_bytes()))
-    }
-
-    /// What a group envelope's `sender_proof` signs.
-    ///
-    /// The ciphertext alone -- not `message_id`, `message_type`, `visibility`
-    /// or `storage_refs`. This is the pre-R2 shape: R2 replaced it with a
-    /// canonical encoding of the whole header for the 1:1 path
-    /// ([`crate::model::signing::envelope_sender_proof_payload`]) and never
-    /// reached the group path, so a legitimately signed group ciphertext can
-    /// still be re-presented under a different header. Widening the coverage
-    /// is R2b; commit 1 only puts a domain in front of it, so that this
-    /// signature cannot be confused with one from another domain.
-    pub(crate) fn group_envelope_sender_proof_payload(payload_b64: &str) -> SigningPayload {
-        let mut payload = SigningPayload::new(SignatureDomain::GroupEnvelopeSenderProof);
-        payload.push_str(payload_b64);
-        payload
     }
 
     /// The JSON both the signature and the hash are taken over: the manifest

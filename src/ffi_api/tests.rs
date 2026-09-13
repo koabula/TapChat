@@ -1958,8 +1958,11 @@ mod tests {
         // Alice sends a real, correctly-authenticated MLS application message.
         harness.send_text(&mut alice, &conversation_id, "hi from alice for real");
 
-        // A malicious/compromised Outbox relabels the envelope's sender fields to
-        // Carol, without touching the MLS ciphertext (which it cannot forge).
+        // A malicious/compromised Outbox relabels the envelope's sender fields
+        // to Carol, without touching the MLS ciphertext (which it cannot
+        // forge). Since R2b this is caught by the sender proof, which covers
+        // the sender fields, rather than by the MLS sender cross-check further
+        // downstream — the record never reaches the adapter.
         {
             let record = harness
                 .outboxes
@@ -1993,6 +1996,271 @@ mod tests {
                 .any(|message| message.sender_user_id.as_deref()
                     == Some(carol.bundle.user_id.as_str())),
             "no message should ever be attributed to carol here"
+        );
+    }
+
+    /// A three-member group with Bob caught up, for the R2b tests below.
+    fn synced_trio(
+        alice: &mut HarnessUser,
+        bob: &mut HarnessUser,
+        carol: &mut HarnessUser,
+    ) -> (GroupHarness, String, String) {
+        import_peer_bundles(&mut [alice, bob, carol]);
+        let mut harness =
+            GroupHarness::with_bundles(&[&*alice, &*bob, &*carol].map(|u| HarnessUser {
+                name: u.name,
+                bundle: u.bundle.clone(),
+                engine: CoreEngine::new(),
+            }));
+        let (group_id, conversation_id) = harness.create_group(
+            alice,
+            "Project",
+            vec![bob.bundle.user_id.clone(), carol.bundle.user_id.clone()],
+        );
+        harness.import_welcome(bob, &group_id);
+        harness.import_welcome(carol, &group_id);
+        harness.sync_group(bob, &group_id);
+        harness.sync_group(carol, &group_id);
+        (harness, group_id, conversation_id)
+    }
+
+    /// What a tampered record must not disturb. The group outbox is a shared
+    /// replayable log with a cursor rather than a per-device inbox, so the
+    /// group equivalent of "ack it and drop it" is "step the cursor past it
+    /// and drop it": the cursor must still advance, or one injected record
+    /// stalls every later record forever.
+    #[derive(Debug, PartialEq)]
+    struct GroupTrace {
+        message_ids: Vec<String>,
+        roster_version: u64,
+        recovery_status: RecoveryStatus,
+    }
+
+    fn group_trace(user: &HarnessUser, group_id: &str, conversation_id: &str) -> GroupTrace {
+        let conversation = user
+            .engine
+            .state
+            .conversations
+            .get(conversation_id)
+            .expect("conversation");
+        GroupTrace {
+            message_ids: conversation
+                .messages
+                .iter()
+                .map(|message| message.message_id.clone())
+                .collect(),
+            roster_version: group_roster_version(user, group_id),
+            recovery_status: conversation.recovery_status,
+        }
+    }
+
+    /// **R2b.** The attack the widened sender proof exists to stop.
+    ///
+    /// The group outbox operator cannot forge an MLS ciphertext, but before
+    /// R2b it did not have to: `storage_refs` was outside the signature *and*
+    /// ordinary records were never signature-checked at all, so it could hang
+    /// an arbitrary blob pointer off a genuine message and the receiving
+    /// client would copy it into the stored message and offer it for download.
+    #[test]
+    fn a_forged_attachment_pointer_on_a_genuine_group_message_leaves_no_trace() {
+        let mut alice = harness_user("alice", ALICE_MNEMONIC, "phone");
+        let mut bob = harness_user("bob", BOB_MNEMONIC, "phone");
+        let mut carol = harness_user("carol", CAROL_MNEMONIC, "phone");
+        let (mut harness, group_id, conversation_id) =
+            synced_trio(&mut alice, &mut bob, &mut carol);
+
+        harness.send_text(&mut alice, &conversation_id, "a genuine message");
+
+        let before = group_trace(&bob, &group_id, &conversation_id);
+        let before_cursor = group_cursor(&bob, &group_id);
+
+        let tampered_seq = {
+            let record = harness
+                .outboxes
+                .get_mut(&group_id)
+                .expect("group outbox")
+                .last_mut()
+                .expect("application record");
+            record.envelope.storage_refs = vec![crate::model::StorageRef {
+                kind: "attachment".into(),
+                object_ref: "blob:attacker-chosen".into(),
+                size_bytes: 4096,
+                mime_type: "image/png".into(),
+                file_name: Some("invoice.png".into()),
+                expires_at: None,
+            }];
+            record.seq
+        };
+
+        harness.sync_group(&mut bob, &group_id);
+
+        assert_eq!(
+            group_trace(&bob, &group_id, &conversation_id),
+            before,
+            "a record carrying an attacker-chosen storage_ref must leave no trace"
+        );
+        assert!(
+            group_cursor(&bob, &group_id) >= tampered_seq,
+            "the cursor must step past the dropped record, or one injected \
+             record stalls the group forever"
+        );
+        assert!(
+            group_cursor(&bob, &group_id) > before_cursor,
+            "the cursor must actually move"
+        );
+
+        // The whole point is that this is not a remote off-switch: the group
+        // must still work afterwards.
+        harness.send_text(&mut alice, &conversation_id, "after");
+        harness.sync_group(&mut bob, &group_id);
+        assert!(
+            group_plaintexts(&bob, &conversation_id)
+                .iter()
+                .any(|text| text == "after"),
+            "the group must keep working after a record is discarded"
+        );
+    }
+
+    /// **R2b.** The header as a whole, not just `storage_refs`. A legitimately
+    /// signed group ciphertext must not be re-presentable under a different
+    /// header.
+    #[test]
+    fn a_group_record_replayed_under_a_different_header_leaves_no_trace() {
+        let rewrites: Vec<(&'static str, fn(&mut GroupEnvelope))> = vec![
+            ("message_id", |envelope| {
+                envelope.message_id = format!("{}:replayed", envelope.message_id)
+            }),
+            ("visibility", |envelope| {
+                envelope.visibility = GroupEnvelopeVisibility::Protocol
+            }),
+            ("message_type", |envelope| {
+                envelope.message_type = GroupMessageType::ControlGroupStateEvent
+            }),
+            ("created_at", |envelope| envelope.created_at += 1),
+            ("conversation_id", |envelope| {
+                envelope.conversation_id = format!("{}:other", envelope.conversation_id)
+            }),
+        ];
+
+        for (name, rewrite) in rewrites {
+            let mut alice = harness_user("alice", ALICE_MNEMONIC, "phone");
+            let mut bob = harness_user("bob", BOB_MNEMONIC, "phone");
+            let mut carol = harness_user("carol", CAROL_MNEMONIC, "phone");
+            let (mut harness, group_id, conversation_id) =
+                synced_trio(&mut alice, &mut bob, &mut carol);
+
+            harness.send_text(&mut alice, &conversation_id, "a genuine message");
+
+            let before = group_trace(&bob, &group_id, &conversation_id);
+            let before_cursor = group_cursor(&bob, &group_id);
+
+            {
+                let record = harness
+                    .outboxes
+                    .get_mut(&group_id)
+                    .expect("group outbox")
+                    .last_mut()
+                    .expect("application record");
+                rewrite(&mut record.envelope);
+                // The record id travels alongside the envelope's, and
+                // `GroupOutboxRecord::validate` requires them to agree.
+                record.message_id = record.envelope.message_id.clone();
+            }
+
+            harness.sync_group(&mut bob, &group_id);
+
+            assert_eq!(
+                group_trace(&bob, &group_id, &conversation_id),
+                before,
+                "[{name}] a rewritten header must leave no trace"
+            );
+            assert!(
+                group_cursor(&bob, &group_id) > before_cursor,
+                "[{name}] the cursor must step past the dropped record"
+            );
+        }
+    }
+
+    /// **R2b.** The positive control. Without this, every "forgery is
+    /// rejected" test above would pass just as well against a gate that
+    /// rejected everything.
+    #[test]
+    fn genuine_group_records_pass_the_authentication_gate() {
+        let mut alice = harness_user("alice", ALICE_MNEMONIC, "phone");
+        let mut bob = harness_user("bob", BOB_MNEMONIC, "phone");
+        let mut carol = harness_user("carol", CAROL_MNEMONIC, "phone");
+        let (mut harness, group_id, conversation_id) =
+            synced_trio(&mut alice, &mut bob, &mut carol);
+
+        harness.send_text(&mut alice, &conversation_id, "hello");
+        harness.send_attachment(&mut alice, &conversation_id, sample_attachment_descriptor());
+        harness.sync_group(&mut bob, &group_id);
+
+        let records = harness.outboxes.get(&group_id).expect("group outbox");
+        assert!(!records.is_empty(), "alice produced no group records");
+        for record in records {
+            let verdict =
+                bob.engine
+                    .authenticate_group_outbox_record(&group_id, &conversation_id, record);
+            assert!(
+                verdict.is_ok(),
+                "the gate rejected a genuine {:?} record: {:?}",
+                record.envelope.message_type,
+                verdict
+            );
+        }
+    }
+
+    /// **R2b, Part 4.** `ControlConversationNeedsRebuild` has no producer on
+    /// the group path, yet it used to be the first statement of the catch-all
+    /// branch: one appended record tore the conversation down, unsigned and
+    /// unchecked, and returned without even writing the cursor. This is the
+    /// group twin of `injected_rebuild_control_leaves_no_trace`.
+    #[test]
+    fn an_injected_group_rebuild_control_leaves_no_trace() {
+        let mut alice = harness_user("alice", ALICE_MNEMONIC, "phone");
+        let mut bob = harness_user("bob", BOB_MNEMONIC, "phone");
+        let mut carol = harness_user("carol", CAROL_MNEMONIC, "phone");
+        let (mut harness, group_id, conversation_id) =
+            synced_trio(&mut alice, &mut bob, &mut carol);
+
+        harness.send_text(&mut alice, &conversation_id, "a genuine message");
+        harness.sync_group(&mut bob, &group_id);
+
+        let before = group_trace(&bob, &group_id, &conversation_id);
+        let before_cursor = group_cursor(&bob, &group_id);
+
+        {
+            let records = harness.outboxes.get_mut(&group_id).expect("group outbox");
+            let mut injected = records.last().expect("a record to clone").clone();
+            injected.seq = records.len() as u64 + 1;
+            injected.envelope.message_type = GroupMessageType::ControlConversationNeedsRebuild;
+            injected.envelope.message_id = "msg:injected-rebuild".into();
+            injected.message_id = injected.envelope.message_id.clone();
+            injected.envelope.transition_id = None;
+            injected.envelope.membership_proof = None;
+            records.push(injected);
+        }
+
+        harness.sync_group(&mut bob, &group_id);
+
+        assert_eq!(
+            group_trace(&bob, &group_id, &conversation_id),
+            before,
+            "an injected rebuild control must not tear the conversation down"
+        );
+        assert!(
+            group_cursor(&bob, &group_id) > before_cursor,
+            "the cursor must step past it rather than stalling the group"
+        );
+        assert!(
+            !bob.engine
+                .state
+                .group_states
+                .get(&group_id)
+                .is_some_and(|state| state.consistency_state
+                    == crate::persistence::GroupConsistencyState::BlockedNeedsRebuild),
+            "the group must not be blocked on a rebuild"
         );
     }
 

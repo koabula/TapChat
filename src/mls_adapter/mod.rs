@@ -1496,6 +1496,46 @@ impl MlsAdapter {
         Ok(result)
     }
 
+    /// The signature public key of a member's MLS leaf, as lowercase hex.
+    ///
+    /// This is the key MLS itself authenticates that member's frames with, so
+    /// checking a detached signature against it proves the signed bytes and
+    /// the frame came from the same leaf. That is what the group outbox
+    /// authentication gate needs, and it needs it for members who are not
+    /// necessarily established contacts, which is what
+    /// `trusted_device_public_key` cannot do.
+    ///
+    /// Deliberately the leaf key rather than the identity chain's
+    /// `device_public_key`: the two are equal by the R0 invariant, but that
+    /// invariant is only enforced locally where this device admits a leaf
+    /// (`verify_key_package_is_peer_device`, `ingest_welcome`). For a leaf
+    /// that arrived inside someone else's commit it holds only transitively.
+    /// Binding to the leaf sidesteps that gap, and is the stronger statement
+    /// anyway: the header was signed by whoever authored the frame.
+    ///
+    /// The hex encoding matches `identity::encode_hex`, so the result drops
+    /// straight into `verify_device_payload_signature`.
+    pub fn member_signature_key(
+        &self,
+        conversation_id: &str,
+        user_id: &str,
+        device_id: &str,
+    ) -> CoreResult<String> {
+        let state = self
+            .groups
+            .get(conversation_id)
+            .ok_or_else(|| CoreError::invalid_input("conversation MLS state does not exist"))?;
+        for member in state.group.members() {
+            let identity = extract_sender_identity(&member.credential)?;
+            if identity == credential_identity(user_id, device_id) {
+                return Ok(crate::identity::encode_hex(&member.signature_key));
+            }
+        }
+        Err(CoreError::invalid_input(
+            "signer is not a member of this MLS group",
+        ))
+    }
+
     pub fn export_persisted_group_state(&self, conversation_id: &str) -> CoreResult<String> {
         if !self.groups.contains_key(conversation_id) {
             return Err(CoreError::invalid_input(
@@ -2290,15 +2330,22 @@ fn device_signer(local_identity: &LocalIdentityState) -> SignatureKeyPair {
 /// `user_id|device_id`. The credential names the leaf; it proves nothing.
 /// Trust in a leaf comes from its signature key being a device key the
 /// verifier's own contact state vouches for.
+///
+/// The one place that knows how a credential identity is spelled, so the `|`
+/// separator cannot drift between a producer and a comparison.
+fn credential_identity(user_id: &str, device_id: &str) -> String {
+    format!("{user_id}|{device_id}")
+}
+
 fn build_credential_identity(local_identity: &LocalIdentityState) -> String {
-    format!(
-        "{}|{}",
-        local_identity.user_identity.user_id, local_identity.device_identity.device_id,
+    credential_identity(
+        &local_identity.user_identity.user_id,
+        &local_identity.device_identity.device_id,
     )
 }
 
 fn peer_credential_identity(peer: &PeerDeviceKeyPackage) -> String {
-    format!("{}|{}", peer.user_id, peer.device_id)
+    credential_identity(&peer.user_id, &peer.device_id)
 }
 
 /// Admit a KeyPackage only if its leaf signature key is the device key the

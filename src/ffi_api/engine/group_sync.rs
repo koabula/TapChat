@@ -1,6 +1,98 @@
 use super::*;
 
+/// Whether the group outbox may deliver a record of this type.
+///
+/// An allowlist, not a denylist, and written as an exhaustive match rather
+/// than a `matches!` on purpose: a new `GroupMessageType` variant must fail to
+/// compile here instead of falling through to the catch-all branch of
+/// `handle_group_outbox_records` and being stored. Rejection is by design
+/// invisible — no error state, no log the user sees, no retry — so a variant
+/// that slipped through would be close to undiagnosable.
+///
+/// Five variants have no honest producer: nothing ever builds a group envelope
+/// carrying `ControlConversationNeedsRebuild` or any of the four join/leave
+/// controls, which travel as their own `GroupJoinRequest` / `GroupLeaveRequest`
+/// documents rather than as envelopes. All five were pure attack surface.
+/// `ControlConversationNeedsRebuild` was the worst of them: it was the first
+/// statement of the catch-all branch and tore the conversation down
+/// unconditionally — no signature check, no authority check — then returned,
+/// abandoning the rest of the batch without even writing the cursor. This is
+/// the same shape R2 removed from the 1:1 path (`inbox_deliverable`).
+pub(crate) const fn group_outbox_deliverable(message_type: GroupMessageType) -> bool {
+    match message_type {
+        GroupMessageType::MlsApplication
+        | GroupMessageType::MlsCommit
+        | GroupMessageType::MlsProposal
+        | GroupMessageType::ControlGroupMembershipChanged
+        | GroupMessageType::ControlGroupMetadataUpdated
+        | GroupMessageType::ControlGroupDissolved
+        | GroupMessageType::ControlGroupStateEvent => true,
+        GroupMessageType::ControlConversationNeedsRebuild
+        | GroupMessageType::ControlGroupJoinRequested
+        | GroupMessageType::ControlGroupJoinApproved
+        | GroupMessageType::ControlGroupJoinRejected
+        | GroupMessageType::ControlGroupLeaveRequested => false,
+    }
+}
+
 impl CoreEngine {
+    /// The single authentication gate for inbound group outbox records.
+    ///
+    /// Positioned as the first statement of the record loop so that nothing
+    /// downstream is reachable with an unauthenticated record — not the
+    /// transition bundle path, not MLS ingest, not the manifest controls, and
+    /// not `store_group_record_message`. Before this existed the group path
+    /// verified `sender_proof` in exactly one place, inside the transition
+    /// bundle, so an ordinary application message was never checked at all:
+    /// the outbox operator could hang arbitrary `storage_refs` off a genuine
+    /// message and the client would download them.
+    ///
+    /// The signer's key comes from the MLS roster, not from contact state
+    /// (`MlsAdapter::member_signature_key`): group members need not be
+    /// established contacts of one another, and the property actually wanted
+    /// is that the header and the frame were signed by the same leaf.
+    ///
+    /// Everything checked here is authored inside one record, so a failure
+    /// implicates only that record: step the cursor past it, drop it, carry
+    /// on. The reason is a static string, so no attacker-controlled data
+    /// reaches the log line, and the signature failures collapse into one
+    /// reason so the log does not distinguish "not a member" from "bad
+    /// signature".
+    pub(crate) fn authenticate_group_outbox_record(
+        &self,
+        group_id: &str,
+        conversation_id: &str,
+        record: &GroupOutboxRecord,
+    ) -> Result<(), &'static str> {
+        record.validate().map_err(|_| "malformed record")?;
+        if record.group_id != group_id {
+            return Err("record belongs to a different group");
+        }
+        if record.envelope.conversation_id != conversation_id {
+            return Err("record belongs to a different conversation");
+        }
+        if !group_outbox_deliverable(record.envelope.message_type) {
+            return Err("message type is not deliverable over the group outbox");
+        }
+        let signer_key = self
+            .state
+            .mls_adapter
+            .as_ref()
+            .ok_or("mls adapter is not initialized")?
+            .member_signature_key(
+                conversation_id,
+                &record.envelope.sender_user_id,
+                &record.envelope.sender_device_id,
+            )
+            .map_err(|_| "sender proof is not valid")?;
+        crate::identity::verify_device_payload_signature(
+            &signer_key,
+            group_envelope_sender_proof_payload(&record.envelope),
+            &record.envelope.sender_proof.value,
+        )
+        .map_err(|_| "sender proof is not valid")
+    }
+
     pub(super) fn sync_group_outbox(
         &mut self,
         group_id: String,
@@ -1549,6 +1641,23 @@ impl CoreEngine {
         let mut stopped_on_retryable_gap = false;
         let mut record_iter = records.into_iter().peekable();
         while let Some(record) = record_iter.next() {
+            // Per-record admission. Anything wrong with this one record is
+            // this one record's problem: step the cursor past it, drop it,
+            // leave no trace, and carry on with the rest of the batch. The
+            // group outbox is a shared replayable log rather than a per-device
+            // inbox, so advancing the cursor is what "ack and discard" means
+            // here.
+            if let Err(reason) =
+                self.authenticate_group_outbox_record(&group_id, &conversation_id, &record)
+            {
+                log::warn!(
+                    "handle_group_outbox_records: discarding unauthenticated record seq={} reason={}",
+                    record.seq,
+                    reason
+                );
+                last_terminal_seq = record.seq;
+                continue;
+            }
             if let Some(transition_id) = record.envelope.transition_id.clone() {
                 if record.envelope.membership_proof.is_some() {
                     let mut bundle = vec![record];
@@ -1574,11 +1683,6 @@ impl CoreEngine {
                 }
             }
             let record_seq = record.seq;
-            if record.group_id != group_id || record.envelope.conversation_id != conversation_id {
-                return Err(CoreError::invalid_input(
-                    "group outbox record does not match local group",
-                ));
-            }
             if self
                 .state
                 .conversations
@@ -1816,14 +1920,6 @@ impl CoreEngine {
                         .insert(conversation_id.clone(), summary);
                 }
             } else {
-                if record.envelope.message_type == GroupMessageType::ControlConversationNeedsRebuild
-                {
-                    return self.escalate_conversation_to_rebuild(
-                        &conversation_id,
-                        RecoveryEscalationReason::ExplicitNeedsRebuildControl,
-                        "group outbox received control_conversation_needs_rebuild",
-                    );
-                }
                 let is_manifest_control = matches!(
                     record.envelope.message_type,
                     GroupMessageType::ControlGroupMembershipChanged
@@ -2046,19 +2142,9 @@ impl CoreEngine {
         if let Some(commit) = commit {
             self.verify_membership_operation_authority(&commit.envelope, &current.manifest)?;
         }
-        for record in bundle {
-            let ciphertext = record
-                .envelope
-                .inline_ciphertext
-                .as_deref()
-                .ok_or_else(|| CoreError::invalid_input("transition record has no ciphertext"))?;
-            self.verify_device_signature(
-                &record.envelope.sender_user_id,
-                &record.envelope.sender_device_id,
-                Self::group_envelope_sender_proof_payload(ciphertext),
-                &record.envelope.sender_proof.value,
-            )?;
-        }
+        // Every record here already cleared `authenticate_group_outbox_record`
+        // in the caller's loop, which is the only way into this function, so
+        // the sender proofs are verified and there is no second check to make.
 
         let mut staged_mls = self
             .state
