@@ -665,8 +665,14 @@ fn cli_message_request_accept_flow_works() -> Result<()> {
 
     let requests = runtime_list_message_requests(&runtime, bundle_auth(&bob_bundle)?)?;
     assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0].sender_user_id, alice_user_id);
     assert!(requests[0].message_count >= 1);
+    assert!(
+        requests[0]
+            .welcome_bytes
+            .as_ref()
+            .is_some_and(|bytes| !bytes.is_empty()),
+        "message request must carry the Welcome"
+    );
 
     let pre_accept_sync = sync_once(&bob_profile)?;
     assert_eq!(
@@ -682,7 +688,6 @@ fn cli_message_request_accept_flow_works() -> Result<()> {
         &bob_profile.to_string_lossy(),
         "--request-id",
         &requests[0].request_id,
-        "--allow-private-url",
     ])?;
     assert_eq!(accepted["accepted"], Value::Bool(true));
     assert_eq!(
@@ -915,9 +920,11 @@ fn cli_contact_request_and_allowlist_commands_work() -> Result<()> {
     let requests = requests.as_array().context("requests list not array")?;
     assert_eq!(requests.len(), 1);
     let request_id = required_str(&requests[0], "request_id")?;
-    assert_eq!(
-        requests[0]["sender_user_id"].as_str(),
-        Some(alice_user_id.as_str())
+    assert!(
+        requests[0]["welcome_bytes"]
+            .as_str()
+            .is_some_and(|bytes| !bytes.is_empty()),
+        "message request must carry the Welcome"
     );
 
     let rejected = run_cli_json([

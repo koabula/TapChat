@@ -11813,6 +11813,107 @@ mod tests {
         assert_eq!(error.code(), "identity_bundle_rolled_back");
     }
 
+    #[test]
+    fn lane_rotation_fetches_same_url_when_publication_revision_advances() {
+        let mut chat = paired_direct_chat();
+        let bob_user_id = chat
+            .bob
+            .state
+            .local_identity
+            .as_ref()
+            .expect("bob identity")
+            .user_identity
+            .user_id
+            .clone();
+        let stored_ref = chat
+            .alice
+            .state
+            .contacts
+            .get(&bob_user_id)
+            .expect("alice holds bob")
+            .bundle
+            .identity_bundle_ref
+            .clone()
+            .expect("bob contact already has a bundle ref");
+        let previous_revision = chat
+            .alice
+            .state
+            .contacts
+            .get(&bob_user_id)
+            .expect("alice holds bob")
+            .bundle
+            .publication_revision;
+        let mut rotated = chat
+            .bob
+            .state
+            .local_bundle
+            .clone()
+            .expect("bob local bundle");
+        assert_eq!(
+            rotated.identity_bundle_ref.as_deref(),
+            Some(stored_ref.as_str()),
+            "this case is the same locator with a newer publication"
+        );
+        rotated.publication_revision = previous_revision.saturating_add(1);
+        rotated.signature = chat
+            .bob
+            .state
+            .local_identity
+            .as_ref()
+            .expect("bob identity")
+            .sign_payload_with_root(crate::identity::identity_bundle_payload(&rotated));
+        chat.bob.state.local_bundle = Some(rotated.clone());
+
+        set_direct_pcs_debt(
+            &mut chat.bob,
+            &chat.conversation_id,
+            DIRECT_PCS_COMMIT_INTERVAL * 2,
+        );
+        chat.bob
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: chat.conversation_id.clone(),
+                plaintext: "pcs trigger".into(),
+            })
+            .expect("bob pcs");
+
+        let inbound =
+            deliver_pending_outbox_to_device(&mut chat.alice, &chat.bob, &chat.alice_device_id);
+        assert!(inbound.effects.iter().any(|effect| matches!(
+            effect,
+            CoreEffect::FetchIdentityBundle { fetch }
+                if fetch.user_id == bob_user_id
+                    && fetch.reference.as_deref() == Some(stored_ref.as_str())
+        )));
+
+        chat.alice
+            .handle_event(CoreEvent::IdentityBundleFetched {
+                user_id: bob_user_id.clone(),
+                bundle: rotated.clone(),
+            })
+            .expect("alice imports same-url newer bob bundle");
+        assert_eq!(
+            chat.alice
+                .state
+                .contacts
+                .get(&bob_user_id)
+                .expect("bob contact")
+                .bundle
+                .publication_revision,
+            rotated.publication_revision
+        );
+        assert_eq!(
+            chat.alice
+                .state
+                .contacts
+                .get(&bob_user_id)
+                .expect("bob contact")
+                .bundle
+                .identity_bundle_ref
+                .as_deref(),
+            Some(stored_ref.as_str())
+        );
+    }
+
     /// **Remark 2 / R1.** The decision test: a party completes a rotation with
     /// the counterparty contributing nothing at all.
     ///
@@ -12645,18 +12746,14 @@ mod tests {
     }
 
     fn accepted_request_result(
-        sender_user_id: &str,
+        _sender_user_id: &str,
         conversation_id: &str,
     ) -> MessageRequestActionResult {
         MessageRequestActionResult {
             accepted: true,
             request_id: "request:pending".into(),
-            sender_user_id: sender_user_id.to_string(),
             promoted_count: 1,
             action: MessageRequestAction::Accept,
-            sender_bundle_share_url: None,
-            sender_bundle_hash: None,
-            sender_display_name: None,
             promoted_conversation_ids: vec![conversation_id.to_string()],
         }
     }

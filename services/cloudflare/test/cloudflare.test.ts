@@ -1789,7 +1789,7 @@ test("direct message request accept promotes only the accepted lane", async () =
   );
   const requests = (await list.json()) as MessageRequestListResult & { version: string };
   assert.equal(requests.requests.length, 2);
-  const newest = requests.requests.find((request) => request.messageCount === 2 && request.lastMessageId === "04040404040404040404040404040404");
+  const newest = [...requests.requests].sort((left, right) => right.firstSeenAt - left.firstSeenAt)[0];
   assert.ok(newest);
 
   const accept = await handleRequest(
@@ -3429,17 +3429,14 @@ test("managed websocket sessions contain send failures and clean themselves up",
 
 test("legacy message request entries are migrated lazily and expire", async () => {
   const state = new MemoryState();
-  const pending = sampleAppend(undefined, "msg:legacy", undefined, "user:legacy");
+  const pending = sampleAppend(undefined, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
   await state.put("message-request:index", ["user:legacy"]);
   await state.put("message-request:user:legacy", {
     requestId: "request:user:legacy",
     recipientDeviceId: "device:bob:phone",
-    senderUserId: "user:legacy",
+    lane: "user:legacy",
     firstSeenAt: 1_000,
-    lastSeenAt: 1_000,
     messageCount: 1,
-    lastMessageId: "msg:legacy",
-    lastConversationId: pending.envelope.lane,
     pendingRequests: [pending]
   });
   const service = new InboxService("device:bob:phone", state, new MemoryR2Store(), [], {

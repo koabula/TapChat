@@ -767,13 +767,11 @@ test("runtime integration: message request changes push over realtime and inbox 
   const queuedEvent = (await queuedMessage) as {
     event: string;
     deviceId: string;
-    senderUserId: string;
     requestId: string;
     change: string;
   };
   assert.equal(queuedEvent.event, "message_request_changed");
   assert.equal(queuedEvent.deviceId, deviceId);
-  assert.equal(queuedEvent.senderUserId, "user:mallory");
   assert.equal(queuedEvent.change, "queued");
 
   const headResponse = await mf.dispatchFetch(`${BASE_URL}/v1/inbox/${encodeURIComponent(deviceId)}/head`, {
@@ -791,7 +789,6 @@ test("runtime integration: message request changes push over realtime and inbox 
 
   const acceptedEventPromise = waitForMatchingWebSocketMessage(socket, (value): value is {
     event: string;
-    senderUserId: string;
     requestId: string;
     change: string;
   } => {
@@ -802,7 +799,6 @@ test("runtime integration: message request changes push over realtime and inbox 
     return (
       candidate.event === "message_request_changed" &&
       candidate.change === "accepted" &&
-      candidate.senderUserId === "user:mallory" &&
       candidate.requestId === requests.requests[0].requestId
     );
   });
@@ -816,7 +812,6 @@ test("runtime integration: message request changes push over realtime and inbox 
   assert.equal(acceptResponse.status, 200);
   const acceptedEvent = await acceptedEventPromise;
   assert.equal(acceptedEvent.event, "message_request_changed");
-  assert.equal(acceptedEvent.senderUserId, "user:mallory");
   assert.equal(acceptedEvent.requestId, requests.requests[0].requestId);
   assert.equal(acceptedEvent.change, "accepted");
 

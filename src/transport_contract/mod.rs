@@ -625,28 +625,10 @@ pub struct FetchIdentityBundleResult {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessageRequestItem {
     pub request_id: String,
-    pub recipient_device_id: String,
-    pub sender_user_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sender_bundle_share_url: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sender_bundle_hash: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sender_display_name: Option<String>,
     pub first_seen_at: u64,
-    pub last_seen_at: u64,
     pub message_count: u64,
-    pub last_message_id: String,
-    #[serde(default)]
-    pub last_conversation_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub welcome_bytes: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub request_kind: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub group_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub group_title: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -687,15 +669,8 @@ pub struct MessageRequestActionRequest {
 pub struct MessageRequestActionResult {
     pub accepted: bool,
     pub request_id: String,
-    pub sender_user_id: String,
     pub promoted_count: u64,
     pub action: MessageRequestAction,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sender_bundle_share_url: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sender_bundle_hash: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sender_display_name: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub promoted_conversation_ids: Vec<String>,
 }

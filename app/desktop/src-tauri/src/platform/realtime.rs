@@ -88,7 +88,7 @@ enum ConnectionReservation {
 }
 
 /// Events received from WebSocket.
-/// Note: Cloudflare uses camelCase for field names (deviceId, senderUserId, requestId)
+/// Note: Cloudflare uses camelCase for field names (deviceId, requestId)
 /// but snake_case for event types (head_updated, inbox_record_available, message_request_changed)
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
@@ -108,8 +108,6 @@ pub enum WsServerEvent {
     MessageRequestChanged {
         #[serde(rename = "deviceId")]
         device_id: String,
-        #[serde(rename = "senderUserId")]
-        sender_user_id: String,
         #[serde(rename = "requestId")]
         request_id: String,
         change: String,
@@ -1218,7 +1216,6 @@ fn direct_core_event_from_ws_event(
         }
         WsServerEvent::MessageRequestChanged {
             device_id,
-            sender_user_id,
             request_id,
             change,
         } if device_id == subscribed_device_id => {
@@ -1231,7 +1228,6 @@ fn direct_core_event_from_ws_event(
             Some(CoreEvent::RealtimeEventReceived {
                 device_id: device_id.clone(),
                 event: RealtimeEvent::MessageRequestChanged {
-                    sender_user_id: sender_user_id.clone(),
                     request_id: request_id.clone(),
                     change,
                 },
@@ -1251,13 +1247,11 @@ fn summarize_ws_event(device_id: &str, event: &WsServerEvent) -> String {
             format!("device_id={device_ref} type=inbox_record_available seq={seq}")
         }
         WsServerEvent::MessageRequestChanged {
-            sender_user_id,
             request_id,
             change,
             ..
         } => format!(
-            "device_id={device_ref} type=message_request_changed sender_user_id={} request_id={} change={change}",
-            redact_id("user", sender_user_id),
+            "device_id={device_ref} type=message_request_changed request_id={} change={change}",
             redact_id("request", request_id)
         ),
         WsServerEvent::GroupHeadUpdated { group_id, seq, .. } => {
@@ -1322,17 +1316,14 @@ mod tests {
             "device:alice-secret",
             &WsServerEvent::MessageRequestChanged {
                 device_id: "device:alice-secret".into(),
-                sender_user_id: "user:bob-secret".into(),
                 request_id: "request:secret".into(),
                 change: "created".into(),
             },
         );
 
         assert!(summary.contains("device_id=<device:"));
-        assert!(summary.contains("sender_user_id=<user:"));
         assert!(summary.contains("request_id=<request:"));
         assert!(!summary.contains("alice"));
-        assert!(!summary.contains("bob"));
         assert!(!summary.contains("request:secret"));
     }
 
@@ -1427,7 +1418,6 @@ mod tests {
             "device:local",
             &WsServerEvent::MessageRequestChanged {
                 device_id: "device:local".into(),
-                sender_user_id: "user:bob".into(),
                 request_id: "request:1".into(),
                 change: "queued".into(),
             },
@@ -1437,12 +1427,10 @@ mod tests {
             Some(CoreEvent::RealtimeEventReceived {
                 device_id,
                 event: RealtimeEvent::MessageRequestChanged {
-                    sender_user_id,
                     request_id,
                     change: MessageRequestRealtimeChange::Queued,
                 }
             }) if device_id == "device:local"
-                && sender_user_id == "user:bob"
                 && request_id == "request:1"
         ));
     }
@@ -1455,7 +1443,6 @@ mod tests {
         };
         let unknown_change = WsServerEvent::MessageRequestChanged {
             device_id: "device:local".into(),
-            sender_user_id: "user:bob".into(),
             request_id: "request:1".into(),
             change: "created".into(),
         };

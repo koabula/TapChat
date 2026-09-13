@@ -3,15 +3,9 @@ import { useNavigate } from "react-router";
 import { invokeApp as invoke } from "@/lib/tauri";
 import { normalizeAppError, presentError } from "@/lib/errors";
 
-import { listGroupConversations } from "@/lib/tauri";
 import { useContactsStore } from "@/store/contacts";
 import { useConversationsStore } from "@/store/conversations";
-import { useSessionStore } from "@/store/session";
-import {
-  filterMessageRequestsForSession,
-  isMessageRequestForSession,
-  useMessageRequestsStore,
-} from "@/store/requests";
+import { useMessageRequestsStore } from "@/store/requests";
 
 import type {
   ContactSummary,
@@ -20,16 +14,31 @@ import type {
   MessageRequestItem,
 } from "@/lib/types";
 
+interface WelcomePreview {
+  conversation_id: string;
+  author_user_id: string;
+  author_device_id: string;
+  identity_bundle_ref?: string;
+}
+
+interface RequestRow {
+  request: MessageRequestItem;
+  preview?: WelcomePreview;
+}
+
+function canAccept(preview?: WelcomePreview): boolean {
+  return Boolean(preview?.identity_bundle_ref?.trim());
+}
+
 export default function MessageRequests() {
   const navigate = useNavigate();
   const requests = useMessageRequestsStore((s) => s.requests);
   const removeRequest = useMessageRequestsStore((s) => s.removeRequest);
-  const deviceId = useSessionStore((s) => s.deviceId);
-  const userId = useSessionStore((s) => s.userId);
   const mergeConversationSnapshot = useConversationsStore(
     (s) => s.mergeConversationSnapshot,
   );
   const setContacts = useContactsStore((s) => s.setContacts);
+  const [rows, setRows] = useState<RequestRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [acting, setActing] = useState<string | null>(null);
   const [actionNotice, setActionNotice] = useState<{
@@ -41,21 +50,33 @@ export default function MessageRequests() {
     void loadFromBackend();
   }, []);
 
+  const previewRows = async (items: MessageRequestItem[]): Promise<RequestRow[]> => {
+    return Promise.all(
+      items.map(async (request) => {
+        if (!request.welcome_bytes) {
+          return { request };
+        }
+        try {
+          const preview = await invoke<WelcomePreview>("preview_welcome", {
+            welcomeBytes: request.welcome_bytes,
+          });
+          return { request, preview };
+        } catch {
+          return { request };
+        }
+      }),
+    );
+  };
+
   const loadFromBackend = async () => {
     setLoading(true);
     try {
       const result = await invoke<{
         view_model?: { message_requests?: MessageRequestItem[] };
       }>("list_message_requests");
-      if (result.view_model?.message_requests) {
-        useMessageRequestsStore.getState().setRequests(
-          filterMessageRequestsForSession(
-            result.view_model.message_requests,
-            useSessionStore.getState().deviceId,
-            useSessionStore.getState().userId,
-          ),
-        );
-      }
+      const items = result.view_model?.message_requests ?? [];
+      useMessageRequestsStore.getState().setRequests(items);
+      setRows(await previewRows(items));
     } catch (err) {
       console.error(`[MessageRequests] Failed to load message requests: ${presentError(err).message}`);
       setActionNotice({ kind: "error", message: presentError(err).message });
@@ -75,18 +96,14 @@ export default function MessageRequests() {
   const handleAction = async (
     request: MessageRequestItem,
     action: "accept" | "reject",
+    preview?: WelcomePreview,
   ) => {
     const requestId = request.request_id;
-    if (!isMessageRequestForSession(request, deviceId, userId)) {
-      console.warn(
-        `[MessageRequests] Dropping stale request requestId=${requestId} recipient=${request.recipient_device_id} sender=${request.sender_user_id}`,
-      );
-      removeRequest(requestId);
+    if (action === "accept" && !canAccept(preview)) {
       setActionNotice({
-        kind: "info",
-        message: "This request no longer belongs to the active session.",
+        kind: "error",
+        message: "This request cannot be accepted: the Welcome has no identity bundle.",
       });
-      void loadFromBackend();
       return;
     }
     setActing(requestId);
@@ -95,9 +112,9 @@ export default function MessageRequests() {
       const result = await invoke<MessageRequestActionOutput>("act_on_message_request", {
         requestId,
         action,
-        senderBundleShareUrl: request.sender_bundle_share_url,
       });
       removeRequest(requestId);
+      setRows((current) => current.filter((row) => row.request.request_id !== requestId));
 
       if (action === "accept" && result.accepted) {
         console.debug(
@@ -140,11 +157,7 @@ export default function MessageRequests() {
           );
           console.debug(`[MessageRequests] Refreshed contacts count=${contacts.length}`);
 
-          if (request.request_kind === "group_invite" && request.group_id) {
-            const groups = await listGroupConversations();
-            const group = groups.find((summary) => summary.group_id === request.group_id);
-            navigate(group ? `/chat/${group.conversation_id}` : "/");
-          } else if (result.conversation_id) {
+          if (result.conversation_id) {
             navigate(`/chat/${result.conversation_id}`);
           } else {
             setActionNotice({
@@ -164,6 +177,7 @@ export default function MessageRequests() {
       setActionNotice({ kind: "error", message: presentError(err).message });
       if (normalizeAppError(err).code === "not_found") {
         removeRequest(requestId);
+        setRows((current) => current.filter((row) => row.request.request_id !== requestId));
       }
       void loadFromBackend();
     } finally {
@@ -171,12 +185,17 @@ export default function MessageRequests() {
     }
   };
 
+  const visibleRows: RequestRow[] =
+    rows.length > 0
+      ? rows
+      : requests.map((request) => ({ request }));
+
   return (
     <div className="flex h-full min-h-0 overflow-hidden bg-base">
       <div className="flex-1 flex min-h-0 flex-col">
         <header className="flex h-14 items-center border-b border-subtle px-4">
           <h1 className="font-semibold text-primary-color">
-            Message Requests ({requests.length})
+            Message Requests ({visibleRows.length})
           </h1>
         </header>
 
@@ -195,60 +214,58 @@ export default function MessageRequests() {
 
           {loading && <div className="text-center text-muted-color">Loading...</div>}
 
-          {!loading && requests.length === 0 && (
+          {!loading && visibleRows.length === 0 && (
             <div className="text-center text-muted-color">
               <p>No pending message requests</p>
             </div>
           )}
 
           {!loading &&
-            requests.map((req) => (
-              <div key={req.request_id} className="card mb-4">
-                <div className="flex items-center gap-3 mb-2">
-                  <div className="avatar">
-                    <span>{req.sender_display_name?.[0] || "?"}</span>
+            visibleRows.map(({ request, preview }) => {
+              const author = preview?.author_user_id;
+              const acceptEnabled = canAccept(preview);
+              return (
+                <div key={request.request_id} className="card mb-4">
+                  <div className="flex items-center gap-3 mb-2">
+                    <div className="avatar">
+                      <span>{author?.[0] || "?"}</span>
+                    </div>
+                    <div>
+                      <span className="text-primary-color">
+                        {author ? `From ${author}` : "Unknown"}
+                      </span>
+                      {author && (
+                        <span className="text-muted-color text-xs block truncate">
+                          Cryptographically verified
+                        </span>
+                      )}
+                    </div>
                   </div>
-                  <div>
-                    <span className="text-primary-color">
-                      {req.sender_display_name || "Unknown"}
-                    </span>
-                    <span className="text-muted-color text-xs block truncate">
-                      {req.sender_user_id}
-                    </span>
+
+                  <div className="text-secondary-color text-sm mb-2">
+                    {request.message_count} messages - First seen{" "}
+                    {formatTime(request.first_seen_at)}
+                  </div>
+
+                  <div className="flex gap-2">
+                    <button
+                      className="btn btn-primary"
+                      onClick={() => handleAction(request, "accept", preview)}
+                      disabled={acting === request.request_id || !acceptEnabled}
+                    >
+                      {acting === request.request_id ? "Accepting..." : "Accept"}
+                    </button>
+                    <button
+                      className="btn btn-secondary"
+                      onClick={() => handleAction(request, "reject", preview)}
+                      disabled={acting === request.request_id}
+                    >
+                      Reject
+                    </button>
                   </div>
                 </div>
-
-                <div className="text-secondary-color text-sm mb-2">
-                  {req.request_kind === "group_invite" ? (
-                    <>
-                      Group invite: {req.group_title || "Untitled group"} - First seen{" "}
-                      {formatTime(req.first_seen_at)}
-                    </>
-                  ) : (
-                    <>
-                      {req.message_count} messages - First seen {formatTime(req.first_seen_at)}
-                    </>
-                  )}
-                </div>
-
-                <div className="flex gap-2">
-                  <button
-                    className="btn btn-primary"
-                    onClick={() => handleAction(req, "accept")}
-                    disabled={acting === req.request_id}
-                  >
-                    {acting === req.request_id ? "Accepting..." : "Accept"}
-                  </button>
-                  <button
-                    className="btn btn-secondary"
-                    onClick={() => handleAction(req, "reject")}
-                    disabled={acting === req.request_id}
-                  >
-                    Reject
-                  </button>
-                </div>
-              </div>
-            ))}
+              );
+            })}
         </div>
       </div>
     </div>

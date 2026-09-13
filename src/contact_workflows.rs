@@ -60,11 +60,8 @@ pub async fn accept_message_request_with_bundle_import(
         .identity_bundle_ref
         .clone()
         .filter(|value| !value.trim().is_empty())
-        .or(request.sender_bundle_share_url.clone())
         .ok_or_else(|| {
-            anyhow!(
-                "sender bundle share url is missing; the Welcome did not include an importable identity bundle"
-            )
+            anyhow!("the Welcome did not include an importable identity bundle")
         })?;
     let bundle = fetch_identity_bundle_from_url(&sender_bundle_share_url).await?;
     ensure_fetched_bundle_matches_expected_sender(&bundle, &preview.author_user_id)?;
@@ -76,7 +73,11 @@ pub async fn accept_message_request_with_bundle_import(
         })
         .await?;
     persist_driver(profile, driver)?;
-    Ok(message_request_action_from_output(&output)?.clone())
+    let mut summary = message_request_action_from_output(&output)?.clone();
+    if summary.sender_user_id.trim().is_empty() {
+        summary.sender_user_id = preview.author_user_id;
+    }
+    Ok(summary)
 }
 
 fn ensure_fetched_bundle_matches_expected_sender(
@@ -85,7 +86,7 @@ fn ensure_fetched_bundle_matches_expected_sender(
 ) -> Result<()> {
     if bundle.user_id != expected_sender_user_id {
         return Err(anyhow!(
-            "fetched identity bundle user_id does not match the message request's sender_user_id"
+            "fetched identity bundle user_id does not match the Welcome author"
         ));
     }
     Ok(())

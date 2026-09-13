@@ -6,10 +6,7 @@ import { invokeApp as invoke } from "@/lib/tauri";
 import { useConversationsStore } from "../store/conversations";
 import { useContactsStore } from "../store/contacts";
 import { useSessionStore } from "../store/session";
-import {
-  filterMessageRequestsForSession,
-  useMessageRequestsStore,
-} from "../store/requests";
+import { useMessageRequestsStore } from "../store/requests";
 import { useGroupsStore } from "../store/groups";
 import {
   getGroupSnapshot,
@@ -218,8 +215,6 @@ export function useCoreUpdate() {
       await refreshGroupsFromBackend();
       await retryPendingWelcomePickups();
 
-      let currentUserId = useSessionStore.getState().userId;
-      let currentDeviceId = useSessionStore.getState().deviceId;
       try {
         const identity = await invoke<{
           user_id?: string;
@@ -227,12 +222,10 @@ export function useCoreUpdate() {
           display_name?: string | null;
         } | null>("get_identity_info");
         if (identity?.user_id) {
-          currentUserId = identity.user_id;
           setUserId(identity.user_id);
         }
         setDisplayName(identity?.display_name ?? null);
         if (identity?.device_id) {
-          currentDeviceId = identity.device_id;
           setDeviceId(identity.device_id);
         }
       } catch (err) {
@@ -243,14 +236,9 @@ export function useCoreUpdate() {
         view_model?: { message_requests?: MessageRequestItem[] };
       }>("list_message_requests");
       if (requestsResult.view_model?.message_requests) {
-        const filtered = filterMessageRequestsForSession(
-          requestsResult.view_model.message_requests,
-          currentDeviceId,
-          currentUserId,
-        );
-        setRequests(filtered);
+        setRequests(requestsResult.view_model.message_requests);
         console.debug(
-          `[useCoreUpdate] loaded message_requests=${filtered.length}`,
+          `[useCoreUpdate] loaded message_requests=${requestsResult.view_model.message_requests.length}`,
         );
       }
     } catch (err) {
@@ -348,15 +336,9 @@ export function useCoreUpdate() {
         }
 
         if (view_model?.message_requests) {
-          const { deviceId, userId } = useSessionStore.getState();
-          const filtered = filterMessageRequestsForSession(
-            view_model.message_requests,
-            deviceId,
-            userId,
-          );
-          setRequests(filtered);
+          setRequests(view_model.message_requests);
           console.debug(
-            `[useCoreUpdate] message_requests=${filtered.length}`,
+            `[useCoreUpdate] message_requests=${view_model.message_requests.length}`,
           );
         }
       })().catch((err) => {

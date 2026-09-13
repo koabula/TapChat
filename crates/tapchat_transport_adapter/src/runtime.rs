@@ -24,13 +24,10 @@ use crate::util::{sign_hmac_token, to_camel_case_json_string, to_snake_case_json
 #[derive(Debug, Clone, Deserialize)]
 pub struct RuntimeMessageRequest {
     pub request_id: String,
-    pub recipient_device_id: String,
-    pub sender_user_id: String,
     pub first_seen_at: u64,
-    pub last_seen_at: u64,
     pub message_count: u64,
-    pub last_message_id: String,
-    pub last_conversation_id: String,
+    #[serde(default)]
+    pub welcome_bytes: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -653,16 +653,6 @@
     },
     {
       "surface": "realtime_event",
-      "path": "senderUserId",
-      "bits": "inhabited",
-      "carries": [
-        "sender_user"
-      ],
-      "signed": false,
-      "table": "sender_identity"
-    },
-    {
-      "surface": "realtime_event",
       "path": "requestId",
       "bits": "inhabited",
       "carries": [],

@@ -208,19 +208,8 @@ pub struct ContactDetailView {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MessageRequestItemView {
     pub request_id: String,
-    pub recipient_device_id: String,
-    pub sender_user_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sender_bundle_share_url: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sender_bundle_hash: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sender_display_name: Option<String>,
     pub first_seen_at: u64,
-    pub last_seen_at: u64,
     pub message_count: u64,
-    pub last_message_id: String,
-    pub last_conversation_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub welcome_bytes: Option<String>,
 }
@@ -237,8 +226,6 @@ pub struct MessageRequestActionView {
     pub auto_created_conversation: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conversation_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sender_bundle_share_url: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1197,7 +1184,6 @@ pub async fn message_request_accept(
         conversation_available,
         auto_created_conversation,
         conversation_id,
-        sender_bundle_share_url: None,
     })
 }
 
@@ -2439,16 +2425,8 @@ fn build_contact_share_url_from_base_url(
 fn map_message_request(item: MessageRequestItem) -> MessageRequestItemView {
     MessageRequestItemView {
         request_id: item.request_id,
-        recipient_device_id: item.recipient_device_id,
-        sender_user_id: item.sender_user_id,
-        sender_bundle_share_url: item.sender_bundle_share_url,
-        sender_bundle_hash: item.sender_bundle_hash,
-        sender_display_name: item.sender_display_name,
         first_seen_at: item.first_seen_at,
-        last_seen_at: item.last_seen_at,
         message_count: item.message_count,
-        last_message_id: item.last_message_id,
-        last_conversation_id: item.last_conversation_id,
         welcome_bytes: item.welcome_bytes,
     }
 }
@@ -2466,7 +2444,6 @@ fn map_message_request_action(
         conversation_available: false,
         auto_created_conversation: false,
         conversation_id: None,
-        sender_bundle_share_url: None,
     }
 }
 

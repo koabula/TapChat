@@ -220,7 +220,6 @@ test("the realtime event shape matches the ledger", () => {
     deviceId: "",
     seq: 0,
     record: undefined as never,
-    senderUserId: "",
     requestId: "",
     change: "queued"
   } satisfies Required<RealtimeEvent>;

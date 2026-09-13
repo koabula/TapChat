@@ -760,28 +760,11 @@ impl CoreDriver {
                         .and_then(|field| field.as_str())
                         .unwrap_or(&action.request_id)
                         .to_string(),
-                    sender_user_id: value
-                        .get("sender_user_id")
-                        .and_then(|field| field.as_str())
-                        .unwrap_or_default()
-                        .to_string(),
                     promoted_count: value
                         .get("promoted_count")
                         .and_then(|field| field.as_u64())
                         .unwrap_or_default(),
                     action: action.action,
-                    sender_bundle_share_url: value
-                        .get("sender_bundle_share_url")
-                        .and_then(|field| field.as_str())
-                        .map(|value| value.to_string()),
-                    sender_bundle_hash: value
-                        .get("sender_bundle_hash")
-                        .and_then(|field| field.as_str())
-                        .map(|value| value.to_string()),
-                    sender_display_name: value
-                        .get("sender_display_name")
-                        .and_then(|field| field.as_str())
-                        .map(|value| value.to_string()),
                     promoted_conversation_ids: value
                         .get("promoted_conversation_ids")
                         .and_then(|field| field.as_array())
@@ -2553,11 +2536,6 @@ fn parse_realtime_event(device_id: &str, text: &str) -> Result<CoreEvent> {
                 .transpose()?,
         },
         "message_request_changed" => RealtimeEvent::MessageRequestChanged {
-            sender_user_id: value
-                .get("sender_user_id")
-                .and_then(|value| value.as_str())
-                .ok_or_else(|| anyhow!("missing sender_user_id"))?
-                .to_string(),
             request_id: value
                 .get("request_id")
                 .and_then(|value| value.as_str())
@@ -2672,7 +2650,7 @@ mod tests {
     fn websocket_message_request_payload_maps_to_core_event() {
         let event = parse_realtime_event(
             "device:bob:phone",
-            r#"{"event":"message_request_changed","sender_user_id":"user:alice","request_id":"request:user:alice","change":"queued"}"#,
+            r#"{"event":"message_request_changed","request_id":"request:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","change":"queued"}"#,
         )
         .expect("parse");
         match event {
@@ -2681,10 +2659,9 @@ mod tests {
                 assert!(matches!(
                     event,
                     crate::ffi_api::RealtimeEvent::MessageRequestChanged {
-                        sender_user_id,
                         request_id,
                         change: crate::transport_contract::MessageRequestRealtimeChange::Queued,
-                    } if sender_user_id == "user:alice" && request_id == "request:user:alice"
+                    } if request_id == "request:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                 ));
             }
             _ => panic!("unexpected event"),

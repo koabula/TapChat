@@ -254,18 +254,15 @@ fn desktop_message_request_accept_syncs_promoted_messages_and_preserves_plaintex
 
     let readd_requests =
         with_tokio(|| async { desktop_app::message_requests_list(&alice_profile).await })?;
-    let readd_request = readd_requests
-        .iter()
-        .find(|request| request.sender_user_id == bob_user_id)
-        .with_context(|| {
-            format!(
-                "expected Alice to receive Bob's re-add request, got {:?}",
-                readd_requests
-            )
-        })?;
-    assert_eq!(
-        readd_request.last_conversation_id, bob_readd_conversation_id,
-        "message request should point at the fresh re-add conversation"
+    let readd_request = readd_requests.first().with_context(|| {
+        format!(
+            "expected Alice to receive Bob's re-add request, got {:?}",
+            readd_requests
+        )
+    })?;
+    assert!(
+        readd_request.welcome_bytes.as_ref().is_some_and(|bytes| !bytes.is_empty()),
+        "message request must carry the Welcome"
     );
     let readd_accept = with_tokio(|| async {
         desktop_app::message_request_accept(&alice_profile, &readd_request.request_id).await

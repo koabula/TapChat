@@ -908,27 +908,15 @@ export interface RealtimeEvent {
   deviceId: string;
   seq?: number;
   record?: InboxRecord;
-  senderUserId?: string;
   requestId?: string;
   change?: "queued" | "accepted" | "rejected";
 }
 
 export interface MessageRequestItem {
   requestId: string;
-  recipientDeviceId: string;
-  senderUserId: string;
-  senderBundleShareUrl?: string;
-  senderBundleHash?: string;
-  senderDisplayName?: string;
   firstSeenAt: number;
-  lastSeenAt: number;
   messageCount: number;
-  lastMessageId: string;
-  lastConversationId?: string;
   welcomeBytes?: string;
-  requestKind?: "direct" | "group_invite";
-  groupId?: string;
-  groupTitle?: string;
 }
 
 export interface MessageRequestListResult {
@@ -938,10 +926,6 @@ export interface MessageRequestListResult {
 export interface MessageRequestActionResult {
   accepted: boolean;
   requestId: string;
-  senderUserId: string;
-  senderBundleShareUrl?: string;
-  senderBundleHash?: string;
-  senderDisplayName?: string;
   promotedCount?: number;
   promotedConversationIds?: string[];
 }

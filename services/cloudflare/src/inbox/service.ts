@@ -47,14 +47,8 @@ interface MessageRequestEntry {
   requestId: string;
   recipientDeviceId: string;
   lane: string;
-  senderUserId: string;
-  senderBundleShareUrl?: string;
-  senderBundleHash?: string;
-  senderDisplayName?: string;
   firstSeenAt: number;
-  lastSeenAt: number;
   messageCount: number;
-  lastMessageId: string;
   pendingRequests: AppendEnvelopeRequest[];
   byteSize?: number;
   expiresAt?: number;
@@ -247,10 +241,6 @@ export class InboxService {
     return {
       accepted: true,
       requestId: entry.requestId,
-      senderUserId: entry.senderUserId,
-      senderBundleShareUrl: entry.senderBundleShareUrl,
-      senderBundleHash: entry.senderBundleHash,
-      senderDisplayName: entry.senderDisplayName,
       promotedCount,
       promotedConversationIds: []
     };
@@ -266,10 +256,6 @@ export class InboxService {
     return {
       accepted: true,
       requestId: entry.requestId,
-      senderUserId: entry.senderUserId,
-      senderBundleShareUrl: entry.senderBundleShareUrl,
-      senderBundleHash: entry.senderBundleHash,
-      senderDisplayName: entry.senderDisplayName,
       promotedCount: 0,
       promotedConversationIds: []
     };
@@ -477,18 +463,13 @@ export class InboxService {
       requestId: `request:${this.randomOpaqueId()}`,
       recipientDeviceId: this.deviceId,
       lane,
-      senderUserId: "",
       firstSeenAt: now,
-      lastSeenAt: now,
       messageCount: 0,
-      lastMessageId: input.envelope.mid,
       pendingRequests: [],
       byteSize: 0,
       expiresAt: now + (limits.messageRequestTtlSeconds ?? 7 * 24 * 60 * 60) * 1000
     };
-    entry.lastSeenAt = now;
     entry.messageCount += 1;
-    entry.lastMessageId = input.envelope.mid;
     entry.pendingRequests.push(input);
     entry.byteSize = (entry.byteSize ?? this.messageRequestEntryBytes(entry) - requestBytes) + requestBytes;
     entry.expiresAt ??= entry.firstSeenAt + (limits.messageRequestTtlSeconds ?? 7 * 24 * 60 * 60) * 1000;
@@ -508,7 +489,6 @@ export class InboxService {
     this.publish({
       event: "message_request_changed",
       deviceId: this.deviceId,
-      senderUserId: entry.senderUserId,
       requestId: entry.requestId,
       change: "queued"
     });
@@ -657,7 +637,6 @@ export class InboxService {
       this.publish({
         event: "message_request_changed",
         deviceId: this.deviceId,
-        senderUserId: existing.senderUserId,
         requestId: existing.requestId,
         change
       });
@@ -759,17 +738,9 @@ export class InboxService {
   private toMessageRequestItem(entry: MessageRequestEntry): MessageRequestItem {
     return {
       requestId: entry.requestId,
-      recipientDeviceId: entry.recipientDeviceId,
-      senderUserId: entry.senderUserId,
-      senderBundleShareUrl: entry.senderBundleShareUrl,
-      senderBundleHash: entry.senderBundleHash,
-      senderDisplayName: entry.senderDisplayName,
       firstSeenAt: entry.firstSeenAt,
-      lastSeenAt: entry.lastSeenAt,
       messageCount: entry.messageCount,
-      lastMessageId: entry.lastMessageId,
-      welcomeBytes: entry.pendingRequests[0]?.envelope.bytes,
-      requestKind: "direct"
+      welcomeBytes: entry.pendingRequests[0]?.envelope.bytes
     };
   }
 

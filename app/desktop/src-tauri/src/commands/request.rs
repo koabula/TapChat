@@ -1,5 +1,5 @@
 use tapchat_core::conversation::RecoveryStatus;
-use tapchat_core::ffi_api::{CoreViewModel, MessageRequestActionSummary};
+use tapchat_core::ffi_api::{CoreViewModel, MessageRequestActionSummary, WelcomePreview};
 use tapchat_core::model::{ConversationKind, ConversationState};
 use tapchat_core::persistence::ContactRelationshipStatus;
 use tapchat_core::transport_contract::MessageRequestAction;
@@ -42,23 +42,32 @@ pub async fn list_message_requests(
 }
 
 #[tauri::command]
+pub async fn preview_welcome(
+    app: AppHandle,
+    welcome_bytes: String,
+) -> crate::errors::DesktopResult<WelcomePreview> {
+    let output = drive_core_with_handle(
+        &app,
+        CoreInput::Command(CoreCommand::PreviewWelcome { welcome_bytes }),
+    )
+    .await
+    .map_err(crate::errors::DesktopError::from)?;
+    output
+        .view_model
+        .and_then(|view| view.welcome_preview)
+        .ok_or_else(|| "welcome preview was not returned by core".to_string().into())
+}
+
+#[tauri::command]
 pub async fn act_on_message_request(
     app: AppHandle,
     state: State<'_, AppState>,
     request_id: String,
     action: String,
-    sender_bundle_share_url: Option<String>,
 ) -> crate::errors::DesktopResult<MessageRequestActionOutput> {
     // Tauri's generated dispatcher already carries a sizeable stack frame on
     // Windows. Keep this command's multi-step async state machine on the heap.
-    Ok(Box::pin(act_on_message_request_impl(
-        app,
-        state,
-        request_id,
-        action,
-        sender_bundle_share_url,
-    ))
-    .await?)
+    Ok(Box::pin(act_on_message_request_impl(app, state, request_id, action)).await?)
 }
 
 async fn act_on_message_request_impl(
@@ -66,7 +75,6 @@ async fn act_on_message_request_impl(
     state: State<'_, AppState>,
     request_id: String,
     action: String,
-    sender_bundle_share_url: Option<String>,
 ) -> Result<MessageRequestActionOutput, String> {
     let action_enum = match action.as_str() {
         "accept" => MessageRequestAction::Accept,
@@ -107,11 +115,8 @@ async fn act_on_message_request_impl(
                 .identity_bundle_ref
                 .clone()
                 .filter(|value| !value.trim().is_empty())
-                .or(sender_bundle_share_url.filter(|url| !url.trim().is_empty()))
-                .or(request.sender_bundle_share_url)
                 .ok_or_else(|| {
-                    "sender bundle share url is missing; cannot safely accept this request"
-                        .to_string()
+                    "the Welcome did not include an importable identity bundle".to_string()
                 })?;
 
             let sender_bundle = tapchat_core::contact_workflows::fetch_identity_bundle_from_url(

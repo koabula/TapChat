@@ -298,20 +298,9 @@ export interface StartDirectChatResult {
 // Message Requests
 export interface MessageRequestItem {
   request_id: string;
-  recipient_device_id: string;
-  sender_user_id: string;
-  sender_bundle_share_url?: string;
-  sender_bundle_hash?: string;
-  sender_display_name?: string;
   first_seen_at: number;
-  last_seen_at: number;
   message_count: number;
-  last_message_id: string;
-  last_conversation_id: string;
   welcome_bytes?: string;
-  request_kind?: "direct" | "group_invite";
-  group_id?: string;
-  group_title?: string;
 }
 
 // Message Request Action Output (matches Rust MessageRequestActionOutput)

@@ -16,10 +16,7 @@ import MessageRequests from "./pages/requests/MessageRequests";
 import SystemBanner from "./components/SystemBanner";
 
 import { useSessionStore } from "./store/session";
-import {
-  filterMessageRequestsForSession,
-  useMessageRequestsStore,
-} from "./store/requests";
+import { useMessageRequestsStore } from "./store/requests";
 import { useCoreUpdate } from "./hooks/useCoreUpdate";
 import { useGroupSyncScheduler } from "./hooks/useGroupSyncScheduler";
 import { useGlobalShortcuts } from "./hooks/useKeyboardShortcuts";
@@ -335,13 +332,10 @@ function App() {
         return;
       }
       if (result.view_model?.message_requests) {
-        const filtered = filterMessageRequestsForSession(
-          result.view_model.message_requests,
-          after.deviceId,
-          after.userId,
+        setRequests(result.view_model.message_requests);
+        console.debug(
+          `[App] message requests refreshed count=${result.view_model.message_requests.length}`,
         );
-        setRequests(filtered);
-        console.debug(`[App] message requests refreshed count=${filtered.length}`);
       }
     };
 

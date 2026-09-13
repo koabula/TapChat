@@ -171,23 +171,6 @@ pub async fn act_on_message_request(
                     .and_then(|v| v.as_str())
                     .unwrap_or(&action.request_id)
                     .to_string(),
-                sender_user_id: value
-                    .get("sender_user_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string(),
-                sender_bundle_share_url: value
-                    .get("sender_bundle_share_url")
-                    .and_then(|v| v.as_str())
-                    .map(ToOwned::to_owned),
-                sender_bundle_hash: value
-                    .get("sender_bundle_hash")
-                    .and_then(|v| v.as_str())
-                    .map(ToOwned::to_owned),
-                sender_display_name: value
-                    .get("sender_display_name")
-                    .and_then(|v| v.as_str())
-                    .map(ToOwned::to_owned),
                 promoted_conversation_ids: value
                     .get("promoted_conversation_ids")
                     .and_then(|v| v.as_array())

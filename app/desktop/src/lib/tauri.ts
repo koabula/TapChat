@@ -245,12 +245,10 @@ export async function listMessageRequests(): Promise<CoreOutput> {
 export async function actOnMessageRequest(
   requestId: string,
   action: "accept" | "reject",
-  senderBundleShareUrl?: string
 ): Promise<CoreOutput> {
   return invoke("act_on_message_request", {
     requestId,
     action,
-    senderBundleShareUrl,
   });
 }
 

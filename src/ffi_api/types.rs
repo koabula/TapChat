@@ -590,7 +590,6 @@ pub enum RealtimeEvent {
         record: Option<InboxRecord>,
     },
     MessageRequestChanged {
-        sender_user_id: String,
         request_id: String,
         change: MessageRequestRealtimeChange,
     },

@@ -347,6 +347,7 @@ pub fn run() {
             commands::profile::reload_engine,
             // Message Requests
             commands::request::list_message_requests,
+            commands::request::preview_welcome,
             commands::request::act_on_message_request,
             commands::request::revoke_contact,
             // Cloudflare

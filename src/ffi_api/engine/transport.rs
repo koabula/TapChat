@@ -3199,27 +3199,13 @@ impl CoreEngine {
                                             "lane rotation identity_bundle_ref is empty; skipping fetch"
                                         );
                                     } else {
-                                        let already_current = self
-                                            .state
-                                            .contacts
-                                            .get(&inbound_peer_user_id)
-                                            .and_then(|contact| {
-                                                contact.bundle.identity_bundle_ref.as_deref()
-                                            })
-                                            == Some(identity_bundle_ref.as_str());
-                                        if already_current {
-                                            log::info!(
-                                                "lane rotation identity_bundle_ref matches the stored contact; skipping fetch"
-                                            );
-                                        } else {
-                                            output = merge_outputs(
-                                                output,
-                                                self.fetch_peer_identity_bundle(
-                                                    inbound_peer_user_id.clone(),
-                                                    identity_bundle_ref,
-                                                ),
-                                            );
-                                        }
+                                        output = merge_outputs(
+                                            output,
+                                            self.fetch_peer_identity_bundle(
+                                                inbound_peer_user_id.clone(),
+                                                identity_bundle_ref,
+                                            ),
+                                        );
                                     }
                                 }
                                 ApplicationPlaintextDecision::ContactAccepted {
@@ -4282,47 +4268,63 @@ impl CoreEngine {
         }
     }
 
+    fn accepted_request_peers(&self, result: &MessageRequestActionResult) -> Vec<String> {
+        let mut peers = Vec::new();
+        for conversation_id in &result.promoted_conversation_ids {
+            let Some(peer_user_id) = self
+                .state
+                .conversations
+                .get(conversation_id)
+                .map(|state| state.peer_user_id.clone())
+                .filter(|peer| !peer.trim().is_empty())
+            else {
+                continue;
+            };
+            if !peers.contains(&peer_user_id) {
+                peers.push(peer_user_id);
+            }
+        }
+        peers
+    }
+
     pub(super) fn contact_accepted_notification_output(
         &mut self,
         result: &MessageRequestActionResult,
+        peer_user_id: &str,
     ) -> CoreResult<CoreOutput> {
         if !result.accepted || result.action != MessageRequestAction::Accept {
             return Ok(CoreOutput::default());
         }
-        if result.sender_user_id.trim().is_empty() {
-            log::warn!(
-                "message request accept completed without sender_user_id; skipping contact accepted control"
-            );
+        if peer_user_id.trim().is_empty() {
             return Ok(CoreOutput::default());
         }
-        let Some(contact) = self.state.contacts.get(&result.sender_user_id) else {
+        let Some(contact) = self.state.contacts.get(peer_user_id) else {
             log::warn!(
                 "message request accept completed for {} but sender contact is missing; skipping contact accepted control",
-                redact_id("user", &result.sender_user_id)
+                redact_id("user", peer_user_id)
             );
             return Ok(CoreOutput::default());
         };
         if Self::relationship_is_removed(&contact.relationship_status) {
             log::info!(
                 "message request accept completed for {} but sender contact is removed; skipping contact accepted control",
-                redact_id("user", &result.sender_user_id)
+                redact_id("user", peer_user_id)
             );
             return Ok(CoreOutput::default());
         }
 
-        let Some((conversation_id, _)) =
-            self.active_direct_conversation_for_peer(&result.sender_user_id)
+        let Some((conversation_id, _)) = self.active_direct_conversation_for_peer(peer_user_id)
         else {
             log::warn!(
                 "message request accept completed for {} but no active direct conversation exists; skipping contact accepted",
-                redact_id("user", &result.sender_user_id)
+                redact_id("user", peer_user_id)
             );
             return Ok(CoreOutput::default());
         };
         if !self.conversation_has_direct_mls(&conversation_id) {
             log::warn!(
                 "message request accept completed for {} but the direct session is not ready; skipping contact accepted",
-                redact_id("user", &result.sender_user_id)
+                redact_id("user", peer_user_id)
             );
             return Ok(CoreOutput::default());
         }
@@ -4362,6 +4364,8 @@ impl CoreEngine {
                 format!("rejected message request {}", result.request_id)
             }
         };
+        let peers = self.accepted_request_peers(&result);
+        let sender_user_id = peers.first().cloned().unwrap_or_default();
         let status_output = CoreOutput {
             state_update: CoreStateUpdate::default(),
             effects: vec![CoreEffect::EmitUserNotification {
@@ -4374,7 +4378,7 @@ impl CoreEngine {
                 message_request_action: Some(MessageRequestActionSummary {
                     accepted: result.accepted,
                     request_id: result.request_id.clone(),
-                    sender_user_id: result.sender_user_id.clone(),
+                    sender_user_id,
                     promoted_count: result.promoted_count,
                     action: result.action,
                 }),
@@ -4386,9 +4390,14 @@ impl CoreEngine {
             }),
         };
         if result.accepted && result.action == MessageRequestAction::Accept {
-            let mut output = self.contact_accepted_notification_output(&result)?;
             let device_id = self.local_device_id_required()?;
-            output = merge_outputs(output, self.sync_inbox(device_id, None)?);
+            let mut output = self.sync_inbox(device_id, None)?;
+            for peer_user_id in &peers {
+                output = merge_outputs(
+                    output,
+                    self.contact_accepted_notification_output(&result, peer_user_id)?,
+                );
+            }
             return Ok(merge_outputs(output, status_output));
         }
         Ok(status_output)
