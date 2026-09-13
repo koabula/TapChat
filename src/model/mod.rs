@@ -322,6 +322,9 @@ pub enum DeliveryClass {
 pub enum ProtectedPayloadKind {
     Text,
     LaneRotation,
+    ContactAccepted,
+    ContactRemoved,
+    GroupWelcomePickup,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -341,18 +344,30 @@ pub struct ProtectedAppMessage {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LaneRotationBody {
-    pub inbound_lane: String,
     pub identity_bundle_ref: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContactAcceptedBody {
+    pub request_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupWelcomePickupBody {
+    pub group_id: String,
+    pub title: String,
+    pub welcome_pickup_descriptor: WelcomePickupDescriptor,
+}
+
 impl ProtectedAppMessage {
-    pub fn new_text(
+    fn assemble(
         app_message_id: String,
         conversation_id: String,
         sender_user_id: String,
         sender_device_id: String,
         recipient_user_id: String,
         mut audience_device_ids: Vec<String>,
+        payload_kind: ProtectedPayloadKind,
         body: String,
         sent_at: u64,
     ) -> CoreResult<Self> {
@@ -365,12 +380,59 @@ impl ProtectedAppMessage {
             sender_device_id,
             recipient_user_id,
             audience_device_ids,
-            payload_kind: ProtectedPayloadKind::Text,
+            payload_kind,
             body,
             sent_at,
         };
         message.validate()?;
         Ok(message)
+    }
+
+    pub fn new_text(
+        app_message_id: String,
+        conversation_id: String,
+        sender_user_id: String,
+        sender_device_id: String,
+        recipient_user_id: String,
+        audience_device_ids: Vec<String>,
+        body: String,
+        sent_at: u64,
+    ) -> CoreResult<Self> {
+        Self::assemble(
+            app_message_id,
+            conversation_id,
+            sender_user_id,
+            sender_device_id,
+            recipient_user_id,
+            audience_device_ids,
+            ProtectedPayloadKind::Text,
+            body,
+            sent_at,
+        )
+    }
+
+    pub fn new_with_kind(
+        app_message_id: String,
+        conversation_id: String,
+        sender_user_id: String,
+        sender_device_id: String,
+        recipient_user_id: String,
+        audience_device_ids: Vec<String>,
+        payload_kind: ProtectedPayloadKind,
+        body: String,
+        sent_at: u64,
+    ) -> CoreResult<Self> {
+        Self::assemble(
+            app_message_id,
+            conversation_id,
+            sender_user_id,
+            sender_device_id,
+            recipient_user_id,
+            audience_device_ids,
+            payload_kind,
+            body,
+            sent_at,
+        )
     }
 
     pub fn new_lane_rotation(
@@ -379,33 +441,27 @@ impl ProtectedAppMessage {
         sender_user_id: String,
         sender_device_id: String,
         recipient_user_id: String,
-        mut audience_device_ids: Vec<String>,
-        inbound_lane: String,
+        audience_device_ids: Vec<String>,
         identity_bundle_ref: String,
         sent_at: u64,
     ) -> CoreResult<Self> {
-        audience_device_ids.sort();
         let body = serde_json::to_string(&LaneRotationBody {
-            inbound_lane,
             identity_bundle_ref,
         })
         .map_err(|error| {
             CoreError::invalid_input(format!("lane rotation encode failed: {error}"))
         })?;
-        let message = Self {
-            version: CURRENT_MODEL_VERSION.to_string(),
+        Self::assemble(
             app_message_id,
             conversation_id,
             sender_user_id,
             sender_device_id,
             recipient_user_id,
             audience_device_ids,
-            payload_kind: ProtectedPayloadKind::LaneRotation,
+            ProtectedPayloadKind::LaneRotation,
             body,
             sent_at,
-        };
-        message.validate()?;
-        Ok(message)
+        )
     }
 
     pub fn to_json_bytes(&self) -> CoreResult<Vec<u8>> {
@@ -452,10 +508,35 @@ impl Validate for ProtectedAppMessage {
                 ));
             }
         }
+        validate_required("body", &self.body)?;
         match self.payload_kind {
-            ProtectedPayloadKind::Text | ProtectedPayloadKind::LaneRotation => {}
+            ProtectedPayloadKind::Text | ProtectedPayloadKind::ContactRemoved => Ok(()),
+            ProtectedPayloadKind::LaneRotation => {
+                let body: LaneRotationBody = serde_json::from_str(&self.body).map_err(|error| {
+                    CoreError::invalid_input(format!("lane rotation body is malformed: {error}"))
+                })?;
+                validate_required("identity_bundle_ref", &body.identity_bundle_ref)
+            }
+            ProtectedPayloadKind::ContactAccepted => {
+                let _: ContactAcceptedBody =
+                    serde_json::from_str(&self.body).map_err(|error| {
+                        CoreError::invalid_input(format!(
+                            "contact accepted body is malformed: {error}"
+                        ))
+                    })?;
+                Ok(())
+            }
+            ProtectedPayloadKind::GroupWelcomePickup => {
+                let body: GroupWelcomePickupBody =
+                    serde_json::from_str(&self.body).map_err(|error| {
+                        CoreError::invalid_input(format!(
+                            "group welcome pickup body is malformed: {error}"
+                        ))
+                    })?;
+                validate_required("group_id", &body.group_id)?;
+                body.welcome_pickup_descriptor.validate()
+            }
         }
-        validate_required("body", &self.body)
     }
 }
 

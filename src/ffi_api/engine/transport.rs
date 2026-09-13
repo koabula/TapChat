@@ -3092,63 +3092,6 @@ impl CoreEngine {
             let inbound_payload_b64 = resolved.payload_b64.clone();
             let inbound_peer_user_id = resolved.peer_user_id.clone();
             let welcome_author = resolved.welcome_author.clone();
-            if inbound_message_type == MessageType::ControlContactRemoved {
-                if self.should_ignore_idempotent_contact_removed_record(&local_user_id, &record) {
-                    log::info!(
-                        "handle_inbox_records: acking and ignoring idempotent ControlContactRemoved for archived relationship conversation_id={} sender_user_id={} message_id={}",
-                        conversation_id,
-                        inbound_peer_user_id,
-                        record.message_id
-                    );
-                    {
-                        let sync_state = self
-                            .state
-                            .sync_states
-                            .entry(device_id.clone())
-                            .or_insert_with(|| SyncEngine::new_device_state(&device_id));
-                        SyncEngine::release_quarantined(sync_state, record.seq);
-                    }
-                    advance_contiguous_ack(
-                        &mut contiguous_ack,
-                        &mut deferred_ackable_seqs,
-                        record.seq,
-                    );
-                    processed_records.push(record);
-                    continue;
-                }
-                output = merge_outputs(
-                    output,
-                    self.handle_contact_removed_record(&local_user_id, &device_id, &record)?,
-                );
-                {
-                    let sync_state = self
-                        .state
-                        .sync_states
-                        .entry(device_id.clone())
-                        .or_insert_with(|| SyncEngine::new_device_state(&device_id));
-                    SyncEngine::release_quarantined(sync_state, record.seq);
-                }
-                advance_contiguous_ack(&mut contiguous_ack, &mut deferred_ackable_seqs, record.seq);
-                processed_records.push(record);
-                continue;
-            }
-            if inbound_message_type == MessageType::ControlContactAccepted {
-                output = merge_outputs(
-                    output,
-                    self.handle_contact_accepted_record(&local_user_id, &record)?,
-                );
-                {
-                    let sync_state = self
-                        .state
-                        .sync_states
-                        .entry(device_id.clone())
-                        .or_insert_with(|| SyncEngine::new_device_state(&device_id));
-                    SyncEngine::release_quarantined(sync_state, record.seq);
-                }
-                advance_contiguous_ack(&mut contiguous_ack, &mut deferred_ackable_seqs, record.seq);
-                processed_records.push(record);
-                continue;
-            }
             if self.should_ignore_closed_relationship_record(&local_user_id, &record) {
                 log::info!(
                     "handle_inbox_records: acking and ignoring {:?} for closed relationship conversation_id={} sender_user_id={} message_id={}",
@@ -3277,6 +3220,75 @@ impl CoreEngine {
                                                 ),
                                             );
                                         }
+                                    }
+                                }
+                                ApplicationPlaintextDecision::ContactAccepted {
+                                    app_message_id,
+                                    ..
+                                } => {
+                                    self.remember_app_message_id(
+                                        &record,
+                                        app_message_id,
+                                        ciphertext_sha256.clone(),
+                                    )?;
+                                    self.observe_direct_application(&conversation_id);
+                                    output = merge_outputs(
+                                        output,
+                                        self.promote_pending_outbound_contact(
+                                            &inbound_peer_user_id,
+                                            "contact_accepted_app",
+                                        )?,
+                                    );
+                                }
+                                ApplicationPlaintextDecision::ContactRemoved { app_message_id } => {
+                                    self.remember_app_message_id(
+                                        &record,
+                                        app_message_id,
+                                        ciphertext_sha256.clone(),
+                                    )?;
+                                    output = merge_outputs(
+                                        output,
+                                        self.apply_peer_contact_removed(
+                                            &inbound_peer_user_id,
+                                            &conversation_id,
+                                        )?,
+                                    );
+                                }
+                                ApplicationPlaintextDecision::GroupWelcomePickup {
+                                    group_id,
+                                    title,
+                                    descriptor,
+                                    app_message_id,
+                                } => {
+                                    self.remember_app_message_id(
+                                        &record,
+                                        app_message_id,
+                                        ciphertext_sha256.clone(),
+                                    )?;
+                                    self.observe_direct_application(&conversation_id);
+                                    if let Some(state) =
+                                        self.state.conversations.get_mut(&conversation_id)
+                                    {
+                                        if let Some(message) = state.messages.iter_mut().rev().find(
+                                            |message| message.message_id == record.message_id,
+                                        ) {
+                                            message.plaintext =
+                                                Some(format!("Group invite: {title}"));
+                                            message.message_type =
+                                                MessageType::ControlGroupWelcomePickup;
+                                        }
+                                    }
+                                    if !self.state.group_states.contains_key(&group_id) {
+                                        output = merge_outputs(
+                                            output,
+                                            self.stage_welcome_pickup(
+                                                group_id,
+                                                descriptor,
+                                                Some(title),
+                                                Some(inbound_peer_user_id.clone()),
+                                                true,
+                                            )?,
+                                        );
                                     }
                                 }
                                 ApplicationPlaintextDecision::DuplicateAppMessage {
@@ -3676,66 +3688,6 @@ impl CoreEngine {
                         }
                     }
                     _ => {
-                        if false && inbound_message_type == MessageType::ControlGroupWelcomePickup {
-                            log::info!(
-                                "handle_inbox_records: received group welcome control message_id={} conversation_id={}",
-                                record.message_id,
-                                conversation_id
-                            );
-                            let payload_b64 = Some(inbound_payload_b64.as_str())
-                                .filter(|value| !value.is_empty())
-                                .ok_or_else(|| {
-                                    CoreError::invalid_input(
-                                        "group welcome pickup control is missing payload",
-                                    )
-                                })?;
-                            let payload = STANDARD.decode(payload_b64).map_err(|error| {
-                                CoreError::invalid_input(format!(
-                                    "failed to decode group welcome pickup control: {error}"
-                                ))
-                            })?;
-                            let invite: GroupWelcomePickupControl =
-                                serde_json::from_slice(&payload).map_err(|error| {
-                                    CoreError::invalid_input(format!(
-                                        "failed to parse group welcome pickup control: {error}"
-                                    ))
-                                })?;
-                            invite.welcome_pickup_descriptor.validate()?;
-                            if let Some(state) = self.state.conversations.get_mut(&conversation_id)
-                            {
-                                if let Some(message) = state
-                                    .messages
-                                    .iter_mut()
-                                    .find(|message| message.message_id == record.message_id)
-                                {
-                                    message.plaintext =
-                                        Some(format!("Group invite: {}", invite.title));
-                                }
-                            }
-                            if !self.state.group_states.contains_key(&invite.group_id) {
-                                log::info!(
-                                    "handle_inbox_records: fetching welcome pickup group_id={} device_id={} endpoint={}",
-                                    invite.group_id,
-                                    invite.welcome_pickup_descriptor.device_id,
-                                    invite.welcome_pickup_descriptor.endpoint
-                                );
-                                output = merge_outputs(
-                                    output,
-                                    self.stage_welcome_pickup(
-                                        invite.group_id.clone(),
-                                        invite.welcome_pickup_descriptor,
-                                        Some(invite.title),
-                                        Some(invite.inviter_user_id),
-                                        true,
-                                    )?,
-                                );
-                            } else {
-                                log::info!(
-                                    "handle_inbox_records: group welcome control ignored because group already exists group_id={}",
-                                    invite.group_id
-                                );
-                            }
-                        }
                         if apply_effect.identity_refresh_needed {
                             let peer_user_id = self.peer_user_for_conversation(&conversation_id)?;
                             output =
@@ -4358,38 +4310,44 @@ impl CoreEngine {
             return Ok(CoreOutput::default());
         }
 
-        let created_at = current_unix_millis(self.next_message_nonce());
-        let envelopes = self.build_contact_accepted_envelopes(
-            &result.sender_user_id,
-            &result.request_id,
-            &result.promoted_conversation_ids,
-            created_at,
-        )?;
-        if envelopes.is_empty() {
+        let Some((conversation_id, _)) =
+            self.active_direct_conversation_for_peer(&result.sender_user_id)
+        else {
             log::warn!(
-                "message request accept completed for {} but no active peer devices were available for contact accepted control",
+                "message request accept completed for {} but no active direct conversation exists; skipping contact accepted",
+                redact_id("user", &result.sender_user_id)
+            );
+            return Ok(CoreOutput::default());
+        };
+        if !self.conversation_has_direct_mls(&conversation_id) {
+            log::warn!(
+                "message request accept completed for {} but the direct session is not ready; skipping contact accepted",
                 redact_id("user", &result.sender_user_id)
             );
             return Ok(CoreOutput::default());
         }
-        let message_ids = envelopes
-            .iter()
-            .map(|envelope| envelope.mid.clone())
-            .collect::<Vec<_>>();
-        self.enqueue_envelopes(result.sender_user_id.clone(), envelopes);
-        let mut output = CoreOutput {
-            state_update: CoreStateUpdate::default(),
+        let body = serde_json::to_string(&ContactAcceptedBody {
+            request_id: result.request_id.clone(),
+        })
+        .map_err(|error| {
+            CoreError::invalid_input(format!("contact accepted encode failed: {error}"))
+        })?;
+        self.enqueue_protected_app(
+            &conversation_id,
+            ProtectedPayloadKind::ContactAccepted,
+            body,
+        )?;
+        self.merge_with_transport_flush(CoreOutput {
+            state_update: CoreStateUpdate {
+                messages_changed: true,
+                ..CoreStateUpdate::default()
+            },
             effects: vec![persist_effect(
                 &self.state,
-                message_ids
-                    .into_iter()
-                    .map(|message_id| PersistOp::SaveOutgoingEnvelope { message_id })
-                    .collect(),
+                self.direct_send_persist_ops(&conversation_id),
             )],
             view_model: None,
-        };
-        output = merge_outputs(output, self.flush_pending_transport()?);
-        Ok(output)
+        })
     }
 
     pub(super) fn message_request_action_output(

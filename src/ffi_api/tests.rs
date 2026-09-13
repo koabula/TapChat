@@ -952,18 +952,47 @@ mod tests {
                 .count(),
             2
         );
+        let for_invitees = alice
+            .state
+            .pending_outbox
+            .iter()
+            .filter(|item| {
+                item.envelope.recipient_device_id == bob_bundle.devices[0].device_id
+                    || item.envelope.recipient_device_id == carol_bundle.devices[0].device_id
+            })
+            .cloned()
+            .collect::<Vec<_>>();
         assert_eq!(
-            alice
-                .state
-                .pending_outbox
+            for_invitees
                 .iter()
                 .filter(|item| crate::mls_adapter::MlsAdapter::payload_is_welcome(
                     item.envelope.payload_b64().unwrap_or_default()
                 ))
                 .count(),
-            0,
-            "group welcome pickup must not travel as a 1:1 envelope"
+            2,
+            "invitees without a 1:1 session must receive a Welcome first"
         );
+        assert_eq!(
+            for_invitees
+                .iter()
+                .filter(|item| envelope_is_wrapped_app(&item.envelope))
+                .count(),
+            2,
+            "the group invite must then ride a wrapped application frame"
+        );
+        for item in &for_invitees {
+            let payload = item.envelope.payload_b64().unwrap_or_default();
+            if crate::mls_adapter::MlsAdapter::payload_is_welcome(payload) {
+                continue;
+            }
+            assert!(
+                envelope_is_wrapped_app(&item.envelope),
+                "1:1 inbox must not carry a parseable non-Welcome record"
+            );
+            let visible = host_visible_envelope_json(&item.envelope);
+            assert!(!visible.contains("control_group_welcome_pickup"));
+            assert!(!visible.contains("Project"));
+        }
     }
 
     #[test]
@@ -4055,8 +4084,19 @@ mod tests {
                     .is_some_and(|text| text.contains("archived"))
         }));
         assert!(!alice.state.mls_summaries.contains_key(&conversation_id));
-        assert!(alice.state.pending_outbox.iter().all(|item| { false }));
+        assert!(
+            alice
+                .state
+                .pending_outbox
+                .iter()
+                .all(|item| envelope_is_wrapped_app(&item.envelope)),
+            "contact removed must leave only wrapped MLS application frames"
+        );
         let pending_after_delete = alice.state.pending_outbox.len();
+        assert!(
+            pending_after_delete > 0,
+            "contact removed must notify the peer before the session is torn down"
+        );
         let send_err = alice
             .handle_command(CoreCommand::SendTextMessage {
                 conversation_id: conversation_id.clone(),
@@ -4083,7 +4123,17 @@ mod tests {
             .mls_states
             .iter()
             .any(|state| state.conversation_id == conversation_id));
-        assert!(snapshot.pending_outbox.iter().all(|item| { false }));
+        assert!(
+            !snapshot.pending_outbox.is_empty(),
+            "delete_contact must leave a wrapped ContactRemoved frame for the peer"
+        );
+        assert!(
+            snapshot
+                .pending_outbox
+                .iter()
+                .all(|item| envelope_is_wrapped_app(&item.envelope)),
+            "the leftover outbox must stay typeless wrapped MLS, not a parseable control"
+        );
 
         let refreshed_bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "laptop");
         alice
@@ -4231,12 +4281,132 @@ mod tests {
             })
             .expect("alice deletes bob");
         assert!(
-            alice.state.pending_outbox.is_empty(),
-            "1:1 ControlContactRemoved is not expressible this submit"
+            alice
+                .state
+                .pending_outbox
+                .iter()
+                .all(|item| envelope_is_wrapped_app(&item.envelope)),
+            "contact removed rides MLS; the 1:1 header stays typeless"
         );
+        assert!(!alice.state.pending_outbox.is_empty());
         assert!(!alice.state.contacts.contains_key(&bob_bundle.user_id));
         assert!(!alice.state.mls_summaries.contains_key(&conversation_id));
         assert!(bob.state.contacts.contains_key(&alice_bundle.user_id));
+    }
+
+    #[test]
+    fn contact_removed_rides_the_direct_session() {
+        let mut chat = paired_direct_chat();
+        let bob_user_id = chat
+            .bob
+            .state
+            .local_identity
+            .as_ref()
+            .expect("bob identity")
+            .user_identity
+            .user_id
+            .clone();
+        let alice_user_id = chat
+            .alice
+            .state
+            .local_identity
+            .as_ref()
+            .expect("alice identity")
+            .user_identity
+            .user_id
+            .clone();
+        chat.alice
+            .handle_command(CoreCommand::DeleteContact {
+                user_id: bob_user_id.clone(),
+            })
+            .expect("alice deletes bob");
+        assert!(!chat.alice.state.pending_outbox.is_empty());
+        for item in &chat.alice.state.pending_outbox {
+            assert!(envelope_is_wrapped_app(&item.envelope));
+            let visible = host_visible_envelope_json(&item.envelope);
+            assert!(
+                !visible.contains("control_contact_removed"),
+                "removed notify must not name a control type on the wire"
+            );
+        }
+        deliver_pending_outbox_to_device(&mut chat.bob, &chat.alice, &chat.bob_device_id);
+        let bob_conversation = chat
+            .bob
+            .state
+            .conversations
+            .get(&chat.conversation_id)
+            .expect("bob conversation");
+        assert_eq!(
+            bob_conversation.conversation.state,
+            crate::model::ConversationState::Archived
+        );
+        assert_eq!(
+            chat.bob
+                .state
+                .contacts
+                .get(&alice_user_id)
+                .expect("alice contact")
+                .relationship_status,
+            ContactRelationshipStatus::RemovedByPeer
+        );
+    }
+
+    #[test]
+    fn contact_accepted_rides_the_direct_session() {
+        let mut alice = local_engine(ALICE_MNEMONIC, "phone");
+        let alice_bundle = alice.local_bundle().expect("alice bundle").clone();
+        let mut bob = local_engine(BOB_MNEMONIC, "phone");
+        let bob_bundle = bob.local_bundle().expect("bob bundle").clone();
+        alice
+            .handle_command(CoreCommand::ImportIdentityBundle {
+                bundle: bob_bundle.clone(),
+            })
+            .expect("alice imports bob");
+        bob.handle_command(CoreCommand::ImportIdentityBundleWithRelationshipStatus {
+            bundle: alice_bundle.clone(),
+            relationship_status: ContactRelationshipStatus::PendingOutbound,
+        })
+        .expect("bob imports alice as pending outbound");
+        let conversation_id = create_direct_conversation(&mut bob, alice_bundle.user_id.clone());
+        let alice_device_id = alice.local_device_id().expect("alice device").to_string();
+        let bob_device_id = bob.local_device_id().expect("bob device").to_string();
+        deliver_pending_outbox_to_device(&mut alice, &bob, &alice_device_id);
+        alice
+            .handle_event(CoreEvent::MessageRequestActionCompleted {
+                result: accepted_request_result(&bob_bundle.user_id, &conversation_id),
+            })
+            .expect("alice accepts");
+        assert!(
+            alice
+                .state
+                .pending_outbox
+                .iter()
+                .any(|item| envelope_is_wrapped_app(&item.envelope)),
+            "accept must send a wrapped MLS application frame"
+        );
+        deliver_pending_outbox_to_device(&mut bob, &alice, &bob_device_id);
+        assert_eq!(
+            bob.state
+                .contacts
+                .get(&alice_bundle.user_id)
+                .expect("alice contact")
+                .relationship_status,
+            ContactRelationshipStatus::Available
+        );
+    }
+
+    #[test]
+    fn lane_rotation_body_is_only_bundle_ref() {
+        let body = crate::model::LaneRotationBody {
+            identity_bundle_ref: "https://example.test/v1/contact-share/bob".into(),
+        };
+        let json = serde_json::to_value(&body).expect("lane rotation json");
+        let object = json.as_object().expect("object");
+        assert_eq!(
+            object.keys().cloned().collect::<Vec<_>>(),
+            vec!["identity_bundle_ref".to_string()]
+        );
+        assert!(!object.contains_key("inbound_lane"));
     }
 
     #[test]
@@ -4261,7 +4431,13 @@ mod tests {
                 user_id: bob_bundle.user_id.clone(),
             })
             .expect("alice deletes bob");
-        assert!(alice.state.pending_outbox.is_empty());
+        assert!(
+            alice
+                .state
+                .pending_outbox
+                .iter()
+                .all(|item| envelope_is_wrapped_app(&item.envelope))
+        );
 
         let bob_device_id = bob.local_device_id().expect("bob device").to_string();
         let late = InboxRecord {
@@ -4341,7 +4517,7 @@ mod tests {
 
         assert!(
             alice.state.pending_outbox.is_empty(),
-            "1:1 control envelopes are not expressible; accept must not synthesize one"
+            "accept without a local MLS session must not enqueue a contact-accepted frame"
         );
         assert!(bob.state.pending_outbox.is_empty());
     }
@@ -4370,7 +4546,7 @@ mod tests {
 
         assert!(
             alice.state.pending_outbox.is_empty(),
-            "1:1 ControlContactAccepted is not expressible this submit"
+            "accept without those conversations locally must not enqueue a contact-accepted frame"
         );
     }
 
@@ -5544,7 +5720,7 @@ mod tests {
             .expect("alice accepts bob request");
         assert!(
             alice.state.pending_outbox.is_empty(),
-            "1:1 ControlContactAccepted is not expressible this submit"
+            "accept without a local MLS session must not enqueue a contact-accepted frame"
         );
         assert_eq!(
             bob.state
@@ -6666,21 +6842,6 @@ mod tests {
             .device_identity
             .device_id
             .clone();
-        let local_user_id = engine
-            .state
-            .local_identity
-            .as_ref()
-            .expect("identity")
-            .user_identity
-            .user_id
-            .clone();
-        let _peer_user_id = engine
-            .state
-            .contacts
-            .keys()
-            .next()
-            .expect("contact")
-            .clone();
 
         let sync = engine
             .handle_command(CoreCommand::SyncInbox {
@@ -6709,8 +6870,6 @@ mod tests {
                             &bob_identity,
                             &device_id,
                             1,
-                            &local_user_id,
-                            MessageType::ControlDeviceMembershipChanged,
                         )],
                     })
                     .to_string(),
@@ -7916,14 +8075,6 @@ mod tests {
             .device_identity
             .device_id
             .clone();
-        let local_user_id = engine
-            .state
-            .local_identity
-            .as_ref()
-            .expect("identity")
-            .user_identity
-            .user_id
-            .clone();
 
         let sync = engine
             .handle_command(CoreCommand::SyncInbox {
@@ -7951,8 +8102,6 @@ mod tests {
                             &bob_identity,
                             &device_id,
                             1,
-                            &local_user_id,
-                            MessageType::ControlDeviceMembershipChanged,
                         )],
                     })
                     .to_string(),
@@ -8146,21 +8295,7 @@ mod tests {
             .device_identity
             .device_id
             .clone();
-        let local_user_id = engine
-            .state
-            .local_identity
-            .as_ref()
-            .expect("identity")
-            .user_identity
-            .user_id
-            .clone();
-        let record = signed_control_record_from(
-            &bob_identity,
-            &device_id,
-            1,
-            &local_user_id,
-            MessageType::ControlDeviceMembershipChanged,
-        );
+        let record = signed_control_record_from(&bob_identity, &device_id, 1);
 
         engine
             .handle_event(CoreEvent::RealtimeEventReceived {
@@ -8201,22 +8336,8 @@ mod tests {
             .device_identity
             .device_id
             .clone();
-        let local_user_id = engine
-            .state
-            .local_identity
-            .as_ref()
-            .expect("identity")
-            .user_identity
-            .user_id
-            .clone();
 
-        let record = signed_control_record_from(
-            &bob_identity,
-            &device_id,
-            1,
-            &local_user_id,
-            MessageType::ControlDeviceMembershipChanged,
-        );
+        let record = signed_control_record_from(&bob_identity, &device_id, 1);
 
         engine
             .handle_event(CoreEvent::InboxRecordsFetched {
@@ -8957,33 +9078,7 @@ mod tests {
             .device_identity
             .device_id
             .clone();
-        let local_user_id = alice
-            .state
-            .local_identity
-            .as_ref()
-            .expect("identity")
-            .user_identity
-            .user_id
-            .clone();
-        let peer_user_id = alice.state.contacts.keys().next().expect("contact").clone();
-        let peer_device_id = alice
-            .state
-            .contacts
-            .values()
-            .next()
-            .expect("contact")
-            .bundle
-            .devices[0]
-            .device_id
-            .clone();
-        let record = sample_control_record_with_type(
-            &device_id,
-            1,
-            &local_user_id,
-            &peer_user_id,
-            &peer_device_id,
-            MessageType::ControlConversationNeedsRebuild,
-        );
+        let record = sample_control_record_with_type(&device_id, 1);
         let conversation_id = format!("control:{}", record.message_id);
         let seq = record.seq;
 
@@ -11138,16 +11233,29 @@ mod tests {
                                     .into_owned()
                             })
                             .expect("claim url must contain a device id");
-                        let key_package_b64 = self
-                            .bundles
+                        let key_package_b64 = user
+                            .engine
+                            .state
+                            .contacts
                             .values()
-                            .find_map(|bundle| {
-                                bundle
+                            .find_map(|contact| {
+                                contact
+                                    .bundle
                                     .devices
                                     .iter()
                                     .find(|device| device.device_id == device_id)
                                     .and_then(|device| device.keypackage_ref.as_ref())
                                     .map(|keypackage_ref| keypackage_ref.object_ref.clone())
+                            })
+                            .or_else(|| {
+                                self.bundles.values().find_map(|bundle| {
+                                    bundle
+                                        .devices
+                                        .iter()
+                                        .find(|device| device.device_id == device_id)
+                                        .and_then(|device| device.keypackage_ref.as_ref())
+                                        .map(|keypackage_ref| keypackage_ref.object_ref.clone())
+                                })
                             })
                             .expect(
                                 "group harness must have a cached key package to simulate a claim response",
@@ -11171,7 +11279,15 @@ mod tests {
                             })
                             .expect("claim response applied")
                     }
-                    CoreEffect::PersistState { .. }
+                    CoreEffect::RegisterAcceptedLane { register } => user
+                        .engine
+                        .handle_event(CoreEvent::AcceptedLaneRegistered {
+                            lane: register.lane,
+                        })
+                        .expect("accepted lane registered"),
+                    CoreEffect::RevokeAcceptedLanes { .. }
+                    | CoreEffect::FetchIdentityBundle { .. }
+                    | CoreEffect::PersistState { .. }
                     | CoreEffect::EmitUserNotification { .. }
                     | CoreEffect::ExecuteHttpRequest { .. }
                     | CoreEffect::ScheduleTimer { .. }
@@ -11449,6 +11565,57 @@ mod tests {
         }
     }
 
+    #[test]
+    fn group_invite_rides_the_direct_session() {
+        let mut alice = harness_user("alice", ALICE_MNEMONIC, "phone");
+        let mut bob = harness_user("bob", BOB_MNEMONIC, "phone");
+        import_peer_bundles(&mut [&mut alice, &mut bob]);
+        assert!(alice.engine.state.conversations.values().all(|conversation| {
+            conversation.conversation.kind != ConversationKind::Direct
+                || conversation.peer_user_id != bob.bundle.user_id
+        }));
+        let mut harness = GroupHarness::with_bundles(&[&alice, &bob].map(|user| HarnessUser {
+            name: user.name,
+            bundle: user.bundle.clone(),
+            engine: CoreEngine::new(),
+        }));
+        harness.create_group(&mut alice, "Family", vec![bob.bundle.user_id.clone()]);
+        let bob_device = bob.bundle.devices[0].device_id.clone();
+        let for_bob = alice
+            .engine
+            .state
+            .pending_outbox
+            .iter()
+            .filter(|item| item.envelope.recipient_device_id == bob_device)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(
+            for_bob.iter().any(|item| MlsAdapter::payload_is_welcome(
+                item.envelope.payload_b64().unwrap_or_default()
+            )),
+            "inviting a contact with no 1:1 session must emit a Welcome first"
+        );
+        assert!(
+            for_bob
+                .iter()
+                .any(|item| envelope_is_wrapped_app(&item.envelope)),
+            "the group invite must then ride a wrapped application frame"
+        );
+        for item in &for_bob {
+            let payload = item.envelope.payload_b64().unwrap_or_default();
+            if MlsAdapter::payload_is_welcome(payload) {
+                continue;
+            }
+            assert!(
+                envelope_is_wrapped_app(&item.envelope),
+                "1:1 inbox must not carry a parseable non-Welcome record"
+            );
+            let visible = host_visible_envelope_json(&item.envelope);
+            assert!(!visible.contains("control_group_welcome_pickup"));
+            assert!(!visible.contains("Family"));
+        }
+    }
+
     fn group_plaintexts(user: &HarnessUser, conversation_id: &str) -> Vec<String> {
         user.engine
             .state
@@ -11541,9 +11708,10 @@ mod tests {
             })
             .collect::<Vec<_>>();
         for descriptor in welcome_descriptors {
-            engine
+            let output = engine
                 .handle_event(CoreEvent::WelcomePickupPut { descriptor })
                 .expect("acknowledge welcome pickup");
+            simulate_pending_key_package_claims(engine, output);
         }
         output
     }
@@ -12653,6 +12821,26 @@ mod tests {
             .clone()
     }
 
+    fn envelope_is_wrapped_app(envelope: &Envelope) -> bool {
+        let Some(payload) = envelope.payload_b64() else {
+            return false;
+        };
+        if MlsAdapter::payload_is_welcome(payload) {
+            return false;
+        }
+        let Ok(raw) = STANDARD.decode(payload.as_bytes()) else {
+            return false;
+        };
+        serde_json::from_slice::<serde_json::Value>(&raw)
+            .ok()
+            .and_then(|value| value.get("payload_kind").cloned())
+            .is_none()
+    }
+
+    fn host_visible_envelope_json(envelope: &Envelope) -> String {
+        serde_json::to_string(envelope).expect("envelope json")
+    }
+
     fn deliver_pending_outbox_to_device(
         recipient: &mut CoreEngine,
         sender: &CoreEngine,
@@ -13176,27 +13364,17 @@ mod tests {
         (identity, bundle)
     }
 
-    /// A control record genuinely signed by `sender_identity`.
+    /// A 1:1 inbox record that is not a Welcome and has no wrap.
     ///
-    /// The receiver must hold the bundle exported from this same identity, or
-    /// the sender proof will not verify.
+    /// After R3-2 the inbox does not classify by `message_type`; unknown-lane
+    /// non-Welcome frames are acked with zero state change.
     fn signed_control_record_from(
         sender_identity: &crate::identity::LocalIdentityState,
         device_id: &str,
         seq: u64,
-        local_user_id: &str,
-        message_type: MessageType,
     ) -> InboxRecord {
-        let mut record = sample_control_record_with_type(
-            device_id,
-            seq,
-            local_user_id,
-            &sender_identity.user_identity.user_id,
-            &sender_identity.device_identity.device_id,
-            message_type,
-        );
         let _ = sender_identity;
-        record
+        sample_control_record_with_type(device_id, seq)
     }
 
     fn pending_application_record(sender: &CoreEngine, device_id: &str) -> InboxRecord {
@@ -13323,16 +13501,7 @@ mod tests {
         }
     }
 
-    fn sample_control_record_with_type(
-        device_id: &str,
-        seq: u64,
-        local_user_id: &str,
-        sender_user_id: &str,
-        sender_device_id: &str,
-        message_type: MessageType,
-    ) -> InboxRecord {
-        let mut users = [local_user_id.to_string(), sender_user_id.to_string()];
-        users.sort();
+    fn sample_control_record_with_type(device_id: &str, seq: u64) -> InboxRecord {
         InboxRecord {
             seq,
             recipient_device_id: device_id.into(),

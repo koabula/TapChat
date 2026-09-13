@@ -348,11 +348,6 @@ impl ConversationManager {
                 state.recovery_status = RecoveryStatus::NeedsRebuild;
                 effect.needs_rebuild = true;
             }
-            MessageType::ControlDeviceMembershipChanged => {
-                state.recovery_status = RecoveryStatus::NeedsRecovery;
-                effect.identity_refresh_needed = true;
-                effect.membership_refresh_needed = true;
-            }
             MessageType::ControlIdentityStateUpdated => {
                 state.recovery_status = RecoveryStatus::NeedsRecovery;
                 effect.identity_refresh_needed = true;
@@ -504,7 +499,7 @@ mod tests {
     }
 
     #[test]
-    fn control_membership_changed_requests_refresh() {
+    fn inbound_membership_control_does_not_request_refresh() {
         let mut state: LocalConversationState = ConversationManager::create_direct_conversation(
             "user:alice",
             "device:alice:phone",
@@ -528,9 +523,9 @@ mod tests {
         )
         .expect("apply should succeed");
 
-        assert!(effect.identity_refresh_needed);
-        assert!(effect.membership_refresh_needed);
-        assert_eq!(state.recovery_status, RecoveryStatus::NeedsRecovery);
+        assert!(!effect.identity_refresh_needed);
+        assert!(!effect.membership_refresh_needed);
+        assert_eq!(state.recovery_status, RecoveryStatus::Healthy);
     }
 
     #[test]

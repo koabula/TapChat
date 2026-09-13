@@ -45,8 +45,9 @@ use crate::model::{
     GroupMemberDevice, GroupMemberInvitePolicy, GroupMemberStatus, GroupMembershipProof,
     GroupMessageType, GroupOutboxDescriptor, GroupOutboxRecord, GroupOutboxRecordState, GroupRole,
     GroupStateEvent, GroupStateEventKind, GroupTransitionOperation, GroupTransitionRequestBinding,
-    IdentityBundle, InboxRecord, MessageType, MlsStateStatus, MlsStateSummary, ProtectedAppMessage,
-    ProtectedPayloadKind, SenderProof, StorageRef, Validate, WelcomePickupDescriptor,
+    ContactAcceptedBody, GroupWelcomePickupBody, IdentityBundle, InboxRecord, MessageType,
+    MlsStateStatus, MlsStateSummary, ProtectedAppMessage, ProtectedPayloadKind, SenderProof,
+    StorageRef, Validate, WelcomePickupDescriptor,
 };
 use crate::persistence::{
     ContactRelationshipStatus, CorePersistenceSnapshot, GroupConsistencyState,
@@ -110,24 +111,20 @@ enum InboxRecordSource {
 /// Rejection is by design invisible — no error state, no log, no retry — so a
 /// variant that fell through the allowlist would be close to undiagnosable.
 ///
-/// Four variants have no honest producer on this path: nothing ever builds a
-/// direct envelope carrying `MlsProposal`, `ControlIdentityStateUpdated`,
-/// `ControlConversationNeedsRebuild` or `ControlGroupStateEvent` — those exist
-/// only as group-outbox message types projected onto stored messages. Two of
-/// them were pure attack surface: one forced a conversation rebuild, the other
-/// triggered an outbound identity fetch.
+/// 1:1 inbox records resolve to one of these three MLS wire formats after
+/// unwrap (or a bare Welcome). Control traffic lives inside application
+/// plaintext (`ProtectedPayloadKind`); the remaining `MessageType` variants
+/// are local / group-outbox projections and are not inbox-deliverable.
 pub(crate) const fn inbox_deliverable(message_type: MessageType) -> bool {
     match message_type {
-        MessageType::MlsApplication
-        | MessageType::MlsCommit
-        | MessageType::MlsWelcome
-        | MessageType::ControlContactRemoved
-        | MessageType::ControlContactAccepted
-        | MessageType::ControlDeviceMembershipChanged
-        | MessageType::ControlGroupWelcomePickup => true,
+        MessageType::MlsApplication | MessageType::MlsCommit | MessageType::MlsWelcome => true,
         MessageType::MlsProposal
+        | MessageType::ControlDeviceMembershipChanged
         | MessageType::ControlIdentityStateUpdated
         | MessageType::ControlConversationNeedsRebuild
+        | MessageType::ControlContactRemoved
+        | MessageType::ControlContactAccepted
+        | MessageType::ControlGroupWelcomePickup
         | MessageType::ControlGroupStateEvent => false,
     }
 }
@@ -176,49 +173,6 @@ pub struct RealtimeSessionSnapshot {
     pub needs_reconnect: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GroupWelcomePickupControl {
-    version: String,
-    #[serde(alias = "group_id")]
-    group_id: String,
-    #[serde(alias = "conversation_id")]
-    conversation_id: String,
-    title: String,
-    #[serde(alias = "inviter_user_id")]
-    inviter_user_id: String,
-    #[serde(alias = "welcome_pickup_descriptor")]
-    welcome_pickup_descriptor: WelcomePickupDescriptor,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct ContactRemovedControl {
-    version: String,
-    #[serde(alias = "conversation_id")]
-    conversation_id: String,
-    #[serde(alias = "actor_user_id")]
-    actor_user_id: String,
-    #[serde(alias = "removed_user_id")]
-    removed_user_id: String,
-    #[serde(alias = "created_at")]
-    created_at: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct ContactAcceptedControl {
-    version: String,
-    #[serde(alias = "conversation_id")]
-    conversation_id: String,
-    #[serde(alias = "actor_user_id")]
-    actor_user_id: String,
-    #[serde(alias = "accepted_user_id")]
-    accepted_user_id: String,
-    #[serde(alias = "request_id")]
-    request_id: String,
-    #[serde(alias = "created_at")]
-    created_at: u64,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ParsedMlsSenderIdentity {
     user_id: String,
@@ -233,6 +187,19 @@ enum ApplicationPlaintextDecision {
     },
     LaneRotation {
         identity_bundle_ref: String,
+        app_message_id: String,
+    },
+    ContactAccepted {
+        request_id: String,
+        app_message_id: String,
+    },
+    ContactRemoved {
+        app_message_id: String,
+    },
+    GroupWelcomePickup {
+        group_id: String,
+        title: String,
+        descriptor: WelcomePickupDescriptor,
         app_message_id: String,
     },
     DuplicateAppMessage {
@@ -762,6 +729,7 @@ impl CoreEngine {
                     .and_then(|deployment| deployment.pending_identity_publication.clone()),
                 pending_requests: BTreeMap::new(),
                 pending_key_package_claim_batches: BTreeMap::new(),
+                pending_direct_app: BTreeMap::new(),
                 request_nonce: 0,
                 message_nonce: snapshot.message_nonce,
                 recovery_contexts,
@@ -3599,7 +3567,7 @@ mod protected_application_message_tests {
     }
 
     #[test]
-    fn legacy_plaintext_is_accepted_but_malformed_wrapper_is_rejected() {
+    fn non_protected_plaintext_is_rejected() {
         let mut engine = CoreEngine::default();
         seed_direct_conversation(&mut engine);
         let record = sample_record();
@@ -3611,10 +3579,7 @@ mod protected_application_message_tests {
         );
         assert!(matches!(
             legacy,
-            ApplicationPlaintextDecision::Accepted {
-                app_message_id: None,
-                ..
-            }
+            ApplicationPlaintextDecision::RejectedProtocol { .. }
         ));
 
         let malformed = serde_json::json!({

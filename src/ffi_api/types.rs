@@ -10,8 +10,8 @@ use crate::mls_adapter::{MlsAdapter, PeerDeviceKeyPackage, PublishedKeyPackage};
 use crate::model::{
     Ack, ConversationKind, ConversationMember, DeploymentBundle, Envelope, GroupCursor,
     GroupEnvelope, GroupInviteDocument, GroupJoinRequest, GroupLeaveRequest, GroupRole,
-    IdentityBundle, InboxRecord, MessageType, MlsStateStatus, MlsStateSummary, StorageRef,
-    WelcomePickupDescriptor,
+    IdentityBundle, InboxRecord, MessageType, MlsStateStatus, MlsStateSummary, ProtectedPayloadKind,
+    StorageRef, WelcomePickupDescriptor,
 };
 use crate::persistence::{
     ContactRelationshipStatus, CorePersistenceSnapshot, PersistOp, PersistedContact,
@@ -1353,6 +1353,10 @@ pub(crate) struct CoreState {
     /// In-flight sequential-claim KeyPackage batches, keyed by creation_id.
     /// Not persisted — see `PendingKeyPackageClaimBatch` doc comment.
     pub(crate) pending_key_package_claim_batches: BTreeMap<String, PendingKeyPackageClaimBatch>,
+    /// Control app messages waiting for a 1:1 session that is still claiming
+    /// KeyPackages. Keyed by conversation_id. Not persisted — same contract
+    /// as `pending_key_package_claim_batches`.
+    pub(crate) pending_direct_app: BTreeMap<String, Vec<PendingDirectApp>>,
     pub(crate) request_nonce: u64,
     pub(crate) message_nonce: u64,
     pub(crate) recovery_contexts: BTreeMap<String, RecoveryContext>,
@@ -1485,6 +1489,12 @@ pub(crate) struct PendingKeyPackageClaimBatch {
     pub(crate) resolved_key_packages: Vec<PeerDeviceKeyPackage>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingDirectApp {
+    pub kind: ProtectedPayloadKind,
+    pub body: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RecoveryReason {
@@ -1600,6 +1610,7 @@ impl Default for CoreState {
             pending_identity_publication: None,
             pending_requests: BTreeMap::new(),
             pending_key_package_claim_batches: BTreeMap::new(),
+            pending_direct_app: BTreeMap::new(),
             request_nonce: 0,
             message_nonce: 0,
             recovery_contexts: BTreeMap::new(),

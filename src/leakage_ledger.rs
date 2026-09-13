@@ -898,8 +898,8 @@ mod tests {
         assert_eq!(
             declared, deliverable,
             "contracts/leakage-ledger.json must declare the payload protection of exactly \
-             the inbox-deliverable message types. Four of them are cleartext today, which \
-             is the same class of leak as the certificate removed in R1."
+             the inbox-deliverable message types. After R3-2 those are the three MLS \
+             wire formats; control traffic lives inside application plaintext."
         );
     }
 

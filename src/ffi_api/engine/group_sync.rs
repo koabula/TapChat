@@ -322,10 +322,6 @@ impl CoreEngine {
                 }
             }
         }
-        // Group welcome pickup is published on the group path. A 1:1
-        // ControlGroupWelcomePickup envelope is no longer expressible; submit 2
-        // will carry the notify as an MLS payload_kind when a session exists.
-        let _ = group_state;
         let mut output = CoreOutput {
             state_update: CoreStateUpdate {
                 checkpoints_changed: true,
@@ -337,6 +333,41 @@ impl CoreEngine {
                 ..CoreViewModel::default()
             }),
         };
+        let title = group_state
+            .as_ref()
+            .map(|state| state.manifest.title.clone())
+            .unwrap_or_default();
+        if let Some(invitee_user_id) = self.contact_user_id_for_device(&descriptor.device_id) {
+            match serde_json::to_string(&GroupWelcomePickupBody {
+                group_id: descriptor.group_id.clone(),
+                title,
+                welcome_pickup_descriptor: descriptor.clone(),
+            }) {
+                Ok(body) => match self.enqueue_or_create_direct_app(
+                    &invitee_user_id,
+                    ProtectedPayloadKind::GroupWelcomePickup,
+                    body,
+                ) {
+                    Ok(notify) => output = merge_outputs(output, notify),
+                    Err(error) => log::warn!(
+                        "group welcome pickup notify failed group_id={} invitee={}: {}",
+                        redact_id("group", &descriptor.group_id),
+                        redact_id("user", &invitee_user_id),
+                        error.message()
+                    ),
+                },
+                Err(error) => log::warn!(
+                    "group welcome pickup body encode failed group_id={}: {error}",
+                    redact_id("group", &descriptor.group_id)
+                ),
+            }
+        } else {
+            log::warn!(
+                "group welcome pickup has no contact for device_id={} group_id={}",
+                redact_id("device", &descriptor.device_id),
+                redact_id("group", &descriptor.group_id)
+            );
+        }
         if let Some((request_id, transition_id, manifest, start_seq)) = completed_join {
             let state = self
                 .state

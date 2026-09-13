@@ -286,11 +286,7 @@ impl CoreEngine {
         revoked_devices: Vec<String>,
         resolved_key_packages: Vec<PeerDeviceKeyPackage>,
     ) -> CoreResult<CoreOutput> {
-        let mut generated = self.build_control_membership_changed_messages(
-            &conversation_id,
-            &peer_user_id,
-            &peer_active_device_ids,
-        )?;
+        let mut generated = Vec::new();
         let output = CoreOutput::default();
         if !resolved_key_packages.is_empty() {
             let artifacts = self
@@ -319,7 +315,16 @@ impl CoreEngine {
                 &artifacts,
             )?);
         }
-        self.enqueue_envelopes(peer_user_id, generated.clone());
+        self.enqueue_envelopes(peer_user_id.clone(), generated.clone());
+        if let Err(error) =
+            self.enqueue_lane_rotation(&conversation_id, &peer_user_id, &peer_active_device_ids)
+        {
+            log::warn!(
+                "membership reconcile lane rotation failed conversation_id={}: {}",
+                conversation_id,
+                error.message()
+            );
+        }
         self.mark_recovery_needed(&conversation_id, RecoveryReason::MembershipChanged);
         self.merge_with_transport_flush(merge_outputs(
             output,

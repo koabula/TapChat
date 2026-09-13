@@ -1047,6 +1047,12 @@ impl CoreEngine {
             )?);
         }
         self.enqueue_envelopes(peer_user_id.clone(), generated.clone());
+        if let Err(error) = self.flush_pending_direct_app(&conversation_id) {
+            log::warn!(
+                "pending direct app after conversation create failed conversation_id={}: {error}",
+                redact_id("conv", &conversation_id)
+            );
+        }
         let persist_ops = vec![
             PersistOp::SaveConversation {
                 conversation_id: conversation_id.clone(),
@@ -1730,6 +1736,184 @@ impl CoreEngine {
         }
     }
 
+    pub(super) fn conversation_has_direct_mls(&self, conversation_id: &str) -> bool {
+        self.state
+            .mls_adapter
+            .as_ref()
+            .is_some_and(|adapter| adapter.has_conversation(conversation_id))
+    }
+
+    pub(super) fn build_protected_app_envelopes(
+        &mut self,
+        conversation_id: &str,
+        kind: ProtectedPayloadKind,
+        body: String,
+    ) -> CoreResult<(Vec<Envelope>, String)> {
+        let peer_user_id = self.peer_user_for_conversation(conversation_id)?;
+        let known_devices = self
+            .direct_peer_contact_bundle(&peer_user_id)
+            .map(|bundle| {
+                bundle
+                    .devices
+                    .iter()
+                    .map(|device| device.device_id.clone())
+                    .collect::<BTreeSet<_>>()
+            })
+            .unwrap_or_default();
+        let mut recipient_device_ids = self.recipient_device_ids(conversation_id)?;
+        if !known_devices.is_empty() {
+            recipient_device_ids.retain(|device_id| known_devices.contains(device_id));
+        }
+        if recipient_device_ids.is_empty() {
+            return Err(CoreError::invalid_state(
+                "conversation has no recipient devices",
+            ));
+        }
+        let (sender_user_id, sender_device_id) = self
+            .state
+            .local_identity
+            .as_ref()
+            .map(|identity| {
+                (
+                    identity.user_identity.user_id.clone(),
+                    identity.device_identity.device_id.clone(),
+                )
+            })
+            .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))?;
+        let nonce = self.next_message_nonce();
+        let sent_at = current_unix_millis(nonce);
+        let app_message_id = self.next_app_message_id(conversation_id, &sender_device_id, nonce);
+        let protected = ProtectedAppMessage::new_with_kind(
+            app_message_id.clone(),
+            conversation_id.to_string(),
+            sender_user_id,
+            sender_device_id,
+            peer_user_id,
+            recipient_device_ids.clone(),
+            kind,
+            body,
+            sent_at,
+        )?;
+        let bytes = protected.to_json_bytes()?;
+        let payload = self
+            .state
+            .mls_adapter
+            .as_mut()
+            .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
+            .encrypt_application(conversation_id, &bytes)?;
+        let mut envelopes = Vec::new();
+        for device_id in &recipient_device_ids {
+            envelopes.push(self.build_envelope(
+                conversation_id,
+                device_id,
+                MessageType::MlsApplication,
+                payload.payload_b64.clone(),
+            )?);
+        }
+        Ok((envelopes, app_message_id))
+    }
+
+    pub(super) fn enqueue_protected_app(
+        &mut self,
+        conversation_id: &str,
+        kind: ProtectedPayloadKind,
+        body: String,
+    ) -> CoreResult<String> {
+        let peer_user_id = self.peer_user_for_conversation(conversation_id)?;
+        let (envelopes, app_message_id) =
+            self.build_protected_app_envelopes(conversation_id, kind, body)?;
+        self.enqueue_envelopes_with_plaintext(
+            peer_user_id,
+            envelopes,
+            String::new(),
+            Some(app_message_id.clone()),
+        );
+        Ok(app_message_id)
+    }
+
+    pub(super) fn enqueue_or_create_direct_app(
+        &mut self,
+        peer_user_id: &str,
+        kind: ProtectedPayloadKind,
+        body: String,
+    ) -> CoreResult<CoreOutput> {
+        if let Some((conversation_id, _)) = self.active_direct_conversation_for_peer(peer_user_id) {
+            if self.conversation_has_direct_mls(&conversation_id) {
+                self.enqueue_protected_app(&conversation_id, kind, body)?;
+                return self.merge_with_transport_flush(CoreOutput {
+                    state_update: CoreStateUpdate {
+                        messages_changed: true,
+                        ..CoreStateUpdate::default()
+                    },
+                    effects: vec![persist_effect(
+                        &self.state,
+                        self.direct_send_persist_ops(&conversation_id),
+                    )],
+                    view_model: None,
+                });
+            }
+        }
+        let output = self.create_conversation(
+            peer_user_id.to_string(),
+            ConversationKind::Direct,
+        )?;
+        if let Some(conversation_id) = self.pending_direct_conversation_id_for_peer(peer_user_id) {
+            self.state
+                .pending_direct_app
+                .entry(conversation_id)
+                .or_default()
+                .push(PendingDirectApp { kind, body });
+            return Ok(output);
+        }
+        if let Some((conversation_id, _)) = self.active_direct_conversation_for_peer(peer_user_id) {
+            if self.conversation_has_direct_mls(&conversation_id) {
+                self.enqueue_protected_app(&conversation_id, kind, body)?;
+                return self.merge_with_transport_flush(output);
+            }
+        }
+        Ok(output)
+    }
+
+    fn pending_direct_conversation_id_for_peer(&self, peer_user_id: &str) -> Option<String> {
+        self.state
+            .pending_key_package_claim_batches
+            .values()
+            .find_map(|batch| match &batch.kind {
+                KeyPackageClaimBatchKind::Direct {
+                    peer_user_id: pending_peer,
+                    conversation_id,
+                    ..
+                } if pending_peer == peer_user_id => Some(conversation_id.clone()),
+                _ => None,
+            })
+    }
+
+    pub(super) fn flush_pending_direct_app(
+        &mut self,
+        conversation_id: &str,
+    ) -> CoreResult<()> {
+        let pending = self
+            .state
+            .pending_direct_app
+            .remove(conversation_id)
+            .unwrap_or_default();
+        for item in pending {
+            self.enqueue_protected_app(conversation_id, item.kind, item.body)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn contact_user_id_for_device(&self, device_id: &str) -> Option<String> {
+        self.state.contacts.iter().find_map(|(user_id, contact)| {
+            contact
+                .bundle
+                .devices
+                .iter()
+                .any(|device| device.device_id == device_id)
+                .then(|| user_id.clone())
+        })
+    }
+
     pub(super) fn evaluate_direct_application_plaintext(
         &self,
         record: &InboxRecord,
@@ -1824,17 +2008,6 @@ impl CoreEngine {
                                     };
                                 }
                             };
-                        let registered_outbound = self
-                            .state
-                            .conversations
-                            .get(&conversation_id)
-                            .and_then(|conversation| conversation.lanes.as_ref())
-                            .map(|lanes| lanes.outbound_lane.as_str());
-                        if registered_outbound != Some(body.inbound_lane.as_str()) {
-                            log::info!(
-                                "lane rotation inbound_lane does not match the registered outbound lane; ignoring lane change"
-                            );
-                        }
                         ApplicationPlaintextDecision::LaneRotation {
                             identity_bundle_ref: body.identity_bundle_ref,
                             app_message_id: protected.app_message_id,
@@ -1844,24 +2017,56 @@ impl CoreEngine {
                         plaintext: protected.body,
                         app_message_id: Some(protected.app_message_id),
                     },
+                    ProtectedPayloadKind::ContactAccepted => {
+                        let body: ContactAcceptedBody = match serde_json::from_str(&protected.body)
+                        {
+                            Ok(body) => body,
+                            Err(_) => {
+                                return ApplicationPlaintextDecision::RejectedProtocol {
+                                    reason: "contact accepted body is malformed".into(),
+                                };
+                            }
+                        };
+                        ApplicationPlaintextDecision::ContactAccepted {
+                            request_id: body.request_id,
+                            app_message_id: protected.app_message_id,
+                        }
+                    }
+                    ProtectedPayloadKind::ContactRemoved => {
+                        ApplicationPlaintextDecision::ContactRemoved {
+                            app_message_id: protected.app_message_id,
+                        }
+                    }
+                    ProtectedPayloadKind::GroupWelcomePickup => {
+                        let body: GroupWelcomePickupBody =
+                            match serde_json::from_str(&protected.body) {
+                                Ok(body) => body,
+                                Err(_) => {
+                                    return ApplicationPlaintextDecision::RejectedProtocol {
+                                        reason: "group welcome pickup body is malformed".into(),
+                                    };
+                                }
+                            };
+                        if body.welcome_pickup_descriptor.validate().is_err() {
+                            return ApplicationPlaintextDecision::RejectedProtocol {
+                                reason: "group welcome pickup descriptor is invalid".into(),
+                            };
+                        }
+                        ApplicationPlaintextDecision::GroupWelcomePickup {
+                            group_id: body.group_id,
+                            title: body.title,
+                            descriptor: body.welcome_pickup_descriptor,
+                            app_message_id: protected.app_message_id,
+                        }
+                    }
                 }
             }
-            Err(error) => {
-                if Self::plaintext_looks_like_protected_app_message(&application.plaintext) {
-                    return ApplicationPlaintextDecision::RejectedProtocol {
-                        reason: format!("malformed protected app message: {}", error.message()),
-                    };
-                }
-                match String::from_utf8(application.plaintext) {
-                    Ok(plaintext) => ApplicationPlaintextDecision::Accepted {
-                        plaintext,
-                        app_message_id: None,
-                    },
-                    Err(_) => ApplicationPlaintextDecision::RejectedProtocol {
-                        reason: "legacy application plaintext is not utf-8".into(),
-                    },
-                }
-            }
+            Err(error) => ApplicationPlaintextDecision::RejectedProtocol {
+                reason: format!(
+                    "application plaintext is not a protected app message: {}",
+                    error.message()
+                ),
+            },
         }
     }
 
@@ -1874,23 +2079,6 @@ impl CoreEngine {
             user_id: parts[0].to_string(),
             device_id: parts[1].to_string(),
         })
-    }
-
-    pub(super) fn plaintext_looks_like_protected_app_message(bytes: &[u8]) -> bool {
-        let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
-            return false;
-        };
-        let Some(object) = value.as_object() else {
-            return false;
-        };
-        [
-            "app_message_id",
-            "audience_device_ids",
-            "payload_kind",
-            "recipient_user_id",
-        ]
-        .iter()
-        .any(|key| object.contains_key(*key))
     }
 
     pub(super) fn conversation_has_app_message(
@@ -2625,58 +2813,6 @@ impl CoreEngine {
         Ok(persist_ops)
     }
 
-    pub(super) fn build_contact_removed_envelopes(
-        &mut self,
-        peer_user_id: &str,
-        conversation_id: &str,
-        _created_at: u64,
-    ) -> CoreResult<Vec<Envelope>> {
-        let _ = (peer_user_id, conversation_id);
-        // Control envelopes are no longer expressible on the 1:1 wire.
-        // Submit 2 carries them as MLS payload_kind.
-        Ok(Vec::new())
-    }
-
-    pub(super) fn contact_accepted_conversation_ids(
-        &self,
-        peer_user_id: &str,
-        promoted_conversation_ids: &[String],
-    ) -> CoreResult<Vec<String>> {
-        const MAX_ACCEPTED_CONVERSATION_IDS: usize = 16;
-        let mut conversation_ids = promoted_conversation_ids
-            .iter()
-            .filter(|conversation_id| !conversation_id.trim().is_empty())
-            .cloned()
-            .collect::<Vec<_>>();
-        conversation_ids.sort();
-        conversation_ids.dedup();
-        if let Some((conversation_id, _)) = self.active_direct_conversation_for_peer(peer_user_id) {
-            if !conversation_ids.contains(&conversation_id) {
-                conversation_ids.insert(0, conversation_id);
-            }
-        }
-        if conversation_ids.len() > MAX_ACCEPTED_CONVERSATION_IDS {
-            log::warn!(
-                "contact accept completed for {} with too many promoted direct conversation ids; truncating the compatibility fanout",
-                redact_id("user", peer_user_id)
-            );
-            conversation_ids.truncate(MAX_ACCEPTED_CONVERSATION_IDS);
-        }
-        Ok(conversation_ids)
-    }
-
-    pub(super) fn build_contact_accepted_envelopes(
-        &mut self,
-        peer_user_id: &str,
-        _request_id: &str,
-        _promoted_conversation_ids: &[String],
-        _created_at: u64,
-    ) -> CoreResult<Vec<Envelope>> {
-        let _ = peer_user_id;
-        // Control envelopes are no longer expressible on the 1:1 wire.
-        Ok(Vec::new())
-    }
-
     pub(super) fn direct_relationship_open_for_record(
         &self,
         peer_user_id: &str,
@@ -2758,77 +2894,74 @@ impl CoreEngine {
         contact_removed || conversation_closed
     }
 
-    pub(super) fn should_ignore_idempotent_contact_removed_record(
-        &self,
-        _local_user_id: &str,
-        _record: &InboxRecord,
-    ) -> bool {
-        false
-    }
-
-    pub(super) fn should_ignore_contact_accepted_record(
-        &self,
-        _local_user_id: &str,
-        _record: &InboxRecord,
-    ) -> bool {
-        true
-    }
-
-    pub(super) fn ensure_archived_direct_conversation_for_control(
+    pub(super) fn apply_peer_contact_removed(
         &mut self,
-        conversation_id: &str,
         peer_user_id: &str,
-        local_user_id: &str,
-        local_device_id: &str,
-    ) -> CoreResult<bool> {
-        if self.state.conversations.contains_key(conversation_id) {
-            return Ok(false);
-        }
-        let peer_device_ids = self
+        conversation_id: &str,
+    ) -> CoreResult<CoreOutput> {
+        if self
             .state
             .contacts
             .get(peer_user_id)
-            .ok_or_else(|| CoreError::invalid_input("peer contact is missing"))?
-            .bundle
-            .devices
-            .iter()
-            .filter(|device| matches!(device.status, DeviceStatusKind::Active))
-            .map(|device| device.device_id.clone())
-            .collect::<Vec<_>>();
-        if peer_device_ids.is_empty() {
-            return Err(CoreError::invalid_input(
-                "peer identity bundle does not contain any active devices",
-            ));
+            .is_some_and(|contact| Self::relationship_is_removed(&contact.relationship_status))
+        {
+            return Ok(CoreOutput::default());
         }
-        let mut conversation = ConversationManager::create_direct_conversation_with_id(
-            conversation_id.to_string(),
-            local_user_id,
-            local_device_id,
+        let local_device_id = self.local_identity_device_id()?;
+        let peer_label = self.contact_label(peer_user_id);
+        let revoke = if self.state.deployment_bundle.is_some() {
+            self.remove_allowlist_user(peer_user_id.to_string())?
+        } else {
+            CoreOutput::default()
+        };
+        self.set_contact_relationship_status(
             peer_user_id,
-            &peer_device_ids,
-        )?;
-        conversation.conversation.state = ConversationState::Archived;
-        self.state
-            .conversations
-            .insert(conversation_id.to_string(), conversation);
-        Ok(true)
-    }
-
-    pub(super) fn handle_contact_removed_record(
-        &mut self,
-        _local_user_id: &str,
-        _local_device_id: &str,
-        _record: &InboxRecord,
-    ) -> CoreResult<CoreOutput> {
-        Ok(CoreOutput::default())
-    }
-
-    pub(super) fn handle_contact_accepted_record(
-        &mut self,
-        _local_user_id: &str,
-        _record: &InboxRecord,
-    ) -> CoreResult<CoreOutput> {
-        Ok(CoreOutput::default())
+            ContactRelationshipStatus::RemovedByPeer,
+        );
+        let system_message = self.next_system_message(
+            conversation_id,
+            MessageType::ControlContactRemoved,
+            Some(peer_user_id.to_string()),
+            String::new(),
+            local_device_id,
+            format!("{peer_label} removed you. This chat was archived."),
+            "contact_removed_by_peer",
+        );
+        let mut persist_ops = Vec::new();
+        let mut message_summaries = Vec::new();
+        if let Some(summary) = self.archive_conversation_with_message(
+            conversation_id,
+            system_message,
+            "removed_by_peer",
+        ) {
+            message_summaries.push(summary);
+        }
+        persist_ops.extend(self.clear_direct_runtime_state(conversation_id)?);
+        if self.state.conversations.contains_key(conversation_id) {
+            persist_ops.push(PersistOp::SaveConversation {
+                conversation_id: conversation_id.to_string(),
+            });
+        }
+        persist_ops.push(PersistOp::SaveContact {
+            user_id: peer_user_id.to_string(),
+        });
+        Ok(merge_outputs(
+            revoke,
+            CoreOutput {
+                state_update: CoreStateUpdate {
+                    contacts_changed: true,
+                    conversations_changed: true,
+                    messages_changed: !message_summaries.is_empty(),
+                    ..CoreStateUpdate::default()
+                },
+                effects: vec![persist_effect(&self.state, persist_ops)],
+                view_model: Some(CoreViewModel {
+                    contacts: self.contact_summaries(),
+                    messages: message_summaries,
+                    ..CoreViewModel::default()
+                }),
+            },
+        ))
     }
 
     pub(super) fn delete_contact(&mut self, user_id: String) -> CoreResult<CoreOutput> {
@@ -2861,17 +2994,24 @@ impl CoreEngine {
         );
         conversation_ids.sort();
         conversation_ids.dedup();
-        let control_conversation_id = conversation_ids.first().cloned().unwrap_or_default();
-        let control_created_at = current_unix_millis(self.next_message_nonce());
-        let control_envelopes = if control_conversation_id.is_empty() {
-            Vec::new()
-        } else {
-            self.build_contact_removed_envelopes(
-                &user_id,
-                &control_conversation_id,
-                control_created_at,
-            )?
-        };
+        let mut control_envelopes = Vec::new();
+        for conversation_id in &conversation_ids {
+            if !self.conversation_has_direct_mls(conversation_id) {
+                continue;
+            }
+            match self.build_protected_app_envelopes(
+                conversation_id,
+                ProtectedPayloadKind::ContactRemoved,
+                "{}".into(),
+            ) {
+                Ok((envelopes, _)) => control_envelopes.extend(envelopes),
+                Err(error) => log::warn!(
+                    "contact removed encrypt failed conversation_id={}: {}",
+                    redact_id("conv", conversation_id),
+                    error.message()
+                ),
+            }
+        }
         let control_message_ids = control_envelopes
             .iter()
             .map(|envelope| envelope.mid.clone())
@@ -2939,17 +3079,6 @@ impl CoreEngine {
             output = merge_outputs(output, self.remove_allowlist_user(user_id)?);
         }
         Ok(merge_outputs(output, transport_output))
-    }
-
-    pub(super) fn build_control_membership_changed_messages(
-        &mut self,
-        conversation_id: &str,
-        peer_user_id: &str,
-        peer_active_device_ids: &[String],
-    ) -> CoreResult<Vec<Envelope>> {
-        let _ = (conversation_id, peer_user_id, peer_active_device_ids);
-        // Control envelopes are no longer expressible on the 1:1 wire.
-        Ok(Vec::new())
     }
 
     pub(super) fn commit_envelopes_for_artifacts(
@@ -3170,11 +3299,11 @@ impl CoreEngine {
         Ok(true)
     }
 
-    fn enqueue_lane_rotation(
+    pub(super) fn enqueue_lane_rotation(
         &mut self,
         conversation_id: &str,
-        peer_user_id: &str,
-        recipient_device_ids: &[String],
+        _peer_user_id: &str,
+        _recipient_device_ids: &[String],
     ) -> CoreResult<()> {
         let Some(reference) = self
             .state
@@ -3186,61 +3315,13 @@ impl CoreEngine {
             log::info!("skipping lane rotation: local identity_bundle_ref is missing");
             return Ok(());
         };
-        let Some(inbound_lane) = self
-            .state
-            .conversations
-            .get(conversation_id)
-            .and_then(|conversation| conversation.lanes.as_ref())
-            .map(|lanes| lanes.inbound_lane.clone())
-        else {
-            return Ok(());
-        };
-        let (sender_user_id, sender_device_id) = self
-            .state
-            .local_identity
-            .as_ref()
-            .map(|identity| {
-                (
-                    identity.user_identity.user_id.clone(),
-                    identity.device_identity.device_id.clone(),
-                )
-            })
-            .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))?;
-        let nonce = self.next_message_nonce();
-        let sent_at = current_unix_millis(nonce);
-        let rotation = crate::model::ProtectedAppMessage::new_lane_rotation(
-            self.next_app_message_id(conversation_id, &sender_device_id, nonce),
-            conversation_id.to_string(),
-            sender_user_id,
-            sender_device_id,
-            peer_user_id.to_string(),
-            recipient_device_ids.to_vec(),
-            inbound_lane,
-            reference,
-            sent_at,
-        )?;
-        let bytes = rotation.to_json_bytes()?;
-        let payload = self
-            .state
-            .mls_adapter
-            .as_mut()
-            .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
-            .encrypt_application(conversation_id, &bytes)?;
-        let mut rotation_envelopes = Vec::new();
-        for device_id in recipient_device_ids {
-            rotation_envelopes.push(self.build_envelope(
-                conversation_id,
-                device_id,
-                MessageType::MlsApplication,
-                payload.payload_b64.clone(),
-            )?);
-        }
-        self.enqueue_envelopes_with_plaintext(
-            peer_user_id.to_string(),
-            rotation_envelopes,
-            String::new(),
-            Some(rotation.app_message_id),
-        );
+        let body = serde_json::to_string(&crate::model::LaneRotationBody {
+            identity_bundle_ref: reference,
+        })
+        .map_err(|error| {
+            CoreError::invalid_input(format!("lane rotation encode failed: {error}"))
+        })?;
+        self.enqueue_protected_app(conversation_id, ProtectedPayloadKind::LaneRotation, body)?;
         Ok(())
     }
 

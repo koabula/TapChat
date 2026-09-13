@@ -100,11 +100,7 @@
   "inlineCiphertext": {
     "mls_application": "opaque",
     "mls_commit": "opaque",
-    "mls_welcome": "opaque",
-    "control_contact_removed": "base64_json_snake",
-    "control_contact_accepted": "base64_json_snake",
-    "control_group_welcome_pickup": "base64_json_camel",
-    "control_device_membership_changed": "base64_ascii"
+    "mls_welcome": "opaque"
   },
   "entries": [
     {
@@ -876,6 +872,8 @@
         "MlsStateStatus",
         "MlsStateSummary",
         "ModelModule",
+        "ContactAcceptedBody",
+        "GroupWelcomePickupBody",
         "LaneRotationBody",
         "ProtectedAppMessage",
         "ProtectedPayloadKind",
