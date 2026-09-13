@@ -36,6 +36,7 @@ pub const APP_ERROR_CODES: &[&str] = &[
     "pool_empty",
     "device_clock_invalid",
     "identity_bundle_conflict",
+    "identity_bundle_rolled_back",
     "identity_refresh_required",
     "contact_share_offline",
     "contact_share_publish_failed",
@@ -194,6 +195,7 @@ const APP_ERROR_DEFAULTS: &[(&str, &str, bool, Option<&str>)] = &[
         true,
         Some("sync_now"),
     ),
+    ("identity_bundle_rolled_back", "identity", false, None),
     (
         "identity_refresh_required",
         "identity",

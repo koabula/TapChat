@@ -36,6 +36,7 @@ export const ERROR_DEFAULTS = {
   pool_empty: ["mls", true, null],
   device_clock_invalid: ["security", false, null],
   identity_bundle_conflict: ["identity", true, "sync_now"],
+  identity_bundle_rolled_back: ["identity", false, null],
   identity_refresh_required: ["identity", true, "refresh_identity"],
   contact_share_offline: ["identity", true, "reconnect"],
   contact_share_publish_failed: ["identity", true, "retry"],

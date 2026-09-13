@@ -46,6 +46,10 @@ impl CoreEngine {
         relationship_status: ContactRelationshipStatus,
     ) -> CoreResult<CoreOutput> {
         IdentityManager::verify_identity_bundle(&bundle)?;
+        Self::ensure_peer_bundle_not_rolled_back(
+            self.state.contacts.get(&bundle.user_id),
+            &bundle,
+        )?;
         let user_id = bundle.user_id.clone();
         let original_name = bundle.display_name.clone();
         let now = current_timestamp_hint(self.state.outbox.len());
@@ -113,6 +117,10 @@ impl CoreEngine {
         bundle: IdentityBundle,
     ) -> CoreResult<CoreOutput> {
         IdentityManager::verify_identity_bundle(&bundle)?;
+        Self::ensure_peer_bundle_not_rolled_back(
+            self.state.contacts.get(&bundle.user_id),
+            &bundle,
+        )?;
         let user_id = bundle.user_id.clone();
         let affected_conversations = self.affected_conversations_for_peer(&user_id);
 
@@ -188,6 +196,25 @@ impl CoreEngine {
             output = merge_outputs(output, self.replay_pending_records_for_device(device_id)?);
         }
         self.merge_with_transport_flush(output)
+    }
+
+    fn ensure_peer_bundle_not_rolled_back(
+        existing: Option<&PersistedContact>,
+        incoming: &IdentityBundle,
+    ) -> CoreResult<()> {
+        let Some(existing) = existing else {
+            return Ok(());
+        };
+        if existing.bundle.user_public_key != incoming.user_public_key {
+            return Ok(());
+        }
+        if incoming.publication_revision < existing.bundle.publication_revision {
+            return Err(CoreError::new(
+                "identity_bundle_rolled_back",
+                "identity bundle publication_revision is older than the one already held",
+            ));
+        }
+        Ok(())
     }
 
     pub(super) fn create_or_load_identity(

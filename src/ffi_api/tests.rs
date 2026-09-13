@@ -7746,6 +7746,134 @@ mod tests {
     }
 
     #[test]
+    fn peer_bundle_cannot_be_rolled_back() {
+        let bundle_n = sample_identity_bundle_at_revision(BOB_MNEMONIC, "phone", 2);
+        let mut alice = local_engine(ALICE_MNEMONIC, "phone");
+        alice
+            .handle_command(CoreCommand::ImportIdentityBundle {
+                bundle: bundle_n.clone(),
+            })
+            .expect("import N");
+        let snapshot = alice
+            .state
+            .contacts
+            .get(&bundle_n.user_id)
+            .expect("bob contact")
+            .clone();
+
+        let error = alice
+            .handle_command(CoreCommand::ImportIdentityBundle {
+                bundle: sample_identity_bundle_at_revision(BOB_MNEMONIC, "phone", 1),
+            })
+            .expect_err("older revision");
+        assert_eq!(error.code(), "identity_bundle_rolled_back");
+        assert_eq!(
+            alice
+                .state
+                .contacts
+                .get(&bundle_n.user_id)
+                .expect("bob contact"),
+            &snapshot
+        );
+
+        alice
+            .handle_command(CoreCommand::ImportIdentityBundle {
+                bundle: bundle_n.clone(),
+            })
+            .expect("idempotent N");
+        assert_eq!(
+            alice
+                .state
+                .contacts
+                .get(&bundle_n.user_id)
+                .expect("bob contact")
+                .bundle
+                .publication_revision,
+            2
+        );
+
+        alice
+            .handle_command(CoreCommand::ImportIdentityBundle {
+                bundle: sample_identity_bundle_at_revision(BOB_MNEMONIC, "phone", 3),
+            })
+            .expect("import N+1");
+        assert_eq!(
+            alice
+                .state
+                .contacts
+                .get(&bundle_n.user_id)
+                .expect("bob contact")
+                .bundle
+                .publication_revision,
+            3
+        );
+    }
+
+    #[test]
+    fn peer_bundle_update_cannot_be_rolled_back() {
+        let bundle_n = sample_identity_bundle_at_revision(BOB_MNEMONIC, "phone", 2);
+        let mut alice = local_engine(ALICE_MNEMONIC, "phone");
+        alice
+            .handle_command(CoreCommand::ImportIdentityBundle {
+                bundle: bundle_n.clone(),
+            })
+            .expect("import N");
+        let snapshot = alice
+            .state
+            .contacts
+            .get(&bundle_n.user_id)
+            .expect("bob contact")
+            .clone();
+
+        let error = alice
+            .handle_command(CoreCommand::ApplyIdentityBundleUpdate {
+                bundle: sample_identity_bundle_at_revision(BOB_MNEMONIC, "phone", 1),
+            })
+            .expect_err("older revision");
+        assert_eq!(error.code(), "identity_bundle_rolled_back");
+        assert_eq!(
+            alice
+                .state
+                .contacts
+                .get(&bundle_n.user_id)
+                .expect("bob contact"),
+            &snapshot
+        );
+
+        alice
+            .handle_command(CoreCommand::ApplyIdentityBundleUpdate {
+                bundle: bundle_n.clone(),
+            })
+            .expect("idempotent N");
+        assert_eq!(
+            alice
+                .state
+                .contacts
+                .get(&bundle_n.user_id)
+                .expect("bob contact")
+                .bundle
+                .publication_revision,
+            2
+        );
+
+        alice
+            .handle_command(CoreCommand::ApplyIdentityBundleUpdate {
+                bundle: sample_identity_bundle_at_revision(BOB_MNEMONIC, "phone", 3),
+            })
+            .expect("update N+1");
+        assert_eq!(
+            alice
+                .state
+                .contacts
+                .get(&bundle_n.user_id)
+                .expect("bob contact")
+                .bundle
+                .publication_revision,
+            3
+        );
+    }
+
+    #[test]
     fn set_contact_verified_persists_and_survives_same_key_update() {
         let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
         let mut alice = local_engine(ALICE_MNEMONIC, "phone");
@@ -13234,6 +13362,27 @@ mod tests {
             package.expires_at,
         )
         .expect("bundle")
+    }
+
+    fn sample_identity_bundle_at_revision(
+        mnemonic: &str,
+        device_name: &str,
+        publication_revision: u64,
+    ) -> IdentityBundle {
+        let identity = IdentityManager::create_or_recover(Some(mnemonic), Some(device_name))
+            .expect("identity");
+        let package = MlsAdapter::generate_key_package(&identity, test_now_ms()).expect("package");
+        let mut bundle = IdentityManager::export_identity_bundle(
+            &identity,
+            &sample_deployment(),
+            package.key_package_b64,
+            package.expires_at,
+        )
+        .expect("bundle");
+        bundle.publication_revision = publication_revision;
+        bundle.signature =
+            identity.sign_payload_with_root(crate::identity::identity_bundle_payload(&bundle));
+        bundle
     }
 
     fn sample_identity_bundle_without_identity_ref(
