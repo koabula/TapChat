@@ -34,7 +34,7 @@ prepare\_blob\_upload\_request & messageId & message\_nonce, recipient\_device, 
 % --- envelope_metadata: tab:inbox, Timing and Traffic type rows
 append\_request & envelope.createdAt & --- \\
 append\_request & envelope.deliveryClass (constant: normal) & --- \\
-append\_request & envelope.inlineCiphertext & --- \\
+append\_request & envelope.inlineCiphertext & recipient\_user, sender\_user \\
 append\_request & envelope.messageType & --- \\
 append\_request & envelope.version (constant: 0.1) & --- \\
 append\_request & version (constant: 0.1) & --- \\

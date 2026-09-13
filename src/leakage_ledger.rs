@@ -48,9 +48,9 @@ const LEDGER_JSON: &str = include_str!("../contracts/leakage-ledger.json");
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum PayloadClass {
-    /// MLS ciphertext. Opaque to the host — but still searched after base64
-    /// decoding, because "opaque" describes the encryption, not a guarantee
-    /// that nothing cleartext was concatenated alongside it.
+    /// MLS frame. The payload is ciphertext but the PrivateMessage header
+    /// (group_id, epoch, content_type) is not, and is searched after base64
+    /// decoding like everything else.
     Opaque,
     /// Base64 of `serde_json` output using the struct's own field names, which
     /// are snake_case (the struct carries no `rename_all`).
@@ -247,6 +247,21 @@ pub(crate) fn occurrences(value: &Value, needle: &str) -> BTreeSet<String> {
         };
         if haystack.contains(needle) {
             out.insert(path.to_string());
+            return;
+        }
+        // Base64 alignment shifts with offset, so a sentinel inside a decoded
+        // payload is not a substring of the JSON leaf. Search after decode.
+        if matches!(leaf, Value::String(_)) {
+            let (bytes, parsed) = decode_inline(&haystack);
+            if String::from_utf8_lossy(&bytes).contains(needle) {
+                out.insert(path.to_string());
+                return;
+            }
+            if let Some(json) = parsed.as_ref() {
+                if !occurrences(json, needle).is_empty() {
+                    out.insert(path.to_string());
+                }
+            }
         }
     });
     out
@@ -510,13 +525,13 @@ pub(crate) fn maximal_append_request() -> crate::transport_contract::AppendEnvel
     let envelope = Envelope {
         version: CURRENT_MODEL_VERSION.to_string(),
         message_id,
-        conversation_id,
+        conversation_id: conversation_id.clone(),
         sender_user_id,
         sender_device_id,
         recipient_device_id,
         created_at: 1_775_000_000_000,
         message_type: MessageType::MlsApplication,
-        inline_ciphertext: Some("Y2lwaGVydGV4dA==".to_string()),
+        inline_ciphertext: Some(representative_mls_frame(&conversation_id)),
         storage_refs: vec![StorageRef {
             kind: "attachment_original".to_string(),
             object_ref: format!(
@@ -547,6 +562,31 @@ pub(crate) fn maximal_append_request() -> crate::transport_contract::AppendEnvel
         sender_bundle_hash: Some("f".repeat(64)),
         sender_display_name: Some(sentinel::DISPLAY_NAME.to_string()),
     }
+}
+
+/// RFC 9420 §6.3 MLSMessage wrapping a PrivateMessage. Existence proof:
+/// `mls_frame_header_names_the_conversation_in_the_clear` in mls_adapter.
+fn representative_mls_frame(conversation_id: &str) -> String {
+    fn push_vlbytes(out: &mut Vec<u8>, bytes: &[u8]) {
+        let len = bytes.len();
+        if len < 64 {
+            out.push(len as u8);
+        } else {
+            let encoded = 0x4000 | (len as u16);
+            out.extend_from_slice(&encoded.to_be_bytes());
+        }
+        out.extend_from_slice(bytes);
+    }
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&1u16.to_be_bytes()); // version: mls10
+    frame.extend_from_slice(&2u16.to_be_bytes()); // wire_format: mls_private_message
+    push_vlbytes(&mut frame, conversation_id.as_bytes());
+    frame.extend_from_slice(&3u64.to_be_bytes()); // epoch
+    frame.push(1); // content_type: application
+    push_vlbytes(&mut frame, &[]);
+    push_vlbytes(&mut frame, &[0xA1; 16]);
+    push_vlbytes(&mut frame, &[0xC3; 32]);
+    base64::engine::general_purpose::STANDARD.encode(frame)
 }
 
 /// The other client-to-host request bodies on the inbox and storage paths.
@@ -1207,5 +1247,22 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["peer"]
         );
+    }
+
+    #[test]
+    fn representative_frame_parses_as_an_mls_private_message() {
+        use openmls::prelude::{tls_codec::Deserialize, MlsMessageIn, WireFormat};
+
+        let conversation_id = "conv:user:TP6YB3HSLM:user:ZQ7X2M1PDA";
+        let encoded = representative_mls_frame(conversation_id);
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .expect("base64");
+        let message = MlsMessageIn::tls_deserialize_exact(bytes).expect("mls message");
+        assert_eq!(message.wire_format(), WireFormat::PrivateMessage);
+        let protocol = message
+            .try_into_protocol_message()
+            .expect("private message");
+        assert_eq!(protocol.group_id().as_slice(), conversation_id.as_bytes());
     }
 }

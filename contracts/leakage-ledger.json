@@ -44,7 +44,12 @@
       {
         "channel": "commit_frequency",
         "checked": false,
-        "note": "Doubled by the R1 rotation change; recorded there as a traffic-pattern cost."
+        "note": "Doubled by the R1 rotation change; recorded there as a traffic-pattern cost. Also directly readable today from PrivateMessage.content_type and epoch; after the R3 wrap only size class remains."
+      },
+      {
+        "channel": "mls_frame_header_epoch_and_content_type",
+        "checked": false,
+        "note": "PrivateMessage.epoch and content_type are cleartext in every frame and identical at both inboxes; not a sentinel so not caught by Check X. Removed by the R3 frame wrap."
       },
       {
         "channel": "retention_window",
@@ -134,9 +139,13 @@
       "surface": "append_request",
       "path": "envelope.inlineCiphertext",
       "bits": "inhabited",
-      "carries": [],
+      "carries": [
+        "recipient_user",
+        "sender_user"
+      ],
       "signed": true,
-      "table": "envelope_metadata"
+      "table": "envelope_metadata",
+      "note": "Not a pure ciphertext: an MLS frame whose PrivateMessage header carries group_id (= conversation_id, which names both users), epoch and content_type in the clear (RFC 9420 §6.3). Identical at both ends of the conversation, so the two inboxes of one conversation share a token. Removed by the R3 frame wrap; until then this row is red on purpose."
     },
     {
       "surface": "append_request",

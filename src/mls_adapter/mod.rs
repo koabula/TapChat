@@ -2588,6 +2588,7 @@ mod tests {
     };
     use crate::identity::{IdentityManager, LocalIdentityState};
     use crate::model::{MessageType, MlsStateStatus};
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 
     const ALICE_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
     const BOB_MNEMONIC: &str =
@@ -2671,6 +2672,49 @@ mod tests {
         alice_adapter
             .create_conversation("conv:alice:bob", &[peer(&bob, bob_package.key_package_b64)])
             .expect("genuine key package");
+    }
+
+    /// Existence proof that an MLS PrivateMessage header names the conversation
+    /// in the clear: `group_id = conversation_id.as_bytes()`. The ledger fixture
+    /// `representative_mls_frame` is only a representative of this leak.
+    #[test]
+    fn mls_frame_header_names_the_conversation_in_the_clear() {
+        let alice = identity(ALICE_MNEMONIC);
+        let bob = identity(BOB_MNEMONIC);
+        let conversation_id = crate::conversation::direct_conversation_id(
+            &alice.user_identity.user_id,
+            &bob.user_identity.user_id,
+        );
+        let (mut alice_adapter, _) = MlsAdapter::bootstrap(&alice).expect("alice adapter");
+        let (_, bob_package) = MlsAdapter::bootstrap(&bob).expect("bob adapter");
+        alice_adapter
+            .create_conversation(&conversation_id, &[peer(&bob, bob_package.key_package_b64)])
+            .expect("create conversation");
+
+        let application = alice_adapter
+            .encrypt_application(&conversation_id, b"probe")
+            .expect("encrypt application");
+        let commit = alice_adapter
+            .rotate_direct_self_update(&conversation_id)
+            .expect("self-update commit");
+
+        let application_bytes = BASE64
+            .decode(application.payload_b64)
+            .expect("application frame");
+        let commit_bytes = BASE64.decode(commit.commit_b64).expect("commit frame");
+        let needle = conversation_id.as_bytes();
+        assert!(
+            application_bytes
+                .windows(needle.len())
+                .any(|window| window == needle),
+            "application frame must contain conversation_id in the clear"
+        );
+        assert!(
+            commit_bytes
+                .windows(needle.len())
+                .any(|window| window == needle),
+            "commit frame must contain conversation_id in the clear"
+        );
     }
 
     #[test]
