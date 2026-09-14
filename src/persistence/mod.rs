@@ -1015,9 +1015,7 @@ mod tests {
     use super::*;
     use crate::conversation::{ConversationManager, RecoveryStatus};
     use crate::identity::IdentityManager;
-    use crate::model::{
-        ConversationState, DeviceStatusKind, Envelope, CURRENT_MODEL_VERSION,
-    };
+    use crate::model::{ConversationState, DeviceStatusKind, Envelope, CURRENT_MODEL_VERSION};
     use base64::Engine as _;
 
     const ALICE_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";

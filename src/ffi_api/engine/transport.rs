@@ -1,3 +1,4 @@
+use super::lanes::InboundFrameResolution;
 use super::*;
 
 impl CoreEngine {
@@ -3059,25 +3060,31 @@ impl CoreEngine {
                 continue;
             }
             let resolved = match self.resolve_inbound_frame(&local_user_id, &device_id, &record)? {
-                Some(resolved) => resolved,
-                None => {
-                    let known_session = self
-                        .conversation_id_for_lane(&record.envelope.lane)
-                        .is_some();
+                InboundFrameResolution::Ready(resolved) => resolved,
+                InboundFrameResolution::Deferred => {
                     {
                         let sync_state = self
                             .state
                             .sync_states
                             .entry(device_id.clone())
                             .or_insert_with(|| SyncEngine::new_device_state(&device_id));
-                        if known_session {
-                            // Known session, but the bytes did not unwrap and
-                            // are not a Welcome: R2 ack + drop, no quarantine.
-                            SyncEngine::release_quarantined(sync_state, record.seq);
-                        } else {
-                            SyncEngine::quarantine_record(sync_state, &record);
-                        }
+                        SyncEngine::quarantine_record(sync_state, &record);
                     }
+                    advance_contiguous_ack(
+                        &mut contiguous_ack,
+                        &mut deferred_ackable_seqs,
+                        record.seq,
+                    );
+                    processed_records.push(record);
+                    continue;
+                }
+                InboundFrameResolution::Rejected => {
+                    let sync_state = self
+                        .state
+                        .sync_states
+                        .entry(device_id.clone())
+                        .or_insert_with(|| SyncEngine::new_device_state(&device_id));
+                    SyncEngine::release_quarantined(sync_state, record.seq);
                     advance_contiguous_ack(
                         &mut contiguous_ack,
                         &mut deferred_ackable_seqs,
@@ -3092,6 +3099,7 @@ impl CoreEngine {
             let inbound_payload_b64 = resolved.payload_b64.clone();
             let inbound_peer_user_id = resolved.peer_user_id.clone();
             let welcome_author = resolved.welcome_author.clone();
+            let authenticated_commit = resolved.authenticated_commit.clone();
             if self.should_ignore_closed_relationship_record(&local_user_id, &record) {
                 log::info!(
                     "handle_inbox_records: acking and ignoring {:?} for closed relationship conversation_id={} sender_user_id={} message_id={}",
@@ -3112,8 +3120,6 @@ impl CoreEngine {
                 processed_records.push(record);
                 continue;
             }
-            self.ensure_local_conversation_for_record(&device_id, &local_user_id, &record);
-            touched_conversation_ids.insert(conversation_id.clone());
             if inbound_message_type == MessageType::MlsApplication {
                 let inline_ciphertext = inbound_payload_b64.as_str();
                 let ciphertext_sha256 =
@@ -3137,6 +3143,7 @@ impl CoreEngine {
                         welcome_author.clone(),
                     )? {
                         IngestResult::AppliedApplication(application) => {
+                            touched_conversation_ids.insert(conversation_id.clone());
                             log::info!(
                                 "handle_inbox_records: AppliedApplication for message {}, plaintext len={}",
                                 redact_id("msg", &record.message_id),
@@ -3255,9 +3262,11 @@ impl CoreEngine {
                                     if let Some(state) =
                                         self.state.conversations.get_mut(&conversation_id)
                                     {
-                                        if let Some(message) = state.messages.iter_mut().rev().find(
-                                            |message| message.message_id == record.message_id,
-                                        ) {
+                                        if let Some(message) =
+                                            state.messages.iter_mut().rev().find(|message| {
+                                                message.message_id == record.message_id
+                                            })
+                                        {
                                             message.plaintext =
                                                 Some(format!("Group invite: {title}"));
                                             message.message_type =
@@ -3405,34 +3414,26 @@ impl CoreEngine {
                 processed_records.push(record);
                 continue;
             }
-            let apply_effect = {
-                let conversation_state = self
-                    .state
-                    .conversations
-                    .get_mut(&conversation_id)
-                    .ok_or_else(|| CoreError::invalid_input("conversation does not exist"))?;
-                ConversationManager::apply_incoming_envelope(
-                    conversation_state,
-                    &record.envelope,
+            let is_mls_protocol = matches!(
+                inbound_message_type,
+                MessageType::MlsApplication
+                    | MessageType::MlsCommit
+                    | MessageType::MlsProposal
+                    | MessageType::MlsWelcome
+            );
+            let apply_effect = if is_mls_protocol {
+                crate::conversation::AppliedEnvelopeEffect::default()
+            } else {
+                let effect = self.record_authenticated_inbound(
+                    &conversation_id,
                     &inbound_peer_user_id,
-                    "",
                     inbound_message_type,
-                    record.received_at,
-                    Vec::new(),
-                )?
+                    &record,
+                    &mut output,
+                )?;
+                touched_conversation_ids.insert(conversation_id.clone());
+                effect
             };
-
-            output.state_update.messages_changed = true;
-            output.state_update.conversations_changed = true;
-            output
-                .view_model
-                .get_or_insert_with(CoreViewModel::default)
-                .messages
-                .push(MessageSummary {
-                    conversation_id: conversation_id.clone(),
-                    message_id: record.message_id.clone(),
-                    message_type: inbound_message_type,
-                });
 
             let mut retention = RecordRetention::Discarded;
             if !apply_effect.duplicate_message
@@ -3444,14 +3445,20 @@ impl CoreEngine {
                 match inbound_message_type {
                     MessageType::MlsApplication
                     | MessageType::MlsCommit
+                    | MessageType::MlsProposal
                     | MessageType::MlsWelcome => {
                         // A commit racing our own for the same base epoch is
                         // settled here, before ingest: the winner discards it
                         // with no state change, the loser repairs itself.
                         let mut arbitrated = false;
                         if inbound_message_type == MessageType::MlsCommit {
+                            let commit = authenticated_commit.as_ref().ok_or_else(|| {
+                                CoreError::invalid_state(
+                                    "resolved direct commit is missing authentication proof",
+                                )
+                            })?;
                             if let Some(extra) =
-                                self.direct_pcs_arbitration(&conversation_id, &record)?
+                                self.direct_pcs_arbitration(&conversation_id, commit)?
                             {
                                 output = merge_outputs(output, extra);
                                 self.finish_mls_apply_pending(
@@ -3467,6 +3474,11 @@ impl CoreEngine {
                         if arbitrated {
                             // Terminal for this record.
                         } else {
+                            let previous_wrap = if inbound_message_type == MessageType::MlsCommit {
+                                self.capture_previous_inbound_wrap(&conversation_id)?
+                            } else {
+                                None
+                            };
                             match self.ingest_inbound_mls(
                                 &conversation_id,
                                 inbound_message_type,
@@ -3474,6 +3486,14 @@ impl CoreEngine {
                                 welcome_author.clone(),
                             )? {
                                 IngestResult::AppliedApplication(application) => {
+                                    touched_conversation_ids.insert(conversation_id.clone());
+                                    self.record_authenticated_inbound(
+                                        &conversation_id,
+                                        &inbound_peer_user_id,
+                                        inbound_message_type,
+                                        &record,
+                                        &mut output,
+                                    )?;
                                     log::info!(
                                         "handle_inbox_records: AppliedApplication for message {}, plaintext len={}",
                                         redact_id("msg", &record.message_id),
@@ -3543,6 +3563,18 @@ impl CoreEngine {
                                     }
                                 }
                                 IngestResult::AppliedCommit { epoch } => {
+                                    touched_conversation_ids.insert(conversation_id.clone());
+                                    self.install_previous_inbound_wrap(
+                                        &conversation_id,
+                                        previous_wrap,
+                                    );
+                                    self.record_authenticated_inbound(
+                                        &conversation_id,
+                                        &inbound_peer_user_id,
+                                        inbound_message_type,
+                                        &record,
+                                        &mut output,
+                                    )?;
                                     log::info!(
                                         "handle_inbox_records: AppliedCommit for message {} in conversation {}, epoch={}",
                                         record.message_id,
@@ -3597,13 +3629,51 @@ impl CoreEngine {
                                         );
                                     }
                                 }
-                                IngestResult::AppliedProposal => {}
+                                IngestResult::AppliedProposal => {
+                                    touched_conversation_ids.insert(conversation_id.clone());
+                                    self.record_authenticated_inbound(
+                                        &conversation_id,
+                                        &inbound_peer_user_id,
+                                        inbound_message_type,
+                                        &record,
+                                        &mut output,
+                                    )?;
+                                }
                                 IngestResult::AppliedWelcome { epoch } => {
+                                    touched_conversation_ids.insert(conversation_id.clone());
+                                    if !self.state.conversations.contains_key(&conversation_id) {
+                                        let author_device_id = welcome_author
+                                            .as_ref()
+                                            .map(|author| author.device_id.clone())
+                                            .ok_or_else(|| {
+                                                CoreError::invalid_state(
+                                                    "authenticated Welcome is missing its author",
+                                                )
+                                            })?;
+                                        let mut local = ConversationManager::create_direct_conversation_with_id(
+                                            conversation_id.clone(),
+                                            &local_user_id,
+                                            &device_id,
+                                            &inbound_peer_user_id,
+                                            &[author_device_id],
+                                        )?;
+                                        local.conversation.updated_at = record.received_at;
+                                        self.state
+                                            .conversations
+                                            .insert(conversation_id.clone(), local);
+                                    }
                                     self.adopt_welcome_lanes(
                                         &conversation_id,
                                         &record.envelope.lane,
                                     );
                                     self.initialize_direct_pcs_from_mls(&conversation_id)?;
+                                    self.record_authenticated_inbound(
+                                        &conversation_id,
+                                        &inbound_peer_user_id,
+                                        inbound_message_type,
+                                        &record,
+                                        &mut output,
+                                    )?;
                                     log::info!(
                                         "handle_inbox_records: AppliedWelcome for message {} in conversation {}, epoch={}",
                                         record.message_id,
@@ -3826,6 +3896,46 @@ impl CoreEngine {
         }
         refresh_persist_effect_snapshots(&mut output, &self.state);
         self.merge_with_transport_flush(output)
+    }
+
+    fn record_authenticated_inbound(
+        &mut self,
+        conversation_id: &str,
+        peer_user_id: &str,
+        message_type: MessageType,
+        record: &InboxRecord,
+        output: &mut CoreOutput,
+    ) -> CoreResult<crate::conversation::AppliedEnvelopeEffect> {
+        let effect = {
+            let conversation = self
+                .state
+                .conversations
+                .get_mut(conversation_id)
+                .ok_or_else(|| CoreError::invalid_input("conversation does not exist"))?;
+            ConversationManager::apply_incoming_envelope(
+                conversation,
+                &record.envelope,
+                peer_user_id,
+                "",
+                message_type,
+                record.received_at,
+                Vec::new(),
+            )?
+        };
+        if !effect.duplicate_message {
+            output.state_update.messages_changed = true;
+            output.state_update.conversations_changed = true;
+            output
+                .view_model
+                .get_or_insert_with(CoreViewModel::default)
+                .messages
+                .push(MessageSummary {
+                    conversation_id: conversation_id.to_string(),
+                    message_id: record.message_id.clone(),
+                    message_type,
+                });
+        }
+        Ok(effect)
     }
 
     pub(super) fn handle_unsuccessful_request(

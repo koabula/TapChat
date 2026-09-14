@@ -496,10 +496,7 @@ pub async fn get_messages(
             )
         })
         .filter_map(|env| {
-            let logical_message_id = env
-                .app_message_id
-                .as_deref()
-                .unwrap_or(&env.envelope.mid);
+            let logical_message_id = env.app_message_id.as_deref().unwrap_or(&env.envelope.mid);
             // Only include if not already in conversation messages
             let already_exists = conversation_messages
                 .iter()

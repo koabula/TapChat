@@ -19,12 +19,12 @@ use crate::transport_contract::GetHeadResult;
 use super::args::{
     Cli, CloudflareProvisionCommand, CloudflareProvisionSubcommand, CloudflareRuntimeCommand,
     CloudflareRuntimeSubcommand, Command, ContactCommand, ContactRequestsCommand,
-    ContactRequestsSubcommand, ContactSubcommand,
-    ConversationCommand, ConversationSubcommand, DeviceCommand, DeviceSubcommand, GroupCommand,
-    GroupInviteCommand, GroupInviteSubcommand, GroupJoinCommand, GroupJoinSubcommand,
-    GroupMemberCommand, GroupMemberSubcommand, GroupSubcommand, MessageCommand, MessageSubcommand,
-    OutputFormat, ProfileCommand, ProfileKeychainCommand, ProfileKeychainSubcommand,
-    ProfileSubcommand, RuntimeCommand, RuntimeSubcommand, SyncCommand, SyncSubcommand,
+    ContactRequestsSubcommand, ContactSubcommand, ConversationCommand, ConversationSubcommand,
+    DeviceCommand, DeviceSubcommand, GroupCommand, GroupInviteCommand, GroupInviteSubcommand,
+    GroupJoinCommand, GroupJoinSubcommand, GroupMemberCommand, GroupMemberSubcommand,
+    GroupSubcommand, MessageCommand, MessageSubcommand, OutputFormat, ProfileCommand,
+    ProfileKeychainCommand, ProfileKeychainSubcommand, ProfileSubcommand, RuntimeCommand,
+    RuntimeSubcommand, SyncCommand, SyncSubcommand,
 };
 use super::driver::CoreDriver;
 use super::profile::{
@@ -2331,7 +2331,6 @@ fn local_user_id(driver: &CoreDriver) -> Result<String> {
         .map(|identity| identity.user_identity.user_id.clone())
         .ok_or_else(|| anyhow!("local identity is not initialized"))
 }
-
 
 fn latest_notification_since(
     driver: &crate::cli::driver::CoreDriver,

@@ -102,8 +102,6 @@ pub struct ConversationLanes {
 pub struct LaneWrapCache {
     pub epoch: u64,
     pub key: [u8; 32],
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub outbound_key: Option<[u8; 32]>,
 }
 
 impl ConversationLanes {

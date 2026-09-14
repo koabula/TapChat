@@ -225,7 +225,6 @@ pub enum ContactRequestsSubcommand {
     },
 }
 
-
 #[derive(Debug, Args)]
 pub struct ConversationCommand {
     #[command(subcommand)]

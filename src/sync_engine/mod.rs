@@ -196,9 +196,7 @@ mod tests {
         SyncEngine, SyncEngineModule, MAX_QUARANTINED_RECORDS,
         MAX_QUARANTINED_RECORDS_PER_CONVERSATION,
     };
-    use crate::model::{
-        Envelope, InboxRecord, InboxRecordState,
-    };
+    use crate::model::{Envelope, InboxRecord, InboxRecordState};
 
     #[test]
     fn module_name_is_stable() {

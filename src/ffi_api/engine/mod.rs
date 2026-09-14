@@ -27,7 +27,7 @@ use crate::conversation::{
     direct_conversation_id, ConversationArchiveMetadata, ConversationManager,
     LocalConversationState, ReconcileMembershipInput, RecoveryStatus, StoredMessage,
 };
-use crate::direct_pcs::{commit_hash_from_b64, designated_committer, OwnCommit};
+use crate::direct_pcs::{designated_committer, OwnCommit};
 use crate::error::{CoreError, CoreResult};
 use crate::ffi_api::types::*;
 use crate::identity::IdentityManager;
@@ -38,16 +38,17 @@ use crate::mls_adapter::{
 };
 use crate::model::signing::{group_envelope_sender_proof_payload, SignatureDomain, SigningPayload};
 use crate::model::{
-    Ack, CapabilityService, Conversation, ConversationKind, ConversationMember, ConversationState,
-    DeliveryClass, DeviceStatusKind, Envelope, GroupCapability, GroupCursor, GroupEnvelope,
-    GroupEnvelopeVisibility, GroupInviteDocument, GroupJoinPolicy, GroupJoinRequest,
-    GroupJoinRequestStatus, GroupLeaveRequest, GroupLeaveRequestStatus, GroupManifest, GroupMember,
-    GroupMemberDevice, GroupMemberInvitePolicy, GroupMemberStatus, GroupMembershipProof,
-    GroupMessageType, GroupOutboxDescriptor, GroupOutboxRecord, GroupOutboxRecordState, GroupRole,
-    GroupStateEvent, GroupStateEventKind, GroupTransitionOperation, GroupTransitionRequestBinding,
-    ContactAcceptedBody, GroupWelcomePickupBody, IdentityBundle, InboxRecord, MessageType,
-    MlsStateStatus, MlsStateSummary, ProtectedAppMessage, ProtectedPayloadKind, SenderProof,
-    StorageRef, Validate, WelcomePickupDescriptor,
+    Ack, CapabilityService, ContactAcceptedBody, Conversation, ConversationKind,
+    ConversationMember, ConversationState, DeliveryClass, DeviceStatusKind, Envelope,
+    GroupCapability, GroupCursor, GroupEnvelope, GroupEnvelopeVisibility, GroupInviteDocument,
+    GroupJoinPolicy, GroupJoinRequest, GroupJoinRequestStatus, GroupLeaveRequest,
+    GroupLeaveRequestStatus, GroupManifest, GroupMember, GroupMemberDevice,
+    GroupMemberInvitePolicy, GroupMemberStatus, GroupMembershipProof, GroupMessageType,
+    GroupOutboxDescriptor, GroupOutboxRecord, GroupOutboxRecordState, GroupRole, GroupStateEvent,
+    GroupStateEventKind, GroupTransitionOperation, GroupTransitionRequestBinding,
+    GroupWelcomePickupBody, IdentityBundle, InboxRecord, MessageType, MlsStateStatus,
+    MlsStateSummary, ProtectedAppMessage, ProtectedPayloadKind, SenderProof, StorageRef, Validate,
+    WelcomePickupDescriptor,
 };
 use crate::persistence::{
     ContactRelationshipStatus, CorePersistenceSnapshot, GroupConsistencyState,

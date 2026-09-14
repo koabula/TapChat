@@ -20,8 +20,7 @@ use crate::transport_contract::{
     ListGroupLeaveRequestsRequest, MessageRequestActionRequest, PrepareBlobUploadRequest,
     PublishSharedStateRequest, PutWelcomePickupRequest, RealtimeSubscriptionRequest,
     RegisterAcceptedLaneRequest, RevokeAcceptedLanesRequest, RevokeGroupInviteRequest,
-    SealGroupOutboxRequest,
-    SubmitGroupJoinRequest, SubmitGroupLeaveRequest,
+    SealGroupOutboxRequest, SubmitGroupJoinRequest, SubmitGroupLeaveRequest,
 };
 
 pub trait TransportPort {
@@ -320,9 +319,7 @@ where
             CoreEffect::RegisterAcceptedLane { register } => {
                 ports.register_accepted_lane(register).await
             }
-            CoreEffect::RevokeAcceptedLanes { revoke } => {
-                ports.revoke_accepted_lanes(revoke).await
-            }
+            CoreEffect::RevokeAcceptedLanes { revoke } => ports.revoke_accepted_lanes(revoke).await,
             CoreEffect::PublishSharedState { publish } => ports.publish_shared_state(publish).await,
             CoreEffect::OpenGroupRealtimeConnection { subscription } => {
                 ports.open_group_realtime(subscription).await

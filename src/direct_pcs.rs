@@ -182,10 +182,7 @@ mod tests {
             ..Default::default()
         };
         state.self_debt = DIRECT_PCS_COMMIT_INTERVAL;
-        state.mark_rotated(
-            own_commit(7, "sha256:mine", true),
-            DIRECT_PCS_MAX_AGE_MS,
-        );
+        state.mark_rotated(own_commit(7, "sha256:mine", true), DIRECT_PCS_MAX_AGE_MS);
         assert_eq!(state.self_debt, 0);
         assert_eq!(state.self_rotated_at_ms, Some(DIRECT_PCS_MAX_AGE_MS));
         assert!(!state.should_rotate(true, DIRECT_PCS_MAX_AGE_MS * 2 - 1));

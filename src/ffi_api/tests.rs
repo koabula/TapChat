@@ -975,7 +975,7 @@ mod tests {
         assert_eq!(
             for_invitees
                 .iter()
-                .filter(|item| envelope_is_wrapped_app(&item.envelope))
+                .filter(|item| envelope_is_wrapped_app(&alice, &item.envelope))
                 .count(),
             2,
             "the group invite must then ride a wrapped application frame"
@@ -986,7 +986,7 @@ mod tests {
                 continue;
             }
             assert!(
-                envelope_is_wrapped_app(&item.envelope),
+                envelope_is_wrapped_app(&alice, &item.envelope),
                 "1:1 inbox must not carry a parseable non-Welcome record"
             );
             let visible = host_visible_envelope_json(&item.envelope);
@@ -4089,7 +4089,7 @@ mod tests {
                 .state
                 .pending_outbox
                 .iter()
-                .all(|item| envelope_is_wrapped_app(&item.envelope)),
+                .all(|item| envelope_is_host_opaque_direct(&item.envelope)),
             "contact removed must leave only wrapped MLS application frames"
         );
         let pending_after_delete = alice.state.pending_outbox.len();
@@ -4131,7 +4131,7 @@ mod tests {
             snapshot
                 .pending_outbox
                 .iter()
-                .all(|item| envelope_is_wrapped_app(&item.envelope)),
+                .all(|item| envelope_is_host_opaque_direct(&item.envelope)),
             "the leftover outbox must stay typeless wrapped MLS, not a parseable control"
         );
 
@@ -4285,7 +4285,7 @@ mod tests {
                 .state
                 .pending_outbox
                 .iter()
-                .all(|item| envelope_is_wrapped_app(&item.envelope)),
+                .all(|item| envelope_is_host_opaque_direct(&item.envelope)),
             "contact removed rides MLS; the 1:1 header stays typeless"
         );
         assert!(!alice.state.pending_outbox.is_empty());
@@ -4322,7 +4322,7 @@ mod tests {
             .expect("alice deletes bob");
         assert!(!chat.alice.state.pending_outbox.is_empty());
         for item in &chat.alice.state.pending_outbox {
-            assert!(envelope_is_wrapped_app(&item.envelope));
+            assert!(envelope_is_host_opaque_direct(&item.envelope));
             let visible = host_visible_envelope_json(&item.envelope);
             assert!(
                 !visible.contains("control_contact_removed"),
@@ -4381,7 +4381,7 @@ mod tests {
                 .state
                 .pending_outbox
                 .iter()
-                .any(|item| envelope_is_wrapped_app(&item.envelope)),
+                .any(|item| envelope_is_wrapped_app(&alice, &item.envelope)),
             "accept must send a wrapped MLS application frame"
         );
         deliver_pending_outbox_to_device(&mut bob, &alice, &bob_device_id);
@@ -4431,13 +4431,11 @@ mod tests {
                 user_id: bob_bundle.user_id.clone(),
             })
             .expect("alice deletes bob");
-        assert!(
-            alice
-                .state
-                .pending_outbox
-                .iter()
-                .all(|item| envelope_is_wrapped_app(&item.envelope))
-        );
+        assert!(alice
+            .state
+            .pending_outbox
+            .iter()
+            .all(|item| envelope_is_host_opaque_direct(&item.envelope)));
 
         let bob_device_id = bob.local_device_id().expect("bob device").to_string();
         let late = InboxRecord {
@@ -5985,7 +5983,7 @@ mod tests {
             .get(&bob_device_id)
             .expect("sync state");
         assert_eq!(sync_state.checkpoint.last_acked_seq, 2);
-        assert!(sync_state.quarantine.is_empty());
+        assert_eq!(sync_state.quarantine.len(), 1);
     }
 
     #[test]
@@ -11570,10 +11568,15 @@ mod tests {
         let mut alice = harness_user("alice", ALICE_MNEMONIC, "phone");
         let mut bob = harness_user("bob", BOB_MNEMONIC, "phone");
         import_peer_bundles(&mut [&mut alice, &mut bob]);
-        assert!(alice.engine.state.conversations.values().all(|conversation| {
-            conversation.conversation.kind != ConversationKind::Direct
-                || conversation.peer_user_id != bob.bundle.user_id
-        }));
+        assert!(alice
+            .engine
+            .state
+            .conversations
+            .values()
+            .all(|conversation| {
+                conversation.conversation.kind != ConversationKind::Direct
+                    || conversation.peer_user_id != bob.bundle.user_id
+            }));
         let mut harness = GroupHarness::with_bundles(&[&alice, &bob].map(|user| HarnessUser {
             name: user.name,
             bundle: user.bundle.clone(),
@@ -11598,7 +11601,7 @@ mod tests {
         assert!(
             for_bob
                 .iter()
-                .any(|item| envelope_is_wrapped_app(&item.envelope)),
+                .any(|item| envelope_is_wrapped_app(&alice.engine, &item.envelope)),
             "the group invite must then ride a wrapped application frame"
         );
         for item in &for_bob {
@@ -11607,7 +11610,7 @@ mod tests {
                 continue;
             }
             assert!(
-                envelope_is_wrapped_app(&item.envelope),
+                envelope_is_wrapped_app(&alice.engine, &item.envelope),
                 "1:1 inbox must not carry a parseable non-Welcome record"
             );
             let visible = host_visible_envelope_json(&item.envelope);
@@ -12407,6 +12410,290 @@ mod tests {
         );
     }
 
+    #[test]
+    fn direct_future_epoch_application_replays_after_commit() {
+        let mut chat = paired_direct_chat();
+        let conversation_id = chat.conversation_id.clone();
+        let alice_rotated = alice_is_designated(&chat);
+        let recipient_device = peer_device_id(&chat, alice_rotated).to_string();
+        set_direct_pcs_debt(
+            rotator_engine_mut(&mut chat, alice_rotated),
+            &conversation_id,
+            DIRECT_PCS_COMMIT_INTERVAL - 1,
+        );
+        trigger_direct_pcs_from_designated(&mut chat);
+        let commit = last_pending_envelope(
+            rotator_engine(&chat, alice_rotated),
+            &recipient_device,
+            MessageType::MlsCommit,
+        );
+        rotator_engine_mut(&mut chat, alice_rotated)
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "future-before-commit".into(),
+            })
+            .expect("send future-epoch application");
+        let application = last_pending_application_envelope(
+            rotator_engine(&chat, alice_rotated),
+            &recipient_device,
+        );
+
+        deliver_inbox_envelope(
+            peer_engine_mut(&mut chat, alice_rotated),
+            &recipient_device,
+            application,
+            100,
+        );
+        assert_eq!(
+            peer_engine(&chat, alice_rotated)
+                .state
+                .sync_states
+                .get(&recipient_device)
+                .map(|state| state.quarantine.len()),
+            Some(1),
+            "future wrap must remain in the invisible bounded quarantine"
+        );
+        assert!(!conversation_has_plaintext(
+            peer_engine(&chat, alice_rotated),
+            &conversation_id,
+            "future-before-commit"
+        ));
+
+        deliver_inbox_envelope(
+            peer_engine_mut(&mut chat, alice_rotated),
+            &recipient_device,
+            commit,
+            101,
+        );
+        assert!(conversation_has_plaintext(
+            peer_engine(&chat, alice_rotated),
+            &conversation_id,
+            "future-before-commit"
+        ));
+        assert_eq!(
+            peer_engine(&chat, alice_rotated)
+                .state
+                .sync_states
+                .get(&recipient_device)
+                .map(|state| state.quarantine.len()),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn direct_previous_epoch_application_survives_peer_commit() {
+        let mut chat = paired_direct_chat();
+        let conversation_id = chat.conversation_id.clone();
+        let alice_rotated = alice_is_designated(&chat);
+        let recipient_device = peer_device_id(&chat, alice_rotated).to_string();
+        rotator_engine_mut(&mut chat, alice_rotated)
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "previous-after-commit".into(),
+            })
+            .expect("send previous-epoch application");
+        let application = last_pending_application_envelope(
+            rotator_engine(&chat, alice_rotated),
+            &recipient_device,
+        );
+        set_direct_pcs_debt(
+            rotator_engine_mut(&mut chat, alice_rotated),
+            &conversation_id,
+            DIRECT_PCS_COMMIT_INTERVAL - 1,
+        );
+        trigger_direct_pcs_from_designated(&mut chat);
+        let commit = last_pending_envelope(
+            rotator_engine(&chat, alice_rotated),
+            &recipient_device,
+            MessageType::MlsCommit,
+        );
+
+        deliver_inbox_envelope(
+            peer_engine_mut(&mut chat, alice_rotated),
+            &recipient_device,
+            commit,
+            100,
+        );
+        deliver_inbox_envelope(
+            peer_engine_mut(&mut chat, alice_rotated),
+            &recipient_device,
+            application,
+            101,
+        );
+        assert!(conversation_has_plaintext(
+            peer_engine(&chat, alice_rotated),
+            &conversation_id,
+            "previous-after-commit"
+        ));
+    }
+
+    #[test]
+    fn rejected_spoofed_welcome_leaves_trusted_core_state_unchanged() {
+        let mut chat = paired_direct_chat();
+        let attacker = local_engine(CAROL_MNEMONIC, "attacker");
+        let mut fake_identity = attacker.state.local_identity.as_ref().unwrap().clone();
+        fake_identity.user_identity.user_id = chat
+            .alice
+            .state
+            .local_identity
+            .as_ref()
+            .unwrap()
+            .user_identity
+            .user_id
+            .clone();
+        fake_identity.device_identity.device_id = chat.alice_device_id.clone();
+        let (mut attacker_mls, _) = MlsAdapter::bootstrap(&fake_identity).unwrap();
+        let key_package = chat
+            .bob
+            .state
+            .mls_adapter
+            .as_mut()
+            .unwrap()
+            .rotate_key_package(test_now_ms())
+            .unwrap();
+        let bob = chat.bob.state.local_identity.as_ref().unwrap();
+        let fake_conversation_id = crate::model::random_opaque_id();
+        let artifacts = attacker_mls
+            .create_conversation_with_reply_lane(
+                &fake_conversation_id,
+                &[crate::mls_adapter::PeerDeviceKeyPackage {
+                    user_id: bob.user_identity.user_id.clone(),
+                    device_id: bob.device_identity.device_id.clone(),
+                    device_public_key: bob.device_identity.device_public_key.clone(),
+                    key_package_b64: key_package.key_package_b64,
+                }],
+                Some(&crate::model::random_opaque_id()),
+                None,
+            )
+            .unwrap();
+        let envelope = Envelope::with_bytes(
+            chat.bob_device_id.clone(),
+            crate::model::random_opaque_id(),
+            crate::model::random_opaque_id(),
+            artifacts.welcomes[0].payload_b64.clone(),
+        );
+        let conversations_before = chat.bob.state.conversations.clone();
+        let lane_index_before = chat.bob.state.lane_index.clone();
+        let adapter_before = chat
+            .bob
+            .state
+            .mls_adapter
+            .as_ref()
+            .unwrap()
+            .state_fingerprint()
+            .unwrap();
+
+        let output = deliver_inbox_envelope(&mut chat.bob, &chat.bob_device_id, envelope, 100);
+
+        assert_eq!(chat.bob.state.conversations, conversations_before);
+        assert_eq!(chat.bob.state.lane_index, lane_index_before);
+        assert_eq!(
+            chat.bob
+                .state
+                .mls_adapter
+                .as_ref()
+                .unwrap()
+                .state_fingerprint()
+                .unwrap(),
+            adapter_before
+        );
+        assert!(!output.state_update.conversations_changed);
+        assert!(!output.state_update.messages_changed);
+        assert!(output
+            .view_model
+            .as_ref()
+            .is_none_or(|view| view.messages.is_empty() && view.conversations.is_empty()));
+    }
+
+    #[test]
+    fn old_wrap_key_without_commit_proof_cannot_trigger_arbitration() {
+        let mut chat = paired_direct_chat();
+        let conversation_id = chat.conversation_id.clone();
+        let alice_rotated = !alice_is_designated(&chat);
+        let victim_device = rotator_device_id(&chat, alice_rotated).to_string();
+        let peer_device = peer_device_id(&chat, alice_rotated).to_string();
+        let victim = rotator_engine(&chat, alice_rotated);
+        let lanes = victim.state.conversations[&conversation_id]
+            .lanes
+            .as_ref()
+            .unwrap();
+        let inbound_lane = lanes.inbound_lane.clone();
+        let compromised_wrap_key = victim
+            .state
+            .mls_adapter
+            .as_ref()
+            .unwrap()
+            .export_lane_wrap_key(&conversation_id, lanes.inbound_dir())
+            .unwrap();
+        set_direct_pcs_debt(
+            rotator_engine_mut(&mut chat, alice_rotated),
+            &conversation_id,
+            DIRECT_PCS_COMMIT_INTERVAL * 2,
+        );
+        rotator_engine_mut(&mut chat, alice_rotated)
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "trigger-local-rotation".into(),
+            })
+            .unwrap();
+        let own_commit = last_pending_envelope(
+            rotator_engine(&chat, alice_rotated),
+            &peer_device,
+            MessageType::MlsCommit,
+        );
+        let raw_commit = unwrapped_inbox_payload(
+            peer_engine(&chat, alice_rotated),
+            &conversation_id,
+            &own_commit,
+        );
+        let mut commit_bytes = STANDARD.decode(raw_commit).unwrap();
+        *commit_bytes.last_mut().unwrap() ^= 1;
+        let forged_commit_b64 = STANDARD.encode(commit_bytes);
+        assert_eq!(
+            MlsAdapter::classify_mls_payload(&forged_commit_b64),
+            Some(MessageType::MlsCommit)
+        );
+        let forged_plaintext =
+            crate::direct_frame::encode(&crate::direct_frame::DirectWrappedFrame {
+                mls_b64: forged_commit_b64,
+                commit_proof: None,
+            })
+            .unwrap();
+        let forged = Envelope::with_bytes(
+            victim_device.clone(),
+            inbound_lane,
+            crate::model::random_opaque_id(),
+            STANDARD.encode(
+                crate::lane_wrap::wrap_frame(&compromised_wrap_key, &forged_plaintext).unwrap(),
+            ),
+        );
+        let before = rotator_engine(&chat, alice_rotated)
+            .state
+            .mls_adapter
+            .as_ref()
+            .unwrap()
+            .state_fingerprint()
+            .unwrap();
+
+        deliver_inbox_envelope(
+            rotator_engine_mut(&mut chat, alice_rotated),
+            &victim_device,
+            forged,
+            100,
+        );
+
+        assert_eq!(
+            rotator_engine(&chat, alice_rotated)
+                .state
+                .mls_adapter
+                .as_ref()
+                .unwrap()
+                .state_fingerprint()
+                .unwrap(),
+            before
+        );
+    }
+
     /// Forward secrecy watchdog. Persisted live state plus a replay of the
     /// rotation commit must not resurrect an `e+1` generation the live state
     /// already consumed, while a genuine `e` message still decrypts.
@@ -12425,8 +12712,8 @@ mod tests {
             &peer_device,
             MessageType::MlsCommit,
         );
-        let pcs_commit_b64 = unwrapped_outbox_payload(
-            rotator_engine(&chat, alice_rotated),
+        let pcs_commit_b64 = unwrapped_inbox_payload(
+            peer_engine(&chat, alice_rotated),
             &conversation_id,
             &pcs_commit_envelope,
         );
@@ -12440,8 +12727,8 @@ mod tests {
             peer_engine(&chat, alice_rotated),
             &designated_device,
         );
-        let late_e = unwrapped_outbox_payload(
-            peer_engine(&chat, alice_rotated),
+        let late_e = unwrapped_inbox_payload(
+            rotator_engine(&chat, alice_rotated),
             &conversation_id,
             &late_e_envelope,
         );
@@ -12467,8 +12754,8 @@ mod tests {
             peer_engine(&chat, alice_rotated),
             &designated_device,
         );
-        let next_epoch = unwrapped_outbox_payload(
-            peer_engine(&chat, alice_rotated),
+        let next_epoch = unwrapped_inbox_payload(
+            rotator_engine(&chat, alice_rotated),
             &conversation_id,
             &next_epoch_envelope,
         );
@@ -12918,20 +13205,55 @@ mod tests {
             .clone()
     }
 
-    fn envelope_is_wrapped_app(envelope: &Envelope) -> bool {
+    fn envelope_is_wrapped_app(sender: &CoreEngine, envelope: &Envelope) -> bool {
+        if !envelope_is_host_opaque_direct(envelope) {
+            return false;
+        }
         let Some(payload) = envelope.payload_b64() else {
             return false;
         };
-        if MlsAdapter::payload_is_welcome(payload) {
-            return false;
-        }
         let Ok(raw) = STANDARD.decode(payload.as_bytes()) else {
             return false;
         };
-        serde_json::from_slice::<serde_json::Value>(&raw)
+        let Some(conversation_id) = sender.state.lane_index.get(&envelope.lane) else {
+            return false;
+        };
+        let Some(lanes) = sender
+            .state
+            .conversations
+            .get(conversation_id)
+            .and_then(|state| state.lanes.as_ref())
+        else {
+            return false;
+        };
+        let Some(adapter) = sender.state.mls_adapter.as_ref() else {
+            return false;
+        };
+        let Ok(key) = adapter.export_lane_wrap_key(conversation_id, lanes.outbound_dir) else {
+            return false;
+        };
+        let Some(plaintext) = crate::lane_wrap::unwrap_with_cached_keys(&key, None, &raw) else {
+            return false;
+        };
+        let Ok(frame) = crate::direct_frame::decode(&plaintext) else {
+            return false;
+        };
+        MlsAdapter::classify_mls_payload(&frame.mls_b64) == Some(MessageType::MlsApplication)
+    }
+
+    fn envelope_is_host_opaque_direct(envelope: &Envelope) -> bool {
+        let Some(payload) = envelope.payload_b64() else {
+            return false;
+        };
+        if MlsAdapter::payload_is_welcome(payload)
+            || MlsAdapter::classify_mls_payload(payload).is_some()
+        {
+            return false;
+        }
+        STANDARD
+            .decode(payload.as_bytes())
             .ok()
-            .and_then(|value| value.get("payload_kind").cloned())
-            .is_none()
+            .is_some_and(|raw| crate::direct_frame::decode(&raw).is_err())
     }
 
     fn host_visible_envelope_json(envelope: &Envelope) -> String {
@@ -13172,7 +13494,8 @@ mod tests {
             .iter()
             .filter(|item| {
                 item.envelope.recipient_device_id == device_id
-                    && types.contains(&MessageType::MlsApplication)
+                    && outbound_item_message_type(sender, item)
+                        .is_some_and(|message_type| types.contains(&message_type))
             })
             .enumerate()
             .map(|(index, item)| InboxRecord {
@@ -13197,6 +13520,40 @@ mod tests {
                 })
                 .expect("filtered inbox records fetched"),
         )
+    }
+
+    fn outbound_item_message_type(
+        sender: &CoreEngine,
+        item: &crate::ffi_api::types::PendingOutboxItem,
+    ) -> Option<MessageType> {
+        outbound_envelope_message_type(sender, &item.envelope)
+    }
+
+    fn outbound_envelope_message_type(
+        sender: &CoreEngine,
+        envelope: &Envelope,
+    ) -> Option<MessageType> {
+        let payload = envelope.payload_b64()?;
+        if MlsAdapter::payload_is_welcome(payload) {
+            return Some(MessageType::MlsWelcome);
+        }
+        let conversation_id = sender.state.lane_index.get(&envelope.lane)?;
+        let lanes = sender
+            .state
+            .conversations
+            .get(conversation_id)?
+            .lanes
+            .as_ref()?;
+        let key = sender
+            .state
+            .mls_adapter
+            .as_ref()?
+            .export_lane_wrap_key(conversation_id, lanes.outbound_dir)
+            .ok()?;
+        let wrapped = STANDARD.decode(payload).ok()?;
+        let plaintext = crate::lane_wrap::unwrap_with_cached_keys(&key, None, &wrapped)?;
+        let frame = crate::direct_frame::decode(&plaintext).ok()?;
+        MlsAdapter::classify_mls_payload(&frame.mls_b64)
     }
 
     fn deliver_inbox_envelope(
@@ -13240,8 +13597,8 @@ mod tests {
             .clone()
     }
 
-    fn unwrapped_outbox_payload(
-        engine: &CoreEngine,
+    fn unwrapped_inbox_payload(
+        recipient: &CoreEngine,
         conversation_id: &str,
         envelope: &Envelope,
     ) -> String {
@@ -13249,32 +13606,9 @@ mod tests {
         if crate::mls_adapter::MlsAdapter::payload_is_welcome(payload) {
             return payload.to_string();
         }
-        let dir = engine
-            .state
-            .conversations
-            .get(conversation_id)
-            .and_then(|conversation| conversation.lanes.as_ref())
-            .map(|lanes| lanes.outbound_dir)
-            .unwrap_or(crate::lane_wrap::WRAP_DIR_C1);
-        let current = engine
-            .state
-            .mls_adapter
-            .as_ref()
-            .expect("adapter")
-            .export_lane_wrap_key(conversation_id, dir)
-            .expect("current wrap key");
-        let previous = engine
-            .state
-            .conversations
-            .get(conversation_id)
-            .and_then(|conversation| conversation.lanes.as_ref())
-            .and_then(|lanes| lanes.wrap_prev.as_ref())
-            .and_then(|cache| cache.outbound_key.or(Some(cache.key)));
-        let wrapped = STANDARD.decode(payload).expect("wrapped payload");
-        let frame =
-            crate::lane_wrap::unwrap_with_cached_keys(&current, previous.as_ref(), &wrapped)
-                .expect("unwrap outbox frame");
-        STANDARD.encode(frame)
+        recipient
+            .unwrap_inbound_bytes(conversation_id, payload)
+            .expect("unwrap inbox frame")
     }
 
     /// The most recent match. Prefer this for commits: the conversation's

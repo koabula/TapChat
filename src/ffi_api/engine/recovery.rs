@@ -703,21 +703,6 @@ impl CoreEngine {
         Ok(CoreOutput::default())
     }
 
-    pub(super) fn ensure_local_conversation_for_record(
-        &mut self,
-        device_id: &str,
-        local_user_id: &str,
-        record: &InboxRecord,
-    ) {
-        let Some(conversation_id) = self.conversation_id_for_lane(&record.envelope.lane) else {
-            return;
-        };
-        if self.state.conversations.contains_key(&conversation_id) {
-            return;
-        }
-        let _ = (device_id, local_user_id);
-    }
-
     /// Whether a retained record is waiting on something that only a Welcome
     /// can supply.
     ///

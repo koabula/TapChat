@@ -147,23 +147,20 @@ function sampleAppend(deviceId: string, messageId: string, ciphertext: string, s
     version: CURRENT_MODEL_VERSION,
     recipientDeviceId: deviceId,
     envelope: {
-      version: CURRENT_MODEL_VERSION,
-      messageId,
-      conversationId: "conv:alice:bob",
-      senderUserId,
-      senderDeviceId: `${senderUserId.replace("user", "device")}:phone`,
       recipientDeviceId: deviceId,
-      createdAt: Date.now(),
-      messageType: "mls_application",
-      inlineCiphertext: ciphertext,
-      storageRefs: [],
-      deliveryClass: "normal",
-      senderProof: {
-        type: "signature",
-        value: "sig"
-      }
+      lane: laneForSender(senderUserId),
+      mid: opaqueId(messageId),
+      bytes: btoa(ciphertext)
     }
   };
+}
+
+function opaqueId(label: string): string {
+  return bytesToHex(new TextEncoder().encode(label)).padEnd(32, "0").slice(0, 32);
+}
+
+function laneForSender(senderUserId: string): string {
+  return opaqueId(`lane:${senderUserId}`);
 }
 
 function sampleCapability(deviceId: string): InboxAppendCapability {
@@ -526,16 +523,14 @@ async function appendEnvelope(
   };
 }
 
-async function registerAcceptedLane(mf: Miniflare, token: string, deviceId: string, allowedSenderUserIds: string[]): Promise<void> {
-  const response = await mf.dispatchFetch(`${BASE_URL}/v1/inbox/${encodeURIComponent(deviceId)}/allowlist`, {
-    method: "PUT",
-    headers: {
-      ...authHeaders(token),
-      "content-type": "application/json"
-    },
-    body: JSON.stringify({ allowedSenderUserIds, rejectedSenderUserIds: [] })
-  });
-  assert.equal(response.status, 200);
+async function registerAcceptedLane(mf: Miniflare, token: string, deviceId: string, senderUserIds: string[]): Promise<void> {
+  for (const senderUserId of senderUserIds) {
+    const response = await mf.dispatchFetch(
+      `${BASE_URL}/v1/inbox/${encodeURIComponent(deviceId)}/accepted-lanes/${laneForSender(senderUserId)}`,
+      { method: "PUT", headers: authHeaders(token) }
+    );
+    assert.equal(response.status, 200);
+  }
 }
 
 type RuntimeWebSocket = {
@@ -636,7 +631,7 @@ test("runtime integration: append -> subscribe push -> reconnect/fetch recovery 
   const pushedRecord = (await pushedRecordMessage) as { event: string; seq: number; record: { seq: number; messageId: string } };
   assert.equal(pushedRecord.event, "inbox_record_available");
   assert.equal(pushedRecord.record.seq, 1);
-  assert.equal(pushedRecord.record.messageId, "msg:1");
+  assert.equal(pushedRecord.record.messageId, opaqueId("msg:1"));
 
   socket.close(1000, "test reconnect");
 
@@ -655,12 +650,12 @@ test("runtime integration: append -> subscribe push -> reconnect/fetch recovery 
     headers: authHeaders(token)
   });
   assert.equal(fetchResponse.status, 200);
-  const fetched = (await fetchResponse.json()) as { toSeq: number; records: Array<{ seq: number; messageId: string; envelope: { inlineCiphertext?: string } }> };
+  const fetched = (await fetchResponse.json()) as { toSeq: number; records: Array<{ seq: number; messageId: string; envelope: { bytes?: string } }> };
   assert.equal(fetched.toSeq, 2);
   assert.equal(fetched.records.length, 1);
   assert.equal(fetched.records[0].seq, 2);
-  assert.equal(fetched.records[0].messageId, "msg:2");
-  assert.equal(fetched.records[0].envelope.bytes, bigCiphertext);
+  assert.equal(fetched.records[0].messageId, opaqueId("msg:2"));
+  assert.equal(fetched.records[0].envelope.bytes, btoa(bigCiphertext));
 
   const ackResponse = await mf.dispatchFetch(`${BASE_URL}/v1/inbox/${encodeURIComponent(deviceId)}/ack`, {
     method: "POST",
@@ -762,8 +757,8 @@ test("runtime integration: message request changes push over realtime and inbox 
   const queuedMessage = waitForWebSocketMessage(socket);
 
   const queued = await appendEnvelope(mf, deviceId, "msg:req-1", "cipher-req", "user:mallory");
-  assert.equal(queued.accepted ? "inbox" : "other", "message_request");
-  assert.equal(queued.queuedAsRequest, true);
+  assert.equal(queued.accepted, true);
+  assert.equal(queued.seq, 1);
   const queuedEvent = (await queuedMessage) as {
     event: string;
     deviceId: string;
@@ -823,14 +818,16 @@ test("runtime integration: message request changes push over realtime and inbox 
     "user:mallory"
   );
   assert.equal(deliveredAfterAccept.status, 200);
-  assert.equal(deliveredAfterAccept.accepted ? "inbox" : "other", "inbox");
-  assert.notEqual(deliveredAfterAccept.queuedAsRequest, true);
+  assert.equal(deliveredAfterAccept.accepted, true);
 
   const fetchResponse = await mf.dispatchFetch(`${BASE_URL}/v1/inbox/${encodeURIComponent(deviceId)}/messages?fromSeq=1&limit=10`, {
     headers: authHeaders(token)
   });
   const fetched = (await fetchResponse.json()) as { records: Array<{ messageId: string }> };
-  assert.deepEqual(fetched.records.map((record) => record.messageId), ["msg:req-1", "msg:req-2"]);
+  assert.deepEqual(fetched.records.map((record) => record.messageId), [
+    opaqueId("msg:req-1"),
+    opaqueId("msg:req-2")
+  ]);
 
   socket.close(1000, "done");
 });

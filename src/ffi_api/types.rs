@@ -10,8 +10,8 @@ use crate::mls_adapter::{MlsAdapter, PeerDeviceKeyPackage, PublishedKeyPackage};
 use crate::model::{
     Ack, ConversationKind, ConversationMember, DeploymentBundle, Envelope, GroupCursor,
     GroupEnvelope, GroupInviteDocument, GroupJoinRequest, GroupLeaveRequest, GroupRole,
-    IdentityBundle, InboxRecord, MessageType, MlsStateStatus, MlsStateSummary, ProtectedPayloadKind,
-    StorageRef, WelcomePickupDescriptor,
+    IdentityBundle, InboxRecord, MessageType, MlsStateStatus, MlsStateSummary,
+    ProtectedPayloadKind, StorageRef, WelcomePickupDescriptor,
 };
 use crate::persistence::{
     ContactRelationshipStatus, CorePersistenceSnapshot, PersistOp, PersistedContact,

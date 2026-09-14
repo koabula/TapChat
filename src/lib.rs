@@ -5,6 +5,7 @@ pub mod contact_share;
 pub mod contact_workflows;
 pub mod conversation;
 pub mod desktop_app;
+pub(crate) mod direct_frame;
 pub mod direct_pcs;
 pub mod error;
 pub mod error_codes_generated;

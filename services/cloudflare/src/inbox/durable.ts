@@ -132,6 +132,22 @@ const DurableObjectBase: typeof CloudflareDurableObject<Env> =
     constructor(_state: DurableObjectState, _env: Env) {}
   } as unknown as typeof CloudflareDurableObject<Env>);
 
+/// Durable Objects interleave requests across external awaits such as R2.
+/// Keep one queue per object instance so a logical Inbox operation observes
+/// and commits one state transition at a time.
+export class SerialExecutor {
+  private tail: Promise<void> = Promise.resolve();
+
+  run<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.tail.then(operation, operation);
+    this.tail = result.then(
+      () => undefined,
+      () => undefined
+    );
+    return result;
+  }
+}
+
 export async function handleInboxDurableRequest(
   request: Request,
   deps: {
@@ -263,6 +279,7 @@ export class InboxDurableObject extends DurableObjectBase {
   private readonly sessions = new Map<string, ManagedSession>();
   private readonly stateRef: DurableObjectState;
   private readonly envRef: Env;
+  private readonly operations = new SerialExecutor();
 
   constructor(state: DurableObjectState, env: Env) {
     super(state, env);
@@ -271,6 +288,10 @@ export class InboxDurableObject extends DurableObjectBase {
   }
 
   async fetch(request: Request): Promise<Response> {
+    return this.operations.run(() => this.fetchSerialized(request));
+  }
+
+  private async fetchSerialized(request: Request): Promise<Response> {
     const url = new URL(request.url);
     const match = url.pathname.match(/\/v1\/inbox\/([^/]+)\//);
     const deviceId = decodeURIComponent(match?.[1] ?? "");
@@ -324,26 +345,28 @@ export class InboxDurableObject extends DurableObjectBase {
   }
 
   async alarm(): Promise<void> {
-    const service = new InboxService(
-      "",
-      new DurableObjectStorageAdapter(this.stateRef.storage),
-      new R2JsonBlobStore(this.envRef.TAPCHAT_STORAGE),
-      [],
-      {
-        headSeq: 0,
-        ackedSeq: 0,
-        retentionDays: Number(this.envRef.RETENTION_DAYS ?? "30"),
-        maxInlineBytes: Number(this.envRef.MAX_INLINE_BYTES ?? "4096"),
-        rateLimitPerMinute: Number(this.envRef.RATE_LIMIT_PER_MINUTE ?? "60"),
-        rateLimitPerHour: Number(this.envRef.RATE_LIMIT_PER_HOUR ?? "600"),
-        messageRequestMaxSenders: Number(this.envRef.MESSAGE_REQUEST_MAX_SENDERS ?? "64"),
-        messageRequestMaxTotalBytes: Number(this.envRef.MESSAGE_REQUEST_MAX_TOTAL_BYTES ?? String(4 * 1024 * 1024)),
-        messageRequestTtlSeconds: Number(this.envRef.MESSAGE_REQUEST_TTL_SECONDS ?? String(7 * 24 * 60 * 60)),
-        messageRequestRateLimitMinute: Number(this.envRef.MESSAGE_REQUEST_RATE_LIMIT_MINUTE ?? "30"),
-        messageRequestRateLimitHour: Number(this.envRef.MESSAGE_REQUEST_RATE_LIMIT_HOUR ?? "300")
-      }
-    );
-    await service.cleanExpiredRecords(Date.now());
+    await this.operations.run(async () => {
+      const service = new InboxService(
+        "",
+        new DurableObjectStorageAdapter(this.stateRef.storage),
+        new R2JsonBlobStore(this.envRef.TAPCHAT_STORAGE),
+        [],
+        {
+          headSeq: 0,
+          ackedSeq: 0,
+          retentionDays: Number(this.envRef.RETENTION_DAYS ?? "30"),
+          maxInlineBytes: Number(this.envRef.MAX_INLINE_BYTES ?? "4096"),
+          rateLimitPerMinute: Number(this.envRef.RATE_LIMIT_PER_MINUTE ?? "60"),
+          rateLimitPerHour: Number(this.envRef.RATE_LIMIT_PER_HOUR ?? "600"),
+          messageRequestMaxSenders: Number(this.envRef.MESSAGE_REQUEST_MAX_SENDERS ?? "64"),
+          messageRequestMaxTotalBytes: Number(this.envRef.MESSAGE_REQUEST_MAX_TOTAL_BYTES ?? String(4 * 1024 * 1024)),
+          messageRequestTtlSeconds: Number(this.envRef.MESSAGE_REQUEST_TTL_SECONDS ?? String(7 * 24 * 60 * 60)),
+          messageRequestRateLimitMinute: Number(this.envRef.MESSAGE_REQUEST_RATE_LIMIT_MINUTE ?? "30"),
+          messageRequestRateLimitHour: Number(this.envRef.MESSAGE_REQUEST_RATE_LIMIT_HOUR ?? "300")
+        }
+      );
+      await service.cleanExpiredRecords(Date.now());
+    });
   }
 }
 

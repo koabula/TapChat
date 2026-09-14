@@ -124,7 +124,10 @@ impl CoreEngine {
         })
     }
 
-    pub(super) fn snapshot_wrap_prev(&mut self, conversation_id: &str) -> CoreResult<()> {
+    pub(super) fn capture_previous_inbound_wrap(
+        &self,
+        conversation_id: &str,
+    ) -> CoreResult<Option<LaneWrapCache>> {
         let Some(inbound_dir) = self
             .state
             .conversations
@@ -132,7 +135,7 @@ impl CoreEngine {
             .and_then(|conversation| conversation.lanes.as_ref())
             .map(|lanes| lanes.inbound_dir())
         else {
-            return Ok(());
+            return Ok(None);
         };
         let adapter = self
             .state
@@ -140,31 +143,29 @@ impl CoreEngine {
             .as_ref()
             .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?;
         if !adapter.has_conversation(conversation_id) {
-            return Ok(());
+            return Ok(None);
         }
-        let outbound_dir = self
-            .state
-            .conversations
-            .get(conversation_id)
-            .and_then(|conversation| conversation.lanes.as_ref())
-            .map(|lanes| lanes.outbound_dir)
-            .unwrap_or(WRAP_DIR_C1);
         let epoch = adapter.export_group_summary(conversation_id)?.epoch;
         let key = adapter.export_lane_wrap_key(conversation_id, inbound_dir)?;
-        let outbound_key = adapter.export_lane_wrap_key(conversation_id, outbound_dir)?;
+        Ok(Some(LaneWrapCache { epoch, key }))
+    }
+
+    pub(super) fn install_previous_inbound_wrap(
+        &mut self,
+        conversation_id: &str,
+        previous: Option<LaneWrapCache>,
+    ) {
+        let Some(previous) = previous else {
+            return;
+        };
         if let Some(lanes) = self
             .state
             .conversations
             .get_mut(conversation_id)
             .and_then(|conversation| conversation.lanes.as_mut())
         {
-            lanes.wrap_prev = Some(LaneWrapCache {
-                epoch,
-                key,
-                outbound_key: Some(outbound_key),
-            });
+            lanes.wrap_prev = Some(previous);
         }
-        Ok(())
     }
 
     pub(super) fn export_outbound_wrap_key(
@@ -186,11 +187,11 @@ impl CoreEngine {
         adapter.export_lane_wrap_key(conversation_id, dir)
     }
 
-    pub(super) fn unwrap_inbound_bytes(
+    fn unwrap_inbound_plaintext(
         &self,
         conversation_id: &str,
         payload_b64: &str,
-    ) -> Option<String> {
+    ) -> Option<Vec<u8>> {
         let lanes = self
             .state
             .conversations
@@ -205,32 +206,50 @@ impl CoreEngine {
             .ok()?;
         let previous = lanes.wrap_prev.as_ref().map(|cache| &cache.key);
         let wrapped = STANDARD.decode(payload_b64).ok()?;
-        let frame = lane_wrap::unwrap_with_cached_keys(&current, previous, &wrapped)?;
-        Some(STANDARD.encode(frame))
+        lane_wrap::unwrap_with_cached_keys(&current, previous, &wrapped)
     }
 
-    pub(super) fn wrap_frame_b64(
-        key: &[u8; lane_wrap::WRAP_KEY_LEN],
+    pub(crate) fn unwrap_inbound_bytes(
+        &self,
+        conversation_id: &str,
         payload_b64: &str,
-    ) -> CoreResult<String> {
-        let frame = STANDARD.decode(payload_b64).map_err(|error| {
-            CoreError::invalid_input(format!("outbound MLS frame is not base64: {error}"))
-        })?;
-        let wrapped = lane_wrap::wrap_frame(key, &frame)?;
-        Ok(STANDARD.encode(wrapped))
+    ) -> Option<String> {
+        let plaintext = self.unwrap_inbound_plaintext(conversation_id, payload_b64)?;
+        crate::direct_frame::decode(&plaintext)
+            .ok()
+            .map(|frame| frame.mls_b64)
     }
 
     pub(super) fn resolve_inbound_frame(
-        &mut self,
+        &self,
         local_user_id: &str,
         device_id: &str,
         record: &InboxRecord,
-    ) -> CoreResult<Option<ResolvedInbound>> {
+    ) -> CoreResult<InboundFrameResolution> {
         let payload_b64 = record.envelope.payload_b64().unwrap_or_default();
         if let Some(conversation_id) = self.conversation_id_for_lane(&record.envelope.lane) {
-            if let Some(unwrapped) = self.unwrap_inbound_bytes(&conversation_id, payload_b64) {
-                let Some(message_type) = MlsAdapter::classify_mls_payload(&unwrapped) else {
-                    return Ok(None);
+            if let Some(plaintext) = self.unwrap_inbound_plaintext(&conversation_id, payload_b64) {
+                let Ok(frame) = crate::direct_frame::decode(&plaintext) else {
+                    return Ok(InboundFrameResolution::Rejected);
+                };
+                let Some(message_type) = MlsAdapter::classify_mls_payload(&frame.mls_b64) else {
+                    return Ok(InboundFrameResolution::Rejected);
+                };
+                let authenticated_commit = match message_type {
+                    MessageType::MlsCommit => {
+                        let Some(commit) = self.authenticate_direct_commit(
+                            &conversation_id,
+                            &frame.mls_b64,
+                            frame.commit_proof.as_ref(),
+                        ) else {
+                            return Ok(InboundFrameResolution::Rejected);
+                        };
+                        Some(commit)
+                    }
+                    _ if frame.commit_proof.is_some() => {
+                        return Ok(InboundFrameResolution::Rejected);
+                    }
+                    _ => None,
                 };
                 let peer_user_id = self
                     .state
@@ -238,75 +257,98 @@ impl CoreEngine {
                     .get(&conversation_id)
                     .map(|conversation| conversation.peer_user_id.clone())
                     .unwrap_or_default();
-                return Ok(Some(ResolvedInbound {
+                return Ok(InboundFrameResolution::Ready(ResolvedInbound {
                     conversation_id,
                     peer_user_id,
                     message_type,
-                    payload_b64: unwrapped,
+                    payload_b64: frame.mls_b64,
                     welcome_author: None,
+                    authenticated_commit,
                 }));
             }
             if MlsAdapter::payload_is_welcome(payload_b64) {
                 return self.resolve_welcome_frame(local_user_id, device_id, record, payload_b64);
             }
-            return Ok(None);
+            return Ok(InboundFrameResolution::Deferred);
         }
         if MlsAdapter::payload_is_welcome(payload_b64) {
             return self.resolve_welcome_frame(local_user_id, device_id, record, payload_b64);
         }
-        Ok(None)
+        Ok(InboundFrameResolution::Deferred)
     }
 
     fn resolve_welcome_frame(
-        &mut self,
-        local_user_id: &str,
-        device_id: &str,
-        record: &InboxRecord,
+        &self,
+        _local_user_id: &str,
+        _device_id: &str,
+        _record: &InboxRecord,
         payload_b64: &str,
-    ) -> CoreResult<Option<ResolvedInbound>> {
+    ) -> CoreResult<InboundFrameResolution> {
         let Some(adapter) = self.state.mls_adapter.as_ref() else {
-            return Ok(None);
+            return Ok(InboundFrameResolution::Rejected);
         };
         let Some(inspection) = adapter.inspect_welcome(payload_b64) else {
-            return Ok(None);
+            return Ok(InboundFrameResolution::Rejected);
         };
         let Ok(author) = self.trusted_welcome_author(&inspection) else {
-            return Ok(None);
+            return Ok(InboundFrameResolution::Rejected);
         };
-        if !self
-            .state
-            .conversations
-            .contains_key(&inspection.conversation_id)
-        {
-            let mut local = ConversationManager::create_direct_conversation_with_id(
-                inspection.conversation_id.clone(),
-                local_user_id,
-                device_id,
-                &inspection.author_user_id,
-                &[inspection.author_device_id.clone()],
-            )?;
-            local.conversation.updated_at = record.received_at;
-            self.state
-                .conversations
-                .insert(inspection.conversation_id.clone(), local);
-        }
-        let reply_lane = self
-            .state
-            .mls_adapter
-            .as_ref()
-            .and_then(|adapter| adapter.reply_lane_from_group(&inspection.conversation_id))
-            .filter(|lane| is_opaque_id(lane));
-        // reply_lane is inside the Welcome; we only learn it after ingest.
-        // Recipient lanes are assigned after AppliedWelcome.
-        let _ = reply_lane;
-        self.index_inbound_lane(&record.envelope.lane, &inspection.conversation_id);
-        Ok(Some(ResolvedInbound {
+        Ok(InboundFrameResolution::Ready(ResolvedInbound {
             conversation_id: inspection.conversation_id,
             peer_user_id: inspection.author_user_id,
             message_type: MessageType::MlsWelcome,
             payload_b64: payload_b64.to_string(),
             welcome_author: Some(author),
+            authenticated_commit: None,
         }))
+    }
+
+    fn authenticate_direct_commit(
+        &self,
+        conversation_id: &str,
+        payload_b64: &str,
+        proof: Option<&crate::direct_frame::DirectCommitProof>,
+    ) -> Option<crate::direct_frame::AuthenticatedDirectCommit> {
+        let proof = proof?;
+        let conversation = self.state.conversations.get(conversation_id)?;
+        if proof.sender_user_id != conversation.peer_user_id {
+            return None;
+        }
+        let message_epoch = MlsAdapter::protocol_message_epoch(payload_b64).ok()?;
+        if proof.base_epoch != message_epoch {
+            return None;
+        }
+        let trusted_key = self
+            .trusted_device_public_key(&proof.sender_user_id, &proof.sender_device_id)
+            .ok()?;
+        let adapter = self.state.mls_adapter.as_ref()?;
+        let member_key = adapter
+            .member_signature_key(
+                conversation_id,
+                &proof.sender_user_id,
+                &proof.sender_device_id,
+            )
+            .ok()?;
+        if member_key != trusted_key {
+            return None;
+        }
+        let digest = crate::direct_frame::commit_sha256(payload_b64).ok()?;
+        crate::identity::verify_device_payload_signature(
+            &trusted_key,
+            crate::model::signing::direct_commit_arbitration_payload(
+                conversation_id,
+                &proof.sender_user_id,
+                &proof.sender_device_id,
+                proof.base_epoch,
+                &digest,
+            ),
+            &proof.signature,
+        )
+        .ok()?;
+        Some(crate::direct_frame::AuthenticatedDirectCommit {
+            base_epoch: proof.base_epoch,
+            commit_hash: crate::direct_frame::commit_hash(&digest),
+        })
     }
 
     pub(super) fn adopt_welcome_lanes(
@@ -369,6 +411,13 @@ pub(super) struct ResolvedInbound {
     pub message_type: MessageType,
     pub payload_b64: String,
     pub welcome_author: Option<WelcomeAuthor>,
+    pub authenticated_commit: Option<crate::direct_frame::AuthenticatedDirectCommit>,
+}
+
+pub(super) enum InboundFrameResolution {
+    Ready(ResolvedInbound),
+    Deferred,
+    Rejected,
 }
 
 pub(super) fn new_lane_pair() -> (String, String) {

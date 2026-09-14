@@ -261,7 +261,10 @@ fn desktop_message_request_accept_syncs_promoted_messages_and_preserves_plaintex
         )
     })?;
     assert!(
-        readd_request.welcome_bytes.as_ref().is_some_and(|bytes| !bytes.is_empty()),
+        readd_request
+            .welcome_bytes
+            .as_ref()
+            .is_some_and(|bytes| !bytes.is_empty()),
         "message request must carry the Welcome"
     );
     let readd_accept = with_tokio(|| async {

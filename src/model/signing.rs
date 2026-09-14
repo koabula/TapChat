@@ -42,9 +42,7 @@
 
 use sha2::{Digest, Sha256};
 
-use super::{
-    GroupEnvelope, GroupEnvelopeVisibility, GroupMessageType, MessageType, StorageRef,
-};
+use super::{GroupEnvelope, GroupEnvelopeVisibility, GroupMessageType, MessageType, StorageRef};
 
 /// Every payload this project signs, outside MLS.
 ///
@@ -60,6 +58,7 @@ use super::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SignatureDomain {
     // Signed by the device key.
+    DirectCommitArbitration,
     GroupEnvelopeSenderProof,
     GroupManifest,
     GroupMembershipProof,
@@ -83,6 +82,7 @@ impl SignatureDomain {
     /// carry no negotiation.
     pub fn as_str(&self) -> &'static str {
         match self {
+            SignatureDomain::DirectCommitArbitration => "tapchat.direct_commit_arbitration.v1",
             SignatureDomain::GroupEnvelopeSenderProof => "tapchat.group_envelope.sender_proof.v1",
             SignatureDomain::GroupManifest => "tapchat.group_manifest.v1",
             SignatureDomain::GroupMembershipProof => "tapchat.group.membership.v1",
@@ -105,6 +105,7 @@ impl SignatureDomain {
     /// test that guards the whole scheme.
     #[cfg(test)]
     pub(crate) const ALL: &'static [SignatureDomain] = &[
+        SignatureDomain::DirectCommitArbitration,
         SignatureDomain::GroupEnvelopeSenderProof,
         SignatureDomain::GroupManifest,
         SignatureDomain::GroupMembershipProof,
@@ -120,6 +121,28 @@ impl SignatureDomain {
         SignatureDomain::DeviceBinding,
         SignatureDomain::IdentityBundle,
     ];
+}
+
+/// The detached author proof carried inside a direct commit's lane wrap.
+///
+/// The proof exists only for the one case MLS cannot validate after the local
+/// device has already merged a competing commit for the same base epoch.  It
+/// binds the exact commit digest to the conversation and the trusted device;
+/// it is not a substitute for ordinary MLS processing.
+pub(crate) fn direct_commit_arbitration_payload(
+    conversation_id: &str,
+    sender_user_id: &str,
+    sender_device_id: &str,
+    base_epoch: u64,
+    commit_sha256: &[u8; 32],
+) -> SigningPayload {
+    let mut payload = SigningPayload::new(SignatureDomain::DirectCommitArbitration);
+    payload.push_str(conversation_id);
+    payload.push_str(sender_user_id);
+    payload.push_str(sender_device_id);
+    payload.push_u64(base_epoch);
+    payload.push_bytes(commit_sha256);
+    payload
 }
 
 /// A length-prefixed byte writer, always opened with a domain.

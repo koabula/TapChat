@@ -1853,10 +1853,8 @@ impl CoreEngine {
                 });
             }
         }
-        let output = self.create_conversation(
-            peer_user_id.to_string(),
-            ConversationKind::Direct,
-        )?;
+        let output =
+            self.create_conversation(peer_user_id.to_string(), ConversationKind::Direct)?;
         if let Some(conversation_id) = self.pending_direct_conversation_id_for_peer(peer_user_id) {
             self.state
                 .pending_direct_app
@@ -1888,10 +1886,7 @@ impl CoreEngine {
             })
     }
 
-    pub(super) fn flush_pending_direct_app(
-        &mut self,
-        conversation_id: &str,
-    ) -> CoreResult<()> {
+    pub(super) fn flush_pending_direct_app(&mut self, conversation_id: &str) -> CoreResult<()> {
         let pending = self
             .state
             .pending_direct_app
@@ -3248,13 +3243,14 @@ impl CoreEngine {
         let peer_user_id = self.peer_user_for_conversation(conversation_id)?;
         let recipient_device_ids = self.recipient_device_ids(conversation_id)?;
         let outbound_prev = self.export_outbound_wrap_key(conversation_id)?;
-        self.snapshot_wrap_prev(conversation_id)?;
+        let inbound_prev = self.capture_previous_inbound_wrap(conversation_id)?;
         let rotated = self
             .state
             .mls_adapter
             .as_mut()
             .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
             .rotate_direct_self_update(conversation_id)?;
+        self.install_previous_inbound_wrap(conversation_id, inbound_prev);
         let summary = self
             .state
             .mls_adapter
@@ -3285,13 +3281,12 @@ impl CoreEngine {
             // `build_envelope` wraps with the post-merge key. The peer is
             // still on the previous epoch, so re-wrap with the outbound key
             // we exported before the self-update.
-            let frame = STANDARD
-                .decode(rotated.commit_b64.as_bytes())
-                .map_err(|error| {
-                    CoreError::invalid_input(format!("PCS commit is not base64: {error}"))
-                })?;
-            envelope.bytes =
-                Some(STANDARD.encode(crate::lane_wrap::wrap_frame(&outbound_prev, &frame)?));
+            envelope.bytes = Some(self.wrap_outbound_frame_with_key(
+                conversation_id,
+                MessageType::MlsCommit,
+                &rotated.commit_b64,
+                &outbound_prev,
+            )?);
             envelopes.push(envelope);
         }
         self.enqueue_envelopes(peer_user_id.clone(), envelopes);
@@ -3353,29 +3348,20 @@ impl CoreEngine {
     pub(super) fn direct_pcs_arbitration(
         &mut self,
         conversation_id: &str,
-        record: &InboxRecord,
+        incoming: &crate::direct_frame::AuthenticatedDirectCommit,
     ) -> CoreResult<Option<CoreOutput>> {
         if !self.conversation_is_direct(conversation_id) {
             return Ok(None);
         }
-        let Some(payload_b64) = self.unwrap_inbound_bytes(
-            conversation_id,
-            record.envelope.payload_b64().unwrap_or_default(),
-        ) else {
-            return Ok(None);
-        };
-        let payload_b64 = payload_b64.as_str();
-        let (Ok(incoming_epoch), Ok(incoming_hash)) = (
-            MlsAdapter::protocol_message_epoch(payload_b64),
-            commit_hash_from_b64(payload_b64),
-        ) else {
-            return Ok(None);
-        };
         let verdict = self
             .state
             .conversations
             .get(conversation_id)
-            .and_then(|state| state.pcs.arbitrate(incoming_epoch, &incoming_hash));
+            .and_then(|state| {
+                state
+                    .pcs
+                    .arbitrate(incoming.base_epoch, &incoming.commit_hash)
+            });
         match verdict {
             None => Ok(None),
             // We won. The peer will find our commit, lose, and repair itself.

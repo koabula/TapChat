@@ -1247,9 +1247,7 @@ fn summarize_ws_event(device_id: &str, event: &WsServerEvent) -> String {
             format!("device_id={device_ref} type=inbox_record_available seq={seq}")
         }
         WsServerEvent::MessageRequestChanged {
-            request_id,
-            change,
-            ..
+            request_id, change, ..
         } => format!(
             "device_id={device_ref} type=message_request_changed request_id={} change={change}",
             redact_id("request", request_id)

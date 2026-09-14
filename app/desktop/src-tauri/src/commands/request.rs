@@ -55,7 +55,11 @@ pub async fn preview_welcome(
     output
         .view_model
         .and_then(|view| view.welcome_preview)
-        .ok_or_else(|| "welcome preview was not returned by core".to_string().into())
+        .ok_or_else(|| {
+            "welcome preview was not returned by core"
+                .to_string()
+                .into()
+        })
 }
 
 #[tauri::command]

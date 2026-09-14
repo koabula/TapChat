@@ -518,12 +518,9 @@ impl Validate for ProtectedAppMessage {
                 validate_required("identity_bundle_ref", &body.identity_bundle_ref)
             }
             ProtectedPayloadKind::ContactAccepted => {
-                let _: ContactAcceptedBody =
-                    serde_json::from_str(&self.body).map_err(|error| {
-                        CoreError::invalid_input(format!(
-                            "contact accepted body is malformed: {error}"
-                        ))
-                    })?;
+                let _: ContactAcceptedBody = serde_json::from_str(&self.body).map_err(|error| {
+                    CoreError::invalid_input(format!("contact accepted body is malformed: {error}"))
+                })?;
                 Ok(())
             }
             ProtectedPayloadKind::GroupWelcomePickup => {

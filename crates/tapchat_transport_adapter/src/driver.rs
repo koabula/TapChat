@@ -233,15 +233,18 @@ impl CoreDriver {
     pub fn pending_mls_artifacts(&self, conversation_id: &str) -> PendingMlsArtifacts {
         let mut artifacts = PendingMlsArtifacts::default();
         let matches_conversation = |envelope: &Envelope| {
-            self.runtime.latest_snapshot.as_ref().is_some_and(|snapshot| {
-                snapshot.conversations.iter().any(|persisted| {
-                    persisted.conversation_id == conversation_id
-                        && persisted.state.lanes.as_ref().is_some_and(|lanes| {
-                            lanes.outbound_lane == envelope.lane
-                                || lanes.inbound_lane == envelope.lane
-                        })
+            self.runtime
+                .latest_snapshot
+                .as_ref()
+                .is_some_and(|snapshot| {
+                    snapshot.conversations.iter().any(|persisted| {
+                        persisted.conversation_id == conversation_id
+                            && persisted.state.lanes.as_ref().is_some_and(|lanes| {
+                                lanes.outbound_lane == envelope.lane
+                                    || lanes.inbound_lane == envelope.lane
+                            })
+                    })
                 })
-            })
         };
         let count = |envelope: &Envelope, artifacts: &mut PendingMlsArtifacts| {
             if tapchat_core::mls_adapter::MlsAdapter::payload_is_welcome(

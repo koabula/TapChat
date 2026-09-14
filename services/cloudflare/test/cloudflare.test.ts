@@ -70,7 +70,8 @@ class TestWebSocketPair {
 const { handleRequest } = await import("../src/routes/http");
 const {
   handleInboxDurableRequest,
-  ManagedSession: InboxManagedSession
+  ManagedSession: InboxManagedSession,
+  SerialExecutor: InboxSerialExecutor
 } = await import("../src/inbox/durable");
 const { deviceRuntimeSigningPayload } = await import("../src/auth/runtime-auth");
 const { handleGroupOutboxDurableRequest, groupIdFromGroupOutboxRequestUrl, ManagedSession: GroupManagedSession } = await import("../src/group-outbox/durable");
@@ -268,6 +269,7 @@ class FakeInboxStub implements DurableObjectStub {
   private readonly spillStore: MemoryR2Store;
   private readonly sessions: SessionSink[];
   private readonly env: { maxInlineBytes: number; retentionDays: number; rateLimitPerMinute: number; rateLimitPerHour: number };
+  private readonly operations = new InboxSerialExecutor();
 
   constructor(
     deviceId: string,
@@ -285,7 +287,7 @@ class FakeInboxStub implements DurableObjectStub {
 
   async fetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
     const request = input instanceof Request ? input : new Request(input, init);
-    return handleInboxDurableRequest(request, {
+    return this.operations.run(() => handleInboxDurableRequest(request, {
       deviceId: this.deviceId,
       state: this.state,
       spillStore: this.spillStore,
@@ -296,7 +298,66 @@ class FakeInboxStub implements DurableObjectStub {
       rateLimitPerHour: this.env.rateLimitPerHour,
       onUpgrade: () => new Response(null, { status: 200 }),
       now: 1_000
-    });
+    }));
+  }
+}
+
+class PausableR2Store extends MemoryR2Store {
+  readonly writeStarted: Promise<void>;
+  private readonly writeReleased: Promise<void>;
+  private markStarted!: () => void;
+  private releaseWrite!: () => void;
+  private pauseNextWrite = true;
+
+  constructor() {
+    super();
+    this.writeStarted = new Promise((resolve) => { this.markStarted = resolve; });
+    this.writeReleased = new Promise((resolve) => { this.releaseWrite = resolve; });
+  }
+
+  release(): void {
+    this.releaseWrite();
+  }
+
+  override async putBytes(
+    key: string,
+    value: ArrayBuffer | Uint8Array,
+    metadata?: Record<string, string>
+  ): Promise<void> {
+    if (this.pauseNextWrite) {
+      this.pauseNextWrite = false;
+      this.markStarted();
+      await this.writeReleased;
+    }
+    await super.putBytes(key, value, metadata);
+  }
+}
+
+class FailOnceR2Store extends MemoryR2Store {
+  private failNextWrite = true;
+
+  override async putBytes(
+    key: string,
+    value: ArrayBuffer | Uint8Array,
+    metadata?: Record<string, string>
+  ): Promise<void> {
+    if (this.failNextWrite) {
+      this.failNextWrite = false;
+      throw new Error("simulated R2 write failure");
+    }
+    await super.putBytes(key, value, metadata);
+  }
+}
+
+class FailOnceCommitState extends MemoryState {
+  private failNextCommit = true;
+
+  override async putEntries(entries: Record<string, unknown>): Promise<void> {
+    if (this.failNextCommit) {
+      this.failNextCommit = false;
+      throw new Error("simulated DO commit failure");
+    }
+    await super.putEntries(entries);
   }
 }
 
@@ -1528,8 +1589,7 @@ test("verified append capability delivers allowlisted sender to inbox", async ()
   assert.deepEqual(await response.json(), {
     version: CURRENT_MODEL_VERSION,
     accepted: true,
-    seq: 1,
-    accepted: true
+    seq: 1
   });
 
   const head = await handleRequest(
@@ -1780,6 +1840,13 @@ test("direct message request accept promotes only the accepted lane", async () =
 
   await appendWithCapability(env, sampleAppend("device:bob:phone", "01010101010101010101010101010101", oldLane));
   await appendWithCapability(env, sampleAppend("device:bob:phone", "02020202020202020202020202020202", oldLane));
+  const oldList = await handleRequest(
+    new Request("https://example.com/v1/inbox/device:bob:phone/message-requests", { headers: authHeaders(token) }),
+    env
+  );
+  const oldRequests = (await oldList.json()) as MessageRequestListResult & { version: string };
+  assert.equal(oldRequests.requests.length, 1);
+  const oldRequestId = oldRequests.requests[0].requestId;
   await appendWithCapability(env, sampleAppend("device:bob:phone", "03030303030303030303030303030303", newLane));
   await appendWithCapability(env, sampleAppend("device:bob:phone", "04040404040404040404040404040404", newLane));
 
@@ -1789,11 +1856,11 @@ test("direct message request accept promotes only the accepted lane", async () =
   );
   const requests = (await list.json()) as MessageRequestListResult & { version: string };
   assert.equal(requests.requests.length, 2);
-  const newest = [...requests.requests].sort((left, right) => right.firstSeenAt - left.firstSeenAt)[0];
-  assert.ok(newest);
+  const target = requests.requests.find((request) => request.requestId !== oldRequestId);
+  assert.ok(target);
 
   const accept = await handleRequest(
-    new Request(`https://example.com/v1/inbox/device:bob:phone/message-requests/${encodeURIComponent(newest!.requestId)}/accept`, {
+    new Request(`https://example.com/v1/inbox/device:bob:phone/message-requests/${encodeURIComponent(target!.requestId)}/accept`, {
       method: "POST",
       headers: authHeaders(token)
     }),
@@ -2736,7 +2803,7 @@ test("group outbox spills large records to R2 and fetches them back", async () =
   const { env, bucket } = createEnv({ maxInlineBytes: "1" });
   const capability = sampleGroupCapability();
   const append = sampleGroupAppend("group:project", "msg:large", "mls_application", capability);
-  append.envelope.bytes = "large cipher payload";
+  append.envelope.inlineCiphertext = "large cipher payload";
 
   const response = await handleRequest(
     new Request("https://example.com/v1/groups/group%3Aproject/outbox/messages", {
@@ -2905,6 +2972,148 @@ test("inbox hard retention advances history floor even while the client is offli
   assert.equal(afterExpiry.historyFloorSeq, 0);
   assert.equal(afterExpiry.toSeq, 1);
   assert.deepEqual(await service.getHead(), { headSeq: 1 });
+});
+
+test("inbox serializes spill writes before assigning the next sequence", async () => {
+  const state = new MemoryState();
+  const spillStore = new PausableR2Store();
+  const service = new InboxService("device:bob:phone", state, spillStore, [], {
+    headSeq: 0,
+    ackedSeq: 0,
+    retentionDays: 1,
+    maxInlineBytes: 1,
+    rateLimitPerMinute: 100,
+    rateLimitPerHour: 1000
+  });
+  const operations = new InboxSerialExecutor();
+  const lane = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+  await service.registerAcceptedLane(lane, 500);
+
+  const firstRequest = sampleAppend(undefined, "11111111111111111111111111111111", lane);
+  const secondRequest = sampleAppend(undefined, "22222222222222222222222222222222", lane);
+  const first = operations.run(() => service.appendEnvelope(firstRequest, 1_000));
+  await spillStore.writeStarted;
+  let secondSettled = false;
+  const second = operations
+    .run(() => service.appendEnvelope(secondRequest, 1_001))
+    .finally(() => { secondSettled = true; });
+  await Promise.resolve();
+  assert.equal(secondSettled, false, "the second append must wait for the first R2 write");
+
+  spillStore.release();
+  const [firstResult, secondResult] = await Promise.all([first, second]);
+  assert.deepEqual([firstResult.seq, secondResult.seq], [1, 2]);
+  assert.deepEqual(await service.getHead(), { headSeq: 2 });
+  const fetched = await service.fetchMessages({ deviceId: "device:bob:phone", fromSeq: 1, limit: 10 });
+  assert.deepEqual(fetched.records.map((record) => record.messageId), [
+    firstRequest.envelope.mid,
+    secondRequest.envelope.mid
+  ]);
+
+  const duplicateRequest = sampleAppend(undefined, "33333333333333333333333333333333", lane);
+  const [duplicateFirst, duplicateSecond] = await Promise.all([
+    operations.run(() => service.appendEnvelope(duplicateRequest, 1_002)),
+    operations.run(() => service.appendEnvelope(duplicateRequest, 1_003))
+  ]);
+  assert.deepEqual(duplicateFirst, { accepted: true, seq: 3 });
+  assert.deepEqual(duplicateSecond, duplicateFirst);
+  assert.deepEqual(await service.getHead(), { headSeq: 3 });
+  assert.equal((await state.list({ prefix: "record:" })).size, 3);
+});
+
+test("inbox R2 failure leaves no sequence gap and retry result is stable", async () => {
+  const state = new MemoryState();
+  const spillStore = new FailOnceR2Store();
+  const service = new InboxService("device:bob:phone", state, spillStore, [], {
+    headSeq: 0,
+    ackedSeq: 0,
+    retentionDays: 1,
+    maxInlineBytes: 1,
+    rateLimitPerMinute: 100,
+    rateLimitPerHour: 1000
+  });
+  const operations = new InboxSerialExecutor();
+  const request = sampleAppend();
+  await service.registerAcceptedLane(request.envelope.lane, 500);
+
+  await assert.rejects(
+    () => operations.run(() => service.appendEnvelope(request, 1_000)),
+    /simulated R2 write failure/
+  );
+  assert.deepEqual(await service.getHead(), { headSeq: 0 });
+  assert.equal((await state.list({ prefix: "record:" })).size, 0);
+
+  const committed = await operations.run(() => service.appendEnvelope(request, 1_001));
+  const retry = await operations.run(() => service.appendEnvelope(request, 1_002));
+  assert.deepEqual(committed, { accepted: true, seq: 1 });
+  assert.deepEqual(retry, committed);
+  assert.deepEqual(await service.getHead(), { headSeq: 1 });
+  assert.equal((await service.fetchMessages({ deviceId: "device:bob:phone", fromSeq: 1, limit: 10 })).records.length, 1);
+});
+
+test("inbox DO commit failure retains the spill and retries at the same sequence", async () => {
+  const state = new FailOnceCommitState();
+  const spillStore = new MemoryR2Store();
+  const service = new InboxService("device:bob:phone", state, spillStore, [], {
+    headSeq: 0,
+    ackedSeq: 0,
+    retentionDays: 1,
+    maxInlineBytes: 1,
+    rateLimitPerMinute: 100,
+    rateLimitPerHour: 1000
+  });
+  const operations = new InboxSerialExecutor();
+  const request = sampleAppend();
+  await service.registerAcceptedLane(request.envelope.lane, 500);
+
+  await assert.rejects(
+    () => operations.run(() => service.appendEnvelope(request, 1_000)),
+    /simulated DO commit failure/
+  );
+  assert.deepEqual(await service.getHead(), { headSeq: 0 });
+  assert.equal((await state.list({ prefix: "record:" })).size, 0);
+  assert.ok(await spillStore.getBytes("inbox-payload/device:bob:phone/1.json"));
+
+  const committed = await operations.run(() => service.appendEnvelope(request, 1_001));
+  assert.deepEqual(committed, { accepted: true, seq: 1 });
+  assert.deepEqual(await service.getHead(), { headSeq: 1 });
+});
+
+test("message request promotion preserves the original append result across retries", async () => {
+  const state = new MemoryState();
+  const service = new InboxService("device:bob:phone", state, new MemoryR2Store(), [], {
+    headSeq: 0,
+    ackedSeq: 0,
+    retentionDays: 1,
+    maxInlineBytes: 4096,
+    rateLimitPerMinute: 100,
+    rateLimitPerHour: 1000
+  });
+  const acceptedLane = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+  const requestLane = "cccccccccccccccccccccccccccccccc";
+  await service.registerAcceptedLane(acceptedLane, 500);
+  await service.appendEnvelope(
+    sampleAppend(undefined, "11111111111111111111111111111111", acceptedLane),
+    1_000
+  );
+
+  const pending = sampleAppend(undefined, "22222222222222222222222222222222", requestLane);
+  const queuedResult = await service.appendEnvelope(pending, 1_001);
+  const [request] = await service.listMessageRequests(1_002);
+  assert.ok(request);
+  const accepted = await service.acceptMessageRequest(request.requestId, 1_003);
+  assert.equal(accepted.promotedCount, 1);
+  assert.deepEqual(await service.getHead(), { headSeq: 2 });
+
+  const retryResult = await service.appendEnvelope(pending, 1_004);
+  assert.deepEqual(retryResult, queuedResult);
+  assert.equal((await service.fetchMessages({ deviceId: "device:bob:phone", fromSeq: 1, limit: 10 })).records.length, 2);
+  await assert.rejects(
+    () => service.acceptMessageRequest(request.requestId, 1_005),
+    /message request not found/
+  );
+  assert.deepEqual(await service.getHead(), { headSeq: 2 });
+  assert.deepEqual(await service.appendEnvelope(pending, 1_006), queuedResult);
 });
 
 test("inbox fetch fails closed when an R2 spill payload is missing", async () => {
@@ -3364,7 +3573,6 @@ test("message request quotas, global rate limit, expiry, and capacity recovery w
     maxInlineBytes: 4096,
     rateLimitPerMinute: 100,
     rateLimitPerHour: 1000,
-    messageRequestMaxPerSender: 2,
     messageRequestMaxSenders: 1,
     messageRequestMaxTotalBytes: 1024 * 1024,
     messageRequestTtlSeconds: 10,

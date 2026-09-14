@@ -39,7 +39,7 @@ impl CoreEngine {
         let bytes = if message_type == MessageType::MlsWelcome {
             payload_b64
         } else {
-            self.wrap_outbound_frame(conversation_id, &payload_b64)?
+            self.wrap_outbound_frame(conversation_id, message_type, &payload_b64)?
         };
         let mut envelope = Envelope::with_bytes(recipient_device_id, lane, mid, bytes);
         if let Some(reference) = storage_refs.into_iter().next() {
@@ -52,11 +52,11 @@ impl CoreEngine {
     }
 
     fn wrap_outbound_frame(
-        &mut self,
+        &self,
         conversation_id: &str,
+        message_type: MessageType,
         payload_b64: &str,
     ) -> CoreResult<String> {
-        use base64::{engine::general_purpose::STANDARD, Engine as _};
         let dir = self
             .state
             .conversations
@@ -67,13 +67,51 @@ impl CoreEngine {
         let adapter = self
             .state
             .mls_adapter
-            .as_mut()
+            .as_ref()
             .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?;
         let key = adapter.export_lane_wrap_key(conversation_id, dir)?;
-        let frame = STANDARD.decode(payload_b64).map_err(|error| {
-            CoreError::invalid_input(format!("outbound MLS frame is not base64: {error}"))
+        self.wrap_outbound_frame_with_key(conversation_id, message_type, payload_b64, &key)
+    }
+
+    pub(super) fn wrap_outbound_frame_with_key(
+        &self,
+        conversation_id: &str,
+        message_type: MessageType,
+        payload_b64: &str,
+        key: &[u8; crate::lane_wrap::WRAP_KEY_LEN],
+    ) -> CoreResult<String> {
+        let commit_proof = if message_type == MessageType::MlsCommit {
+            let identity = self
+                .state
+                .local_identity
+                .as_ref()
+                .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))?;
+            let base_epoch = MlsAdapter::protocol_message_epoch(payload_b64)?;
+            let digest = crate::direct_frame::commit_sha256(payload_b64)?;
+            let sender_user_id = identity.user_identity.user_id.clone();
+            let sender_device_id = identity.device_identity.device_id.clone();
+            let signature =
+                identity.sign_payload(crate::model::signing::direct_commit_arbitration_payload(
+                    conversation_id,
+                    &sender_user_id,
+                    &sender_device_id,
+                    base_epoch,
+                    &digest,
+                ));
+            Some(crate::direct_frame::DirectCommitProof {
+                sender_user_id,
+                sender_device_id,
+                base_epoch,
+                signature,
+            })
+        } else {
+            None
+        };
+        let plaintext = crate::direct_frame::encode(&crate::direct_frame::DirectWrappedFrame {
+            mls_b64: payload_b64.to_string(),
+            commit_proof,
         })?;
-        let wrapped = crate::lane_wrap::wrap_frame(&key, &frame)?;
+        let wrapped = crate::lane_wrap::wrap_frame(key, &plaintext)?;
         Ok(STANDARD.encode(wrapped))
     }
 

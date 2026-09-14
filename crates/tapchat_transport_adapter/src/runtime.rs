@@ -35,13 +35,15 @@ struct RuntimeMessageRequestList {
     pub requests: Vec<RuntimeMessageRequest>,
 }
 
-
 #[derive(Debug, Clone, Default)]
 pub struct CloudflareRuntimeOptions {
     pub max_inline_bytes: Option<u64>,
     pub retention_days: Option<u64>,
     pub rate_limit_per_minute: Option<u64>,
     pub rate_limit_per_hour: Option<u64>,
+    pub runtime_id: Option<String>,
+    pub owner_user_id: Option<String>,
+    pub owner_user_public_key: Option<String>,
 }
 
 pub struct CloudflareRuntimeHandle {
@@ -88,6 +90,18 @@ impl CloudflareRuntimeHandle {
         let websocket_base_url = format!("ws://127.0.0.1:{port}");
         let bootstrap_secret = generate_hex_secret();
         let sharing_secret = generate_hex_secret();
+        let runtime_id = options
+            .runtime_id
+            .as_deref()
+            .unwrap_or("runtime:local-test");
+        let owner_user_id = options
+            .owner_user_id
+            .as_deref()
+            .unwrap_or("user:local-test-owner");
+        let owner_user_public_key = options
+            .owner_user_public_key
+            .as_deref()
+            .unwrap_or("0000000000000000000000000000000000000000000000000000000000000000");
 
         let mut child = Command::new("node");
         child
@@ -97,6 +111,12 @@ impl CloudflareRuntimeHandle {
             .env("TAPCHAT_TRANSPORT_PERSIST_TO", temp_dir.path())
             .env("TAPCHAT_TRANSPORT_BOOTSTRAP_SECRET", &bootstrap_secret)
             .env("TAPCHAT_TRANSPORT_SHARING_SECRET", &sharing_secret)
+            .env("TAPCHAT_TRANSPORT_RUNTIME_ID", runtime_id)
+            .env("TAPCHAT_TRANSPORT_OWNER_USER_ID", owner_user_id)
+            .env(
+                "TAPCHAT_TRANSPORT_OWNER_USER_PUBLIC_KEY",
+                owner_user_public_key,
+            )
             .env("HOME", &runtime_home)
             .env("USERPROFILE", &runtime_home)
             .env("XDG_CONFIG_HOME", &runtime_config)
@@ -170,6 +190,32 @@ impl CloudflareRuntimeHandle {
 
     pub fn sharing_secret(&self) -> &str {
         &self.sharing_secret
+    }
+
+    pub async fn deployment_bundle(
+        &self,
+        user_id: &str,
+        device_id: &str,
+    ) -> Result<DeploymentBundle> {
+        tapchat_core::cli::runtime::fetch_deployment_bundle_v3(&self.base_url, user_id, device_id)
+            .await
+    }
+
+    pub fn remember_runtime_auth(
+        &self,
+        bundle: &DeploymentBundle,
+        auth: DeviceRuntimeAuth,
+    ) -> Result<()> {
+        let device_id = bundle
+            .expected_device_id
+            .as_ref()
+            .context("deployment bundle is missing expected device id")?;
+        let auth = Box::leak(Box::new(auth));
+        PROVISIONED_RUNTIME_AUTH
+            .lock()
+            .map_err(|_| anyhow!("runtime credential registry lock poisoned"))?
+            .insert((bundle.runtime_id.clone(), device_id.clone()), auth);
+        Ok(())
     }
 
     pub async fn bootstrap_device_bundle(
@@ -279,11 +325,7 @@ impl CloudflareRuntimeHandle {
         Ok(())
     }
 
-    pub async fn register_accepted_lane(
-        &self,
-        auth: &DeviceRuntimeAuth,
-        lane: &str,
-    ) -> Result<()> {
+    pub async fn register_accepted_lane(&self, auth: &DeviceRuntimeAuth, lane: &str) -> Result<()> {
         let response = self
             .client
             .put(format!(

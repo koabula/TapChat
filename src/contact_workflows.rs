@@ -60,9 +60,7 @@ pub async fn accept_message_request_with_bundle_import(
         .identity_bundle_ref
         .clone()
         .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| {
-            anyhow!("the Welcome did not include an importable identity bundle")
-        })?;
+        .ok_or_else(|| anyhow!("the Welcome did not include an importable identity bundle"))?;
     let bundle = fetch_identity_bundle_from_url(&sender_bundle_share_url).await?;
     ensure_fetched_bundle_matches_expected_sender(&bundle, &preview.author_user_id)?;
     import_identity_bundle_into_profile(profile, driver, bundle).await?;

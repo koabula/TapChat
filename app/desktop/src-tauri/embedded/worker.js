@@ -5439,14 +5439,10 @@ var InboxService = class {
     const accepted = await this.isAcceptedLane(input.envelope.lane);
     if (accepted) {
       await this.enforceRateLimit(INBOX_DO_KEYS.rateLimit(input.envelope.lane), now);
-      const delivered = await this.deliverEnvelope(input, now);
-      await this.state.put(INBOX_DO_KEYS.appendResult(input.envelope.mid), delivered);
-      return delivered;
+      return this.deliverEnvelope(input, now);
     }
     await this.enforceRateLimit(INBOX_DO_KEYS.rateLimitFirstContact, now);
-    const queued = await this.queueMessageRequestWithLimit(input, now);
-    await this.state.put(INBOX_DO_KEYS.appendResult(input.envelope.mid), queued);
-    return queued;
+    return this.queueMessageRequestWithLimit(input, now);
   }
   async fetchMessages(input) {
     if (input.deviceId !== this.deviceId) {
@@ -5542,8 +5538,7 @@ var InboxService = class {
     await this.registerAcceptedLane(entry.lane, now);
     let promotedCount = 0;
     for (const request of entry.pendingRequests) {
-      const delivered = await this.deliverEnvelope(request, now);
-      await this.state.put(INBOX_DO_KEYS.appendResult(request.envelope.mid), delivered);
+      await this.deliverEnvelope(request, now, false);
       promotedCount += 1;
     }
     await this.deleteMessageRequest(entry.lane, "accepted");
@@ -5647,13 +5642,7 @@ var InboxService = class {
   async isAcceptedLane(lane) {
     return await this.state.get(INBOX_DO_KEYS.acceptedLane(lane)) !== void 0;
   }
-  async nextLaneSeq(lane) {
-    const current = await this.state.get(INBOX_DO_KEYS.laneSeq(lane)) ?? 0;
-    const next = current + 1;
-    await this.state.put(INBOX_DO_KEYS.laneSeq(lane), next);
-    return next;
-  }
-  async deliverEnvelope(input, now) {
+  async deliverEnvelope(input, now, persistAppendResult = true) {
     const meta = await this.getMeta();
     const existingSeq = await this.state.get(INBOX_DO_KEYS.idempotency(input.envelope.mid));
     if (existingSeq !== void 0) {
@@ -5673,8 +5662,9 @@ var InboxService = class {
       state: "available",
       envelope: input.envelope
     };
+    let index;
     if (ciphertextSize > 0 && ciphertextSize <= meta.maxInlineBytes && bytes) {
-      const inlineIndex = {
+      index = {
         seq,
         messageId: record.messageId,
         recipientDeviceId: record.recipientDeviceId,
@@ -5685,11 +5675,10 @@ var InboxService = class {
         storageRef: input.envelope.storageRef,
         inlineBytes: bytes
       };
-      await this.state.put(INBOX_DO_KEYS.record(seq), inlineIndex);
     } else if (decoded) {
       const payloadRef = R2_KEYS.inboxPayload(this.deviceId, seq);
       await this.spillStore.putBytes(payloadRef, decoded);
-      const indexed = {
+      index = {
         seq,
         messageId: record.messageId,
         recipientDeviceId: record.recipientDeviceId,
@@ -5700,9 +5689,8 @@ var InboxService = class {
         storageRef: input.envelope.storageRef,
         payloadRef
       };
-      await this.state.put(INBOX_DO_KEYS.record(seq), indexed);
     } else {
-      const indexed = {
+      index = {
         seq,
         messageId: record.messageId,
         recipientDeviceId: record.recipientDeviceId,
@@ -5712,10 +5700,14 @@ var InboxService = class {
         lane: input.envelope.lane,
         storageRef: input.envelope.storageRef
       };
-      await this.state.put(INBOX_DO_KEYS.record(seq), indexed);
     }
-    await this.state.put(INBOX_DO_KEYS.idempotency(record.messageId), seq);
-    await this.state.put(INBOX_DO_KEYS.meta, { ...meta, headSeq: seq });
+    const result = { accepted: true, seq };
+    await this.state.putEntries({
+      [INBOX_DO_KEYS.record(seq)]: index,
+      [INBOX_DO_KEYS.idempotency(record.messageId)]: seq,
+      ...persistAppendResult ? { [INBOX_DO_KEYS.appendResult(record.messageId)]: result } : {},
+      [INBOX_DO_KEYS.meta]: { ...meta, headSeq: seq }
+    });
     this.publish({
       event: "head_updated",
       deviceId: this.deviceId,
@@ -5727,7 +5719,7 @@ var InboxService = class {
       seq,
       record
     });
-    return { accepted: true, seq };
+    return result;
   }
   async queueMessageRequestWithLimit(input, now) {
     await this.enforceMessageRequestRateLimit(now);
@@ -5769,10 +5761,15 @@ var InboxService = class {
       totalBytes: queueMeta.totalBytes + requestBytes,
       senderCount: nextIndex.length
     };
+    const laneSeqKey = INBOX_DO_KEYS.laneSeq(lane);
+    const laneSeq = (await this.state.get(laneSeqKey) ?? 0) + 1;
+    const result = { accepted: true, seq: laneSeq };
     await this.state.putEntries({
       [key]: entry,
       [INBOX_DO_KEYS.messageRequestIndex]: nextIndex,
-      [INBOX_DO_KEYS.messageRequestMeta]: nextQueueMeta
+      [INBOX_DO_KEYS.messageRequestMeta]: nextQueueMeta,
+      [laneSeqKey]: laneSeq,
+      [INBOX_DO_KEYS.appendResult(input.envelope.mid)]: result
     });
     await this.scheduleNextAlarm(now);
     this.publish({
@@ -5781,10 +5778,7 @@ var InboxService = class {
       requestId: entry.requestId,
       change: "queued"
     });
-    return {
-      accepted: true,
-      seq: await this.nextLaneSeq(lane)
-    };
+    return result;
   }
   messageRequestCapacityExceeded(message) {
     throw new HttpError(429, "message_request_capacity_exceeded", message);
@@ -6135,6 +6129,17 @@ var DurableObjectBase3 = globalThis.DurableObject ?? class {
   constructor(_state, _env) {
   }
 };
+var SerialExecutor = class {
+  tail = Promise.resolve();
+  run(operation) {
+    const result = this.tail.then(operation, operation);
+    this.tail = result.then(
+      () => void 0,
+      () => void 0
+    );
+    return result;
+  }
+};
 async function handleInboxDurableRequest(request, deps) {
   const now = deps.now ?? Date.now();
   const url = new URL(request.url);
@@ -6234,12 +6239,16 @@ var InboxDurableObject = class extends DurableObjectBase3 {
   sessions = /* @__PURE__ */ new Map();
   stateRef;
   envRef;
+  operations = new SerialExecutor();
   constructor(state, env) {
     super(state, env);
     this.stateRef = state;
     this.envRef = env;
   }
   async fetch(request) {
+    return this.operations.run(() => this.fetchSerialized(request));
+  }
+  async fetchSerialized(request) {
     const url = new URL(request.url);
     const match = url.pathname.match(/\/v1\/inbox\/([^/]+)\//);
     const deviceId = decodeURIComponent(match?.[1] ?? "");
@@ -6290,26 +6299,28 @@ var InboxDurableObject = class extends DurableObjectBase3 {
     });
   }
   async alarm() {
-    const service = new InboxService(
-      "",
-      new DurableObjectStorageAdapter2(this.stateRef.storage),
-      new R2JsonBlobStore2(this.envRef.TAPCHAT_STORAGE),
-      [],
-      {
-        headSeq: 0,
-        ackedSeq: 0,
-        retentionDays: Number(this.envRef.RETENTION_DAYS ?? "30"),
-        maxInlineBytes: Number(this.envRef.MAX_INLINE_BYTES ?? "4096"),
-        rateLimitPerMinute: Number(this.envRef.RATE_LIMIT_PER_MINUTE ?? "60"),
-        rateLimitPerHour: Number(this.envRef.RATE_LIMIT_PER_HOUR ?? "600"),
-        messageRequestMaxSenders: Number(this.envRef.MESSAGE_REQUEST_MAX_SENDERS ?? "64"),
-        messageRequestMaxTotalBytes: Number(this.envRef.MESSAGE_REQUEST_MAX_TOTAL_BYTES ?? String(4 * 1024 * 1024)),
-        messageRequestTtlSeconds: Number(this.envRef.MESSAGE_REQUEST_TTL_SECONDS ?? String(7 * 24 * 60 * 60)),
-        messageRequestRateLimitMinute: Number(this.envRef.MESSAGE_REQUEST_RATE_LIMIT_MINUTE ?? "30"),
-        messageRequestRateLimitHour: Number(this.envRef.MESSAGE_REQUEST_RATE_LIMIT_HOUR ?? "300")
-      }
-    );
-    await service.cleanExpiredRecords(Date.now());
+    await this.operations.run(async () => {
+      const service = new InboxService(
+        "",
+        new DurableObjectStorageAdapter2(this.stateRef.storage),
+        new R2JsonBlobStore2(this.envRef.TAPCHAT_STORAGE),
+        [],
+        {
+          headSeq: 0,
+          ackedSeq: 0,
+          retentionDays: Number(this.envRef.RETENTION_DAYS ?? "30"),
+          maxInlineBytes: Number(this.envRef.MAX_INLINE_BYTES ?? "4096"),
+          rateLimitPerMinute: Number(this.envRef.RATE_LIMIT_PER_MINUTE ?? "60"),
+          rateLimitPerHour: Number(this.envRef.RATE_LIMIT_PER_HOUR ?? "600"),
+          messageRequestMaxSenders: Number(this.envRef.MESSAGE_REQUEST_MAX_SENDERS ?? "64"),
+          messageRequestMaxTotalBytes: Number(this.envRef.MESSAGE_REQUEST_MAX_TOTAL_BYTES ?? String(4 * 1024 * 1024)),
+          messageRequestTtlSeconds: Number(this.envRef.MESSAGE_REQUEST_TTL_SECONDS ?? String(7 * 24 * 60 * 60)),
+          messageRequestRateLimitMinute: Number(this.envRef.MESSAGE_REQUEST_RATE_LIMIT_MINUTE ?? "30"),
+          messageRequestRateLimitHour: Number(this.envRef.MESSAGE_REQUEST_RATE_LIMIT_HOUR ?? "300")
+        }
+      );
+      await service.cleanExpiredRecords(Date.now());
+    });
   }
 };
 var ManagedSession2 = class {
