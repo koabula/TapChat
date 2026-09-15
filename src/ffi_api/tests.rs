@@ -7440,14 +7440,16 @@ mod tests {
             .all(|state| state.serialized_group_state.is_some()));
     }
 
+    /// An append reply is a sequence number, so there is no disposition to
+    /// disbelieve — only a reply we can read, or none.
     #[test]
-    fn append_requires_explicit_accepted_result() {
+    fn append_requires_a_decodable_reply() {
         let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
         let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
         let output = alice
             .handle_command(CoreCommand::SendTextMessage {
-                conversation_id,
+                conversation_id: conversation_id.clone(),
                 plaintext: "hello".into(),
             })
             .expect("send");
@@ -7457,10 +7459,33 @@ mod tests {
             .handle_event(CoreEvent::HttpResponseReceived {
                 request_id,
                 status: 200,
-                body: Some(r#"{"accepted":false,"seq":0}"#.into()),
+                body: None,
             })
-            .expect_err("append accepted=false should fail");
-        assert_eq!(error.code(), "temporary_failure");
+            .expect_err("an append with no body should fail");
+        assert_eq!(error.code(), "invalid_input");
+
+        let output = alice
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id,
+                plaintext: "again".into(),
+            })
+            .expect("send");
+        let request_id = find_http_request_id(&output, "/messages");
+        let accepted = alice
+            .handle_event(CoreEvent::HttpResponseReceived {
+                request_id,
+                status: 200,
+                body: Some(r#"{"seq":41}"#.into()),
+            })
+            .expect("a sequence number is the whole reply");
+        assert_eq!(
+            accepted
+                .view_model
+                .as_ref()
+                .and_then(|view| view.append_result.as_ref())
+                .and_then(|result| result.seq),
+            Some(41)
+        );
     }
 
     #[test]
@@ -7593,7 +7618,6 @@ mod tests {
             .as_ref()
             .and_then(|view| view.append_result.as_ref())
             .expect("append result");
-        assert!(append_result.accepted);
         assert!(append_result.seq.is_some());
         let stored = alice
             .state
@@ -7649,7 +7673,6 @@ mod tests {
             .as_ref()
             .and_then(|view| view.append_result.as_ref())
             .expect("append result");
-        assert!(append_result.accepted);
         assert_eq!(append_result.seq, Some(0));
     }
 
@@ -7685,7 +7708,6 @@ mod tests {
             .as_ref()
             .and_then(|view| view.append_result.as_ref())
             .expect("append result");
-        assert!(append_result.accepted);
         assert_eq!(append_result.seq, Some(3));
     }
 

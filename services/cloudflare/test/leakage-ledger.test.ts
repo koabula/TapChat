@@ -92,7 +92,6 @@ const MID = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const RENDERED: ReadonlyArray<{ surface: string; template: string; key: string }> = [
   { surface: "inbox_do_key", template: "meta", key: INBOX_DO_KEYS.meta },
   { surface: "inbox_do_key", template: "accepted-lane:{lane}", key: INBOX_DO_KEYS.acceptedLane(LANE) },
-  { surface: "inbox_do_key", template: "lane-seq:{lane}", key: INBOX_DO_KEYS.laneSeq(LANE) },
   { surface: "inbox_do_key", template: "record:{seq}", key: INBOX_DO_KEYS.record(7) },
   {
     surface: "inbox_do_key",

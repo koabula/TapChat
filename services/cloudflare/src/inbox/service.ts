@@ -16,6 +16,21 @@ import type {
 import type { DurableObjectStorageLike, JsonBlobStore, SessionSink } from "../types/runtime";
 
 interface InboxMeta {
+  /**
+   * What the inbox answers an append with.
+   *
+   * One counter over every append this device accepts, whatever becomes of
+   * the record: a first contact waiting for its recipient and an admitted
+   * message draw from the same sequence, so the number discloses nothing
+   * about which happened. It used to be `headSeq + 1` for one and a per-lane
+   * counter starting at 1 for the other, which told a sender it was still
+   * queued on its very first reply.
+   *
+   * It is also the closer analogue of what the ideal returns: `Send` gives
+   * back `|T| + 1`, and the transcript counts every send, not the ones an
+   * adversary later chose to deliver. `headSeq` counts only the admitted.
+   */
+  appendSeq: number;
   headSeq: number;
   ackedSeq: number;
   historyFloorSeq?: number;
@@ -384,11 +399,15 @@ export class InboxService {
     persistAppendResult = true
   ): Promise<AppendEnvelopeResult> {
     const meta = await this.getMeta();
+    // The idempotency map stores what the append was answered with, not where
+    // the record landed: replying with a record position would put the
+    // admitted/queued distinction back on the wire through the retry path.
     const existingSeq = await this.state.get<number>(INBOX_DO_KEYS.idempotency(input.envelope.mid));
     if (existingSeq !== undefined) {
-      return { accepted: true, seq: existingSeq };
+      return { seq: existingSeq };
     }
 
+    const appendSeq = meta.appendSeq + 1;
     const seq = meta.headSeq + 1;
     const expiresAt = now + meta.retentionDays * 24 * 60 * 60 * 1000;
     const bytes = input.envelope.bytes;
@@ -444,12 +463,12 @@ export class InboxService {
       };
     }
 
-    const result: AppendEnvelopeResult = { accepted: true, seq };
+    const result: AppendEnvelopeResult = { seq: appendSeq };
     await this.state.putEntries({
       [INBOX_DO_KEYS.record(seq)]: index,
-      [INBOX_DO_KEYS.idempotency(record.messageId)]: seq,
+      [INBOX_DO_KEYS.idempotency(record.messageId)]: appendSeq,
       ...(persistAppendResult ? { [INBOX_DO_KEYS.appendResult(record.messageId)]: result } : {}),
-      [INBOX_DO_KEYS.meta]: { ...meta, headSeq: seq } satisfies InboxMeta
+      [INBOX_DO_KEYS.meta]: { ...meta, appendSeq, headSeq: seq } satisfies InboxMeta
     });
     this.publish({
       event: "head_updated",
@@ -510,14 +529,19 @@ export class InboxService {
       totalBytes: queueMeta.totalBytes + requestBytes,
       senderCount: nextIndex.length
     };
-    const laneSeqKey = INBOX_DO_KEYS.laneSeq(lane);
-    const laneSeq = ((await this.state.get<number>(laneSeqKey)) ?? 0) + 1;
-    const result: AppendEnvelopeResult = { accepted: true, seq: laneSeq };
+    // The same counter the admitted path draws from, advanced in the same
+    // batch that commits the queued envelope. `headSeq` stays where it is:
+    // this record has no position in the record stream yet, and giving it one
+    // would leave a hole that the next fetch covering it reports as a storage
+    // integrity error.
+    const meta = await this.getMeta();
+    const appendSeq = meta.appendSeq + 1;
+    const result: AppendEnvelopeResult = { seq: appendSeq };
     await this.state.putEntries({
       [key]: entry,
       [INBOX_DO_KEYS.messageRequestIndex]: nextIndex,
       [INBOX_DO_KEYS.messageRequestMeta]: nextQueueMeta,
-      [laneSeqKey]: laneSeq,
+      [INBOX_DO_KEYS.meta]: { ...meta, appendSeq } satisfies InboxMeta,
       [INBOX_DO_KEYS.appendResult(input.envelope.mid)]: result
     });
     await this.scheduleNextAlarm(now);

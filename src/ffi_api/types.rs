@@ -24,12 +24,12 @@ use crate::persistence::{
 };
 use crate::sync_engine::DeviceSyncState;
 use crate::transport_contract::{
-    AppendDeliveryDisposition, AppendGroupEnvelopeRequest, AppendGroupTransitionRequest,
-    BlobDownloadRequest, BlobUploadRequest, ClaimGroupJoinRequest, ClaimGroupLeaveRequest,
-    CompleteGroupJoinRequest, CreateGroupInviteRequest, DecideGroupJoinRequest,
-    FetchGroupInviteRequest, FetchGroupOutboxRequest, FetchIdentityBundleRequest,
-    FetchMessageRequestsRequest, FetchWelcomePickupRequest, GetGroupAuthorizationStateRequest,
-    GetGroupJoinRequestStatusRequest, GetGroupOutboxHeadRequest, GroupRealtimeSubscriptionRequest,
+    AppendGroupEnvelopeRequest, AppendGroupTransitionRequest, BlobDownloadRequest,
+    BlobUploadRequest, ClaimGroupJoinRequest, ClaimGroupLeaveRequest, CompleteGroupJoinRequest,
+    CreateGroupInviteRequest, DecideGroupJoinRequest, FetchGroupInviteRequest,
+    FetchGroupOutboxRequest, FetchIdentityBundleRequest, FetchMessageRequestsRequest,
+    FetchWelcomePickupRequest, GetGroupAuthorizationStateRequest, GetGroupJoinRequestStatusRequest,
+    GetGroupOutboxHeadRequest, GroupRealtimeSubscriptionRequest,
     InitializeGroupAuthorizationRequest, ListGroupInvitesRequest, ListGroupJoinRequestsRequest,
     ListGroupLeaveRequestsRequest, MessageRequestAction, MessageRequestActionRequest,
     MessageRequestActionResult, MessageRequestItem, MessageRequestRealtimeChange,
@@ -1115,7 +1115,6 @@ pub struct MessageRequestActionSummary {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppendResultSummary {
-    pub accepted: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seq: Option<u64>,
 }

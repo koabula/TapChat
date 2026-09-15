@@ -64,13 +64,13 @@ use crate::persistence::{
 };
 use crate::sync_engine::{SyncDecision, SyncEngine};
 use crate::transport_contract::{
-    AckRequest, AckResult, AppendDeliveryDisposition, AppendEnvelopeRequest, AppendEnvelopeResult,
-    AppendGroupEnvelopeRequest, AppendGroupEnvelopeResult, AppendGroupTransitionRequest,
-    BlobDownloadRequest, BlobUploadRequest, ClaimGroupJoinRequest, ClaimGroupLeaveRequest,
-    CompleteGroupJoinRequest, CreateGroupInviteRequest, DecideGroupJoinRequest,
-    DeviceStatusDocument, DeviceStatusRecord, FetchGroupInviteRequest, FetchGroupOutboxRequest,
-    FetchGroupOutboxResult, FetchIdentityBundleRequest, FetchMessageRequestsRequest,
-    FetchMessagesRequest, FetchMessagesResult, FetchWelcomePickupRequest, FetchWelcomePickupResult,
+    AckRequest, AckResult, AppendEnvelopeRequest, AppendEnvelopeResult, AppendGroupEnvelopeRequest,
+    AppendGroupEnvelopeResult, AppendGroupTransitionRequest, BlobDownloadRequest,
+    BlobUploadRequest, ClaimGroupJoinRequest, ClaimGroupLeaveRequest, CompleteGroupJoinRequest,
+    CreateGroupInviteRequest, DecideGroupJoinRequest, DeviceStatusDocument, DeviceStatusRecord,
+    FetchGroupInviteRequest, FetchGroupOutboxRequest, FetchGroupOutboxResult,
+    FetchIdentityBundleRequest, FetchMessageRequestsRequest, FetchMessagesRequest,
+    FetchMessagesResult, FetchWelcomePickupRequest, FetchWelcomePickupResult,
     GetGroupAuthorizationStateRequest, GetGroupJoinRequestStatusRequest, GetGroupOutboxHeadRequest,
     GetHeadResult, GroupAuthorizationUpdate, GroupJoinDecision,
     InitializeGroupAuthorizationRequest, ListGroupInvitesRequest, ListGroupJoinRequestsRequest,

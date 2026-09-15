@@ -1708,17 +1708,16 @@ impl CoreEngine {
                 message_id,
                 peer_user_id,
             } => {
+                // A missing body is an HTTP-level failure and is reported as
+                // one. The previous fallback fabricated a "not accepted"
+                // response instead, which read as a disposition the inbox
+                // never reports.
                 let result: AppendEnvelopeResult = serde_json::from_str(
-                    body.as_deref().unwrap_or("{\"accepted\":false,\"seq\":0}"),
+                    body.as_deref().unwrap_or_default(),
                 )
                 .map_err(|error| {
                     CoreError::invalid_input(format!("failed to decode append response: {error}"))
                 })?;
-                if !result.accepted {
-                    return Err(CoreError::temporary_failure(
-                        "append response was not accepted",
-                    ));
-                }
                 let append_delivery = self.handle_append_delivery_result(&message_id, &result);
                 self.state
                     .pending_outbox
@@ -4273,7 +4272,6 @@ impl CoreEngine {
         let envelope = pending_item.map(|item| item.envelope.clone());
 
         let append_result = AppendResultSummary {
-            accepted: result.accepted,
             seq: Some(result.seq),
         };
         let protocol_only_contact_control = false;
@@ -4415,49 +4413,22 @@ impl CoreEngine {
             changed
         });
 
-        if result.accepted {
-            return AppendDeliveryOutput {
-                output: CoreOutput {
-                    state_update: CoreStateUpdate {
-                        messages_changed,
-                        conversations_changed: messages_changed,
-                        contacts_changed: contact_changed,
-                        ..CoreStateUpdate::default()
-                    },
-                    effects: vec![],
-                    view_model: Some(CoreViewModel {
-                        append_result: Some(append_result),
-                        contacts,
-                        ..CoreViewModel::default()
-                    }),
-                },
-                saved_conversation_id,
-            };
-        }
-        let (status, message, banner) = (
-            SystemStatus::TemporaryNetworkFailure,
-            "TapChat could not confirm delivery.".to_string(),
-            "Delivery was not confirmed.".to_string(),
-        );
+        // Every well-formed reply is a delivery. The inbox reports a sequence
+        // number and nothing else, so there is no "not accepted" branch to
+        // take; a failure to reach it at all is an HTTP failure and is handled
+        // as one by the caller.
         AppendDeliveryOutput {
             output: CoreOutput {
                 state_update: CoreStateUpdate {
-                    system_statuses_changed: vec![status],
                     messages_changed,
                     conversations_changed: messages_changed,
                     contacts_changed: contact_changed,
                     ..CoreStateUpdate::default()
                 },
-                effects: vec![CoreEffect::EmitUserNotification {
-                    notification: UserNotificationEffect { status, message },
-                }],
+                effects: vec![],
                 view_model: Some(CoreViewModel {
                     append_result: Some(append_result),
                     contacts,
-                    banners: vec![SystemBanner {
-                        status,
-                        message: banner,
-                    }],
                     ..CoreViewModel::default()
                 }),
             },

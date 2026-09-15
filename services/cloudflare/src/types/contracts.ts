@@ -602,8 +602,15 @@ export interface AppendEnvelopeRequest {
   envelope: Envelope;
 }
 
+/**
+ * What an append is answered with: a sequence number and nothing else.
+ *
+ * There used to be an `accepted` flag beside it, and it was always true —
+ * whether a record joined the record stream or is waiting for its recipient to
+ * accept a first contact is the recipient's business, not the transport's to
+ * report.
+ */
 export interface AppendEnvelopeResult {
-  accepted: boolean;
   seq: number;
 }
 

@@ -43,7 +43,6 @@ function opaqueName(): string {
 export const INBOX_DO_KEYS = {
   meta: "meta",
   acceptedLane: (lane: string): string => `accepted-lane:${lane}`,
-  laneSeq: (lane: string): string => `lane-seq:${lane}`,
   record: (seq: number): string => `record:${seq}`,
   idempotency: (mid: string): string => `idempotency:${mid}`,
   appendResult: (mid: string): string => `append-result:${mid}`,
@@ -93,7 +92,6 @@ export const R2_KEYS = {
 export const INBOX_DO_KEY_TEMPLATES: Record<keyof typeof INBOX_DO_KEYS, string> = {
   meta: "meta",
   acceptedLane: "accepted-lane:{lane}",
-  laneSeq: "lane-seq:{lane}",
   record: "record:{seq}",
   idempotency: "idempotency:{mid}",
   appendResult: "append-result:{mid}",

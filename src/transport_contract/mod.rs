@@ -17,14 +17,6 @@ pub struct AppendEnvelopeRequest {
     pub envelope: Envelope,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AppendDeliveryDisposition {
-    Inbox,
-    MessageRequest,
-    Rejected,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MessageRequestRealtimeChange {
@@ -33,15 +25,15 @@ pub enum MessageRequestRealtimeChange {
     Rejected,
 }
 
-impl Default for AppendDeliveryDisposition {
-    fn default() -> Self {
-        Self::Inbox
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// What an append is answered with: a sequence number and nothing else.
+///
+/// There used to be an `accepted` flag beside it, and it was always true.
+/// Whether a record joined the record stream or is waiting for its recipient
+/// to accept a first contact is the recipient's business, not the transport's
+/// to report — and the number itself is now drawn from one counter over every
+/// append, so it does not report it either.
 pub struct AppendEnvelopeResult {
-    pub accepted: bool,
     pub seq: u64,
 }
 
@@ -773,20 +765,19 @@ mod tests {
     }
 
     #[test]
-    fn append_result_round_trips_unified_acceptance() {
-        let result = AppendEnvelopeResult {
-            accepted: true,
-            seq: 7,
-        };
+    fn append_result_carries_a_sequence_number_and_nothing_else() {
+        let result = AppendEnvelopeResult { seq: 7 };
 
         let json = serde_json::to_string(&result).expect("serialize");
         let decoded: AppendEnvelopeResult = serde_json::from_str(&json).expect("deserialize");
 
-        assert!(decoded.accepted);
         assert_eq!(decoded.seq, 7);
-        assert!(!json.contains("delivered"));
-        assert!(!json.contains("queued"));
-        assert!(!json.contains("request_id"));
+        assert_eq!(json, r#"{"seq":7}"#);
+        // Each of these was, at some point, a way for the reply to report what
+        // the inbox did with the record.
+        for reported in ["delivered", "queued", "request_id", "accepted", "rejected"] {
+            assert!(!json.contains(reported), "append reply reports {reported}");
+        }
     }
 
     #[test]

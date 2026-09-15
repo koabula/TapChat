@@ -370,7 +370,6 @@ test("append authorization uses the registry bundle when the R2 mirror is stale"
     "user:alice"
   );
   assert.equal(delivered.status, 200);
-  assert.equal(delivered.accepted ? "inbox" : "other", "inbox");
 });
 
 test("stale append capability requests an identity refresh without queuing a message request", async (t) => {
@@ -621,9 +620,7 @@ test("runtime integration: append -> subscribe push -> reconnect/fetch recovery 
   const firstMessage = waitForWebSocketMessage(socket);
 
   const append1 = await appendEnvelope(mf, deviceId, "msg:1", "cipher-1");
-  assert.equal(append1.accepted, true);
   assert.equal(append1.seq, 1);
-  assert.equal(append1.accepted ? "inbox" : "other", "inbox");
 
   const pushed = (await firstMessage) as { event: string; seq: number; record?: { seq: number; messageId: string } };
   assert.equal(pushed.event, "head_updated");
@@ -756,8 +753,11 @@ test("runtime integration: message request changes push over realtime and inbox 
   await waitForSubscribeReady(socket);
   const queuedMessage = waitForWebSocketMessage(socket);
 
+  // A queued append is answered with a number from the same counter an
+  // admitted one draws from, and the record stream does not move for it. The
+  // reply and the head deliberately disagree: the head is the recipient's
+  // business, the reply is all the sender gets.
   const queued = await appendEnvelope(mf, deviceId, "msg:req-1", "cipher-req", "user:mallory");
-  assert.equal(queued.accepted, true);
   assert.equal(queued.seq, 1);
   const queuedEvent = (await queuedMessage) as {
     event: string;
@@ -818,7 +818,6 @@ test("runtime integration: message request changes push over realtime and inbox 
     "user:mallory"
   );
   assert.equal(deliveredAfterAccept.status, 200);
-  assert.equal(deliveredAfterAccept.accepted, true);
 
   const fetchResponse = await mf.dispatchFetch(`${BASE_URL}/v1/inbox/${encodeURIComponent(deviceId)}/messages?fromSeq=1&limit=10`, {
     headers: authHeaders(token)

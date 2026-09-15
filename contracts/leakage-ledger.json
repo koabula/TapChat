@@ -94,7 +94,8 @@
       },
       {
         "channel": "ciphertext_length",
-        "checked": false
+        "checked": false,
+        "note": "Rotation is now the loudest thing on a lane. A rotation carries the rotating party's whole signed bundle rather than a reference to it — roughly four to six times an ordinary message, separable by size alone — and rotation is triggered by how many messages a party has itself sent, so the two directions of one conversation rotate on correlated schedules. Both inboxes therefore show a size-distinctive, time-correlated periodic event. This stays inside the ceiling tab:inbox already concedes (volume and timing), and it bought the counterparty callback and Definition 3; it is recorded because a repair that moves a conceded parameter should be written down, and it is the first quantity the partition test should measure rather than estimate."
       },
       {
         "channel": "inter_arrival_timing",
@@ -501,7 +502,8 @@
       "carries": [],
       "signed": false,
       "parameter": "L_ibx",
-      "fate": "accepted"
+      "fate": "accepted",
+      "note": "Inbox bookkeeping: the record head, the ack watermark, the retention and limit settings, and the append counter the inbox answers every append with. That counter runs over every append whatever becomes of the record, so the number discloses nothing about whether the record was admitted or queued; it is also the closer analogue of the i the ideal returns, which counts every send rather than the ones an adversary chose to deliver."
     },
     {
       "surface": "inbox_do_key",
@@ -511,16 +513,6 @@
       "signed": false,
       "parameter": "L_ibx",
       "fate": "routing"
-    },
-    {
-      "surface": "inbox_do_key",
-      "path": "lane-seq:{lane}",
-      "bits": "inhabited",
-      "carries": [],
-      "signed": false,
-      "parameter": "L_ibx",
-      "fate": "to_repair",
-      "note": "A per-lane counter starting at 1, returned as the append `seq` while a lane is still queued, where an admitted lane returns the device-global head. The write-up's Send says the inbox answers with a sequence number and nothing else; that is false while the two counters differ, so the sender reads its own admission state off the first reply."
     },
     {
       "surface": "inbox_do_key",
@@ -863,7 +855,6 @@
       "reason": "Authored by the host; discloses nothing it did not have.",
       "types": [
         "AckResult",
-        "AppendDeliveryDisposition",
         "AppendEnvelopeResult",
         "FetchIdentityBundleResult",
         "FetchMessageRequestsResult",
