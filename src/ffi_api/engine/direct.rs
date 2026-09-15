@@ -6,6 +6,14 @@ impl CoreEngine {
         bundle: crate::model::DeploymentBundle,
     ) -> CoreResult<CoreOutput> {
         bundle.validate()?;
+        let previous_inbox = self
+            .state
+            .deployment_bundle
+            .as_ref()
+            .map(|deployment| deployment.inbox_http_endpoint.clone());
+        let inbox_moved = previous_inbox
+            .as_ref()
+            .is_some_and(|endpoint| endpoint != &bundle.inbox_http_endpoint);
         self.state.deployment_bundle = Some(bundle);
         self.refresh_local_bundle()?;
         let mut output = CoreOutput {
@@ -23,6 +31,10 @@ impl CoreEngine {
         output
             .effects
             .extend(self.local_shared_state_publish_effects()?);
+        if inbox_moved {
+            output = merge_outputs(output, self.relocate_inbound_lanes()?);
+            output = self.merge_with_transport_flush(output)?;
+        }
         Ok(output)
     }
 
@@ -2003,8 +2015,37 @@ impl CoreEngine {
                                     };
                                 }
                             };
+                        if !crate::model::is_opaque_id(&body.inbound_lane) {
+                            return ApplicationPlaintextDecision::RejectedProtocol {
+                                reason: "lane rotation inbound_lane is not an opaque id".into(),
+                            };
+                        }
+                        if body.bundle.user_id != peer_user_id {
+                            return ApplicationPlaintextDecision::RejectedProtocol {
+                                reason:
+                                    "lane rotation bundle user_id does not match conversation peer"
+                                        .into(),
+                            };
+                        }
+                        if IdentityManager::verify_identity_bundle(&body.bundle).is_err() {
+                            return ApplicationPlaintextDecision::RejectedProtocol {
+                                reason: "lane rotation bundle failed verification".into(),
+                            };
+                        }
+                        if Self::ensure_peer_bundle_not_rolled_back(
+                            self.state.contacts.get(&body.bundle.user_id),
+                            &body.bundle,
+                        )
+                        .is_err()
+                        {
+                            return ApplicationPlaintextDecision::RejectedProtocol {
+                                reason: "lane rotation bundle publication_revision rolled back"
+                                    .into(),
+                            };
+                        }
                         ApplicationPlaintextDecision::LaneRotation {
-                            identity_bundle_ref: body.identity_bundle_ref,
+                            bundle: body.bundle,
+                            inbound_lane: body.inbound_lane,
                             app_message_id: protected.app_message_id,
                         }
                     }
@@ -3290,28 +3331,31 @@ impl CoreEngine {
             envelopes.push(envelope);
         }
         self.enqueue_envelopes(peer_user_id.clone(), envelopes);
-        self.enqueue_lane_rotation(conversation_id, &peer_user_id, &recipient_device_ids)?;
+        self.enqueue_lane_rotation(conversation_id)?;
         Ok(true)
     }
 
-    pub(super) fn enqueue_lane_rotation(
-        &mut self,
-        conversation_id: &str,
-        _peer_user_id: &str,
-        _recipient_device_ids: &[String],
-    ) -> CoreResult<()> {
-        let Some(reference) = self
+    pub(super) fn enqueue_lane_rotation(&mut self, conversation_id: &str) -> CoreResult<()> {
+        let bundle = self
             .state
             .local_bundle
-            .as_ref()
-            .and_then(|bundle| bundle.identity_bundle_ref.clone())
-            .filter(|value| !value.trim().is_empty())
-        else {
-            log::info!("skipping lane rotation: local identity_bundle_ref is missing");
-            return Ok(());
-        };
+            .clone()
+            .ok_or_else(|| CoreError::invalid_state("local identity bundle is missing"))?;
+        let inbound_lane = self
+            .state
+            .conversations
+            .get(conversation_id)
+            .and_then(|conversation| conversation.lanes.as_ref())
+            .map(|lanes| lanes.inbound_lane.clone())
+            .ok_or_else(|| CoreError::invalid_state("conversation has no inbound lane"))?;
+        if !crate::model::is_opaque_id(&inbound_lane) {
+            return Err(CoreError::invalid_state(
+                "inbound lane is not a 128-bit hex id",
+            ));
+        }
         let body = serde_json::to_string(&crate::model::LaneRotationBody {
-            identity_bundle_ref: reference,
+            bundle,
+            inbound_lane,
         })
         .map_err(|error| {
             CoreError::invalid_input(format!("lane rotation encode failed: {error}"))
@@ -3320,21 +3364,164 @@ impl CoreEngine {
         Ok(())
     }
 
-    pub(super) fn fetch_peer_identity_bundle(
-        &self,
-        user_id: String,
-        reference: String,
-    ) -> CoreOutput {
-        CoreOutput {
-            state_update: CoreStateUpdate::default(),
-            effects: vec![CoreEffect::FetchIdentityBundle {
-                fetch: FetchIdentityBundleRequest {
-                    user_id,
-                    reference: Some(reference),
-                },
-            }],
-            view_model: None,
+    fn bundle_device_ids(bundle: &IdentityBundle) -> BTreeSet<String> {
+        bundle
+            .devices
+            .iter()
+            .map(|device| device.device_id.clone())
+            .collect()
+    }
+
+    pub(super) fn apply_announced_peer_bundle(
+        &mut self,
+        conversation_id: &str,
+        expected_user_id: &str,
+        bundle: IdentityBundle,
+        inbound_lane: String,
+    ) -> CoreResult<CoreOutput> {
+        if bundle.user_id != expected_user_id {
+            return Ok(CoreOutput::default());
         }
+        IdentityManager::verify_identity_bundle(&bundle)?;
+        Self::ensure_peer_bundle_not_rolled_back(
+            self.state.contacts.get(&bundle.user_id),
+            &bundle,
+        )?;
+
+        let previous_devices = self
+            .state
+            .contacts
+            .get(&bundle.user_id)
+            .map(|contact| Self::bundle_device_ids(&contact.bundle))
+            .unwrap_or_default();
+        let new_devices = Self::bundle_device_ids(&bundle);
+        let devices_changed = previous_devices != new_devices;
+        let user_id = bundle.user_id.clone();
+
+        let existing = self.state.contacts.get(&user_id);
+        let display_name = existing.and_then(|contact| contact.display_name.clone());
+        let original_name = bundle
+            .display_name
+            .clone()
+            .or(existing.and_then(|contact| contact.original_name.clone()));
+        let added_at = existing
+            .map(|contact| contact.added_at)
+            .unwrap_or_else(|| current_timestamp_hint(self.state.outbox.len()));
+        let relationship_status = existing
+            .map(|contact| contact.relationship_status.clone())
+            .unwrap_or_default();
+        let verified_at = existing.and_then(|contact| contact.verified_at);
+        let verified_root_key = existing.and_then(|contact| contact.verified_root_key.clone());
+        let existing_root_key = existing.map(|contact| contact.bundle.user_public_key.clone());
+        let existing_key_changed_unverified = existing
+            .map(|contact| contact.key_changed_unverified)
+            .unwrap_or(false);
+
+        let mut persisted_contact = PersistedContact {
+            user_id: user_id.clone(),
+            bundle,
+            display_name,
+            original_name,
+            relationship_status,
+            added_at,
+            verified_at,
+            verified_root_key,
+            key_changed_unverified: existing_key_changed_unverified,
+        };
+        if let Some(previous_root_key) = existing_root_key.as_deref() {
+            persisted_contact.note_root_key_before_update(previous_root_key);
+        }
+        persisted_contact.align_verification();
+        self.state
+            .contacts
+            .insert(user_id.clone(), persisted_contact);
+
+        let mut persist_ops = vec![PersistOp::SaveContact {
+            user_id: user_id.clone(),
+        }];
+        let mut output = CoreOutput {
+            state_update: CoreStateUpdate {
+                contacts_changed: true,
+                ..CoreStateUpdate::default()
+            },
+            effects: Vec::new(),
+            view_model: None,
+        };
+
+        if devices_changed {
+            for affected in self.affected_conversations_for_peer(&user_id) {
+                self.mark_recovery_needed(&affected, RecoveryReason::IdentityChanged);
+                self.transition_recovery_phase(
+                    &affected,
+                    RecoveryPhase::WaitingForExplicitReconcile,
+                );
+                output = merge_outputs(output, self.reconcile_conversation_membership(affected)?);
+            }
+        }
+
+        let current_outbound = self
+            .state
+            .conversations
+            .get(conversation_id)
+            .and_then(|conversation| conversation.lanes.as_ref())
+            .map(|lanes| lanes.outbound_lane.clone());
+        if current_outbound.as_deref() != Some(inbound_lane.as_str())
+            && self
+                .state
+                .conversations
+                .get(conversation_id)
+                .and_then(|conversation| conversation.lanes.as_ref())
+                .is_some()
+        {
+            self.switch_outbound_lane(conversation_id, inbound_lane)?;
+            output.state_update.conversations_changed = true;
+            persist_ops.push(PersistOp::SaveConversation {
+                conversation_id: conversation_id.to_string(),
+            });
+        }
+        output
+            .effects
+            .insert(0, persist_effect(&self.state, persist_ops));
+        Ok(output)
+    }
+
+    fn relocate_inbound_lanes(&mut self) -> CoreResult<CoreOutput> {
+        let conversation_ids = self
+            .state
+            .conversations
+            .iter()
+            .filter(|(_, conversation)| {
+                conversation.conversation.kind == ConversationKind::Direct
+                    && conversation.lanes.is_some()
+            })
+            .map(|(conversation_id, _)| conversation_id.clone())
+            .collect::<Vec<_>>();
+        if conversation_ids.is_empty() {
+            return Ok(CoreOutput::default());
+        }
+
+        let mut output = CoreOutput {
+            state_update: CoreStateUpdate {
+                conversations_changed: true,
+                checkpoints_changed: true,
+                ..CoreStateUpdate::default()
+            },
+            effects: Vec::new(),
+            view_model: None,
+        };
+        let mut persist_ops = Vec::new();
+        for conversation_id in conversation_ids {
+            let new_inbound = crate::model::random_opaque_id();
+            self.replace_inbound_lane(&conversation_id, new_inbound.clone())?;
+            output = merge_outputs(output, self.register_accepted_lane(new_inbound)?);
+            self.enqueue_lane_rotation(&conversation_id)?;
+            persist_ops.push(PersistOp::SaveConversation { conversation_id });
+        }
+        persist_ops.push(PersistOp::SaveLocalIdentity);
+        output
+            .effects
+            .push(persist_effect(&self.state, persist_ops));
+        Ok(output)
     }
 
     /// Arbitrate an inbound commit against our own commit for the same base

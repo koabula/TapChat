@@ -343,8 +343,10 @@ pub struct ProtectedAppMessage {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LaneRotationBody {
-    pub identity_bundle_ref: String,
+    pub bundle: IdentityBundle,
+    pub inbound_lane: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -442,11 +444,13 @@ impl ProtectedAppMessage {
         sender_device_id: String,
         recipient_user_id: String,
         audience_device_ids: Vec<String>,
-        identity_bundle_ref: String,
+        bundle: IdentityBundle,
+        inbound_lane: String,
         sent_at: u64,
     ) -> CoreResult<Self> {
         let body = serde_json::to_string(&LaneRotationBody {
-            identity_bundle_ref,
+            bundle,
+            inbound_lane,
         })
         .map_err(|error| {
             CoreError::invalid_input(format!("lane rotation encode failed: {error}"))
@@ -515,7 +519,13 @@ impl Validate for ProtectedAppMessage {
                 let body: LaneRotationBody = serde_json::from_str(&self.body).map_err(|error| {
                     CoreError::invalid_input(format!("lane rotation body is malformed: {error}"))
                 })?;
-                validate_required("identity_bundle_ref", &body.identity_bundle_ref)
+                body.bundle.validate()?;
+                if !is_opaque_id(&body.inbound_lane) {
+                    return Err(CoreError::invalid_input(
+                        "inbound_lane must be a 128-bit hex id",
+                    ));
+                }
+                Ok(())
             }
             ProtectedPayloadKind::ContactAccepted => {
                 let _: ContactAcceptedBody = serde_json::from_str(&self.body).map_err(|error| {

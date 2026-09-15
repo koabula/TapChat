@@ -316,9 +316,7 @@ impl CoreEngine {
             )?);
         }
         self.enqueue_envelopes(peer_user_id.clone(), generated.clone());
-        if let Err(error) =
-            self.enqueue_lane_rotation(&conversation_id, &peer_user_id, &peer_active_device_ids)
-        {
+        if let Err(error) = self.enqueue_lane_rotation(&conversation_id) {
             log::warn!(
                 "membership reconcile lane rotation failed conversation_id={}: {}",
                 conversation_id,

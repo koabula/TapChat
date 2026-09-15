@@ -3184,7 +3184,8 @@ impl CoreEngine {
                                     self.observe_direct_application(&conversation_id);
                                 }
                                 ApplicationPlaintextDecision::LaneRotation {
-                                    identity_bundle_ref,
+                                    bundle,
+                                    inbound_lane,
                                     app_message_id,
                                 } => {
                                     self.remember_app_message_id(
@@ -3193,19 +3194,15 @@ impl CoreEngine {
                                         ciphertext_sha256.clone(),
                                     )?;
                                     self.observe_direct_application(&conversation_id);
-                                    if identity_bundle_ref.trim().is_empty() {
-                                        log::info!(
-                                            "lane rotation identity_bundle_ref is empty; skipping fetch"
-                                        );
-                                    } else {
-                                        output = merge_outputs(
-                                            output,
-                                            self.fetch_peer_identity_bundle(
-                                                inbound_peer_user_id.clone(),
-                                                identity_bundle_ref,
-                                            ),
-                                        );
-                                    }
+                                    output = merge_outputs(
+                                        output,
+                                        self.apply_announced_peer_bundle(
+                                            &conversation_id,
+                                            &inbound_peer_user_id,
+                                            bundle,
+                                            inbound_lane,
+                                        )?,
+                                    );
                                 }
                                 ApplicationPlaintextDecision::ContactAccepted {
                                     app_message_id,

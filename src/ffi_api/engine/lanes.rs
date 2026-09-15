@@ -76,6 +76,68 @@ impl CoreEngine {
         self.index_inbound_lane(&outbound_c2, conversation_id);
     }
 
+    pub(super) fn replace_inbound_lane(
+        &mut self,
+        conversation_id: &str,
+        new_inbound: String,
+    ) -> CoreResult<()> {
+        if !is_opaque_id(&new_inbound) {
+            return Err(CoreError::invalid_input("lane must be a 128-bit hex id"));
+        }
+        let old_inbound = self
+            .state
+            .conversations
+            .get(conversation_id)
+            .and_then(|conversation| conversation.lanes.as_ref())
+            .map(|lanes| lanes.inbound_lane.clone())
+            .ok_or_else(|| CoreError::invalid_state("conversation has no inbound lane"))?;
+        if old_inbound == new_inbound {
+            return Ok(());
+        }
+        if let Some(lanes) = self
+            .state
+            .conversations
+            .get_mut(conversation_id)
+            .and_then(|conversation| conversation.lanes.as_mut())
+        {
+            lanes.inbound_lane = new_inbound.clone();
+        }
+        self.state.lane_index.remove(&old_inbound);
+        self.index_inbound_lane(&new_inbound, conversation_id);
+        Ok(())
+    }
+
+    pub(super) fn switch_outbound_lane(
+        &mut self,
+        conversation_id: &str,
+        new_outbound: String,
+    ) -> CoreResult<()> {
+        if !is_opaque_id(&new_outbound) {
+            return Err(CoreError::invalid_input("lane must be a 128-bit hex id"));
+        }
+        let old_outbound = self
+            .state
+            .conversations
+            .get(conversation_id)
+            .and_then(|conversation| conversation.lanes.as_ref())
+            .map(|lanes| lanes.outbound_lane.clone())
+            .ok_or_else(|| CoreError::invalid_state("conversation has no outbound lane"))?;
+        if old_outbound == new_outbound {
+            return Ok(());
+        }
+        if let Some(lanes) = self
+            .state
+            .conversations
+            .get_mut(conversation_id)
+            .and_then(|conversation| conversation.lanes.as_mut())
+        {
+            lanes.outbound_lane = new_outbound.clone();
+        }
+        self.state.lane_index.remove(&old_outbound);
+        self.index_inbound_lane(&new_outbound, conversation_id);
+        Ok(())
+    }
+
     pub(super) fn register_accepted_lane(&mut self, lane: String) -> CoreResult<CoreOutput> {
         if !is_opaque_id(&lane) {
             return Err(CoreError::invalid_input("lane must be a 128-bit hex id"));

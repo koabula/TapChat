@@ -194,7 +194,8 @@ enum ApplicationPlaintextDecision {
         app_message_id: Option<String>,
     },
     LaneRotation {
-        identity_bundle_ref: String,
+        bundle: IdentityBundle,
+        inbound_lane: String,
         app_message_id: String,
     },
     ContactAccepted {
@@ -1345,7 +1346,12 @@ impl CoreEngine {
                 request_id,
                 failure,
             } => self.handle_http_failure(request_id, failure),
-            CoreEvent::IdentityBundleFetched { user_id: _, bundle } => {
+            CoreEvent::IdentityBundleFetched { user_id, bundle } => {
+                if bundle.user_id != user_id {
+                    return Err(CoreError::invalid_input(
+                        "fetched identity bundle user_id does not match the requested user",
+                    ));
+                }
                 self.apply_identity_bundle_update(bundle)
             }
             CoreEvent::IdentityBundleFetchFailed {

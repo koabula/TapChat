@@ -4396,17 +4396,30 @@ mod tests {
     }
 
     #[test]
-    fn lane_rotation_body_is_only_bundle_ref() {
+    fn lane_rotation_body_carries_signed_bundle_and_inbound_lane() {
+        let bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let inbound_lane = "0123456789abcdef0123456789abcdef".to_string();
         let body = crate::model::LaneRotationBody {
-            identity_bundle_ref: "https://example.test/v1/contact-share/bob".into(),
+            bundle: bundle.clone(),
+            inbound_lane: inbound_lane.clone(),
         };
         let json = serde_json::to_value(&body).expect("lane rotation json");
         let object = json.as_object().expect("object");
+        let mut keys = object.keys().cloned().collect::<Vec<_>>();
+        keys.sort();
+        assert_eq!(keys, vec!["bundle".to_string(), "inbound_lane".to_string()]);
+        assert!(!object.contains_key("identity_bundle_ref"));
         assert_eq!(
-            object.keys().cloned().collect::<Vec<_>>(),
-            vec!["identity_bundle_ref".to_string()]
+            object.get("inbound_lane").and_then(|value| value.as_str()),
+            Some(inbound_lane.as_str())
         );
-        assert!(!object.contains_key("inbound_lane"));
+        assert_eq!(
+            object
+                .get("bundle")
+                .and_then(|value| value.get("userId"))
+                .and_then(|value| value.as_str()),
+            Some(bundle.user_id.as_str())
+        );
     }
 
     #[test]
@@ -11697,7 +11710,7 @@ mod tests {
     }
 
     #[test]
-    fn lane_rotation_refreshes_peer_bundle_reference() {
+    fn lane_rotation_applies_peer_bundle_without_fetch() {
         let mut chat = paired_direct_chat();
         let bob_user_id = chat
             .bob
@@ -11748,13 +11761,13 @@ mod tests {
 
         let inbound =
             deliver_pending_outbox_to_device(&mut chat.alice, &chat.bob, &chat.alice_device_id);
-        assert!(inbound.effects.iter().any(|effect| matches!(
-            effect,
-            CoreEffect::FetchIdentityBundle { fetch }
-                if fetch.user_id == bob_user_id
-                    && fetch.reference.as_deref()
-                        == Some("https://example.test/v1/contact-share/bob-rotated")
-        )));
+        assert!(
+            inbound
+                .effects
+                .iter()
+                .all(|effect| !matches!(effect, CoreEffect::FetchIdentityBundle { .. })),
+            "lane rotation must apply the inlined bundle locally"
+        );
         assert!(
             !chat
                 .alice
@@ -11767,13 +11780,6 @@ mod tests {
                 .any(|message| message.plaintext.as_deref() == Some("")),
             "lane rotation must not become a visible chat message"
         );
-
-        chat.alice
-            .handle_event(CoreEvent::IdentityBundleFetched {
-                user_id: bob_user_id.clone(),
-                bundle: rotated.clone(),
-            })
-            .expect("alice imports rotated bob bundle");
         assert_eq!(
             chat.alice
                 .state
@@ -11785,6 +11791,16 @@ mod tests {
                 .as_deref(),
             Some("https://example.test/v1/contact-share/bob-rotated")
         );
+        assert_eq!(
+            chat.alice
+                .state
+                .contacts
+                .get(&bob_user_id)
+                .expect("bob contact")
+                .bundle
+                .publication_revision,
+            rotated.publication_revision
+        );
 
         let error = chat
             .alice
@@ -11794,7 +11810,7 @@ mod tests {
     }
 
     #[test]
-    fn lane_rotation_fetches_same_url_when_publication_revision_advances() {
+    fn lane_rotation_applies_newer_publication_without_fetch() {
         let mut chat = paired_direct_chat();
         let bob_user_id = chat
             .bob
@@ -11858,19 +11874,13 @@ mod tests {
 
         let inbound =
             deliver_pending_outbox_to_device(&mut chat.alice, &chat.bob, &chat.alice_device_id);
-        assert!(inbound.effects.iter().any(|effect| matches!(
-            effect,
-            CoreEffect::FetchIdentityBundle { fetch }
-                if fetch.user_id == bob_user_id
-                    && fetch.reference.as_deref() == Some(stored_ref.as_str())
-        )));
-
-        chat.alice
-            .handle_event(CoreEvent::IdentityBundleFetched {
-                user_id: bob_user_id.clone(),
-                bundle: rotated.clone(),
-            })
-            .expect("alice imports same-url newer bob bundle");
+        assert!(
+            inbound
+                .effects
+                .iter()
+                .all(|effect| !matches!(effect, CoreEffect::FetchIdentityBundle { .. })),
+            "same-url revision bump must not fetch"
+        );
         assert_eq!(
             chat.alice
                 .state
@@ -11892,6 +11902,313 @@ mod tests {
                 .as_deref(),
             Some(stored_ref.as_str())
         );
+    }
+
+    #[test]
+    fn relocation_to_empty_runtime_keeps_the_conversation() {
+        let mut chat = paired_direct_chat();
+        let conversation_id = chat.conversation_id.clone();
+        let bob_user_id = chat
+            .bob
+            .state
+            .local_identity
+            .as_ref()
+            .expect("bob identity")
+            .user_identity
+            .user_id
+            .clone();
+
+        chat.alice
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "before-move".into(),
+            })
+            .expect("alice sends before move");
+        deliver_pending_outbox_to_device(&mut chat.bob, &chat.alice, &chat.bob_device_id);
+        chat.bob
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "before-move-reply".into(),
+            })
+            .expect("bob replies before move");
+        deliver_pending_outbox_to_device(&mut chat.alice, &chat.bob, &chat.alice_device_id);
+
+        let old_bob_inbound = chat
+            .bob
+            .state
+            .conversations
+            .get(&conversation_id)
+            .and_then(|conversation| conversation.lanes.as_ref())
+            .map(|lanes| lanes.inbound_lane.clone())
+            .expect("bob inbound");
+        let old_alice_outbound = chat
+            .alice
+            .state
+            .conversations
+            .get(&conversation_id)
+            .and_then(|conversation| conversation.lanes.as_ref())
+            .map(|lanes| lanes.outbound_lane.clone())
+            .expect("alice outbound");
+        assert_eq!(old_alice_outbound, old_bob_inbound);
+        let old_bob_outbound = chat
+            .bob
+            .state
+            .conversations
+            .get(&conversation_id)
+            .and_then(|conversation| conversation.lanes.as_ref())
+            .map(|lanes| lanes.outbound_lane.clone())
+            .expect("bob outbound");
+        let old_endpoint = chat
+            .alice
+            .state
+            .contacts
+            .get(&bob_user_id)
+            .and_then(|contact| contact.bundle.devices.first())
+            .and_then(|device| device.inbox_append_capability.as_ref())
+            .map(|capability| capability.endpoint.clone())
+            .expect("bob inbox endpoint");
+        let epoch_before = conversation_epoch(&chat.alice, &conversation_id);
+
+        let mut relocated = sample_deployment();
+        relocated.inbox_http_endpoint = "https://bob-new.example.test".into();
+        relocated.inbox_websocket_endpoint = "wss://bob-new.example.test/ws".into();
+        relocated.runtime_id = "runtime:bob-new".into();
+        relocated.runtime_config.identity_bundle_ref =
+            Some("https://bob-new.example.test/state/identity.json".into());
+        relocated.storage_base_info.base_url = Some("https://bob-new-storage.example.test".into());
+
+        let relocate = chat
+            .bob
+            .handle_command(CoreCommand::ImportDeploymentBundle { bundle: relocated })
+            .expect("bob relocates");
+        let registered = relocate
+            .effects
+            .iter()
+            .filter_map(|effect| match effect {
+                CoreEffect::RegisterAcceptedLane { register } => Some(register.lane.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            registered.len(),
+            1,
+            "relocation registers one fresh inbound"
+        );
+        assert_ne!(registered[0], old_bob_inbound, "must not copy the old lane");
+        let new_bob_inbound = chat
+            .bob
+            .state
+            .conversations
+            .get(&conversation_id)
+            .and_then(|conversation| conversation.lanes.as_ref())
+            .map(|lanes| lanes.inbound_lane.clone())
+            .expect("bob new inbound");
+        assert_eq!(new_bob_inbound, registered[0]);
+        assert_eq!(
+            chat.bob
+                .state
+                .conversations
+                .get(&conversation_id)
+                .and_then(|conversation| conversation.lanes.as_ref())
+                .map(|lanes| lanes.outbound_lane.as_str()),
+            Some(old_bob_outbound.as_str()),
+            "relocating B must not change the lane B writes on A's inbox"
+        );
+
+        let inbound =
+            deliver_pending_outbox_to_device(&mut chat.alice, &chat.bob, &chat.alice_device_id);
+        assert!(
+            inbound
+                .effects
+                .iter()
+                .all(|effect| !matches!(effect, CoreEffect::FetchIdentityBundle { .. })),
+            "relocation announcement must not fetch"
+        );
+        assert_eq!(
+            chat.alice
+                .state
+                .conversations
+                .get(&conversation_id)
+                .and_then(|conversation| conversation.lanes.as_ref())
+                .map(|lanes| lanes.outbound_lane.clone())
+                .as_deref(),
+            Some(new_bob_inbound.as_str())
+        );
+        let new_endpoint = chat
+            .alice
+            .state
+            .contacts
+            .get(&bob_user_id)
+            .and_then(|contact| contact.bundle.devices.first())
+            .and_then(|device| device.inbox_append_capability.as_ref())
+            .map(|capability| capability.endpoint.clone())
+            .expect("updated bob inbox endpoint");
+        assert_ne!(new_endpoint, old_endpoint);
+        assert!(new_endpoint.contains("bob-new.example.test"));
+        assert_eq!(
+            conversation_epoch(&chat.alice, &conversation_id),
+            epoch_before,
+            "relocation must not rebuild the MLS session"
+        );
+
+        let after = chat
+            .alice
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "after-move".into(),
+            })
+            .expect("alice sends after move");
+        assert!(after.effects.iter().any(|effect| matches!(
+            effect,
+            CoreEffect::ExecuteHttpRequest { request }
+                if request.url.contains("bob-new.example.test")
+        )));
+        assert!(after.effects.iter().all(|effect| match effect {
+            CoreEffect::ExecuteHttpRequest { request } if request.url.contains("/messages") => {
+                !request.url.contains(&old_endpoint)
+            }
+            _ => true,
+        }));
+        let after_lane = chat
+            .alice
+            .state
+            .pending_outbox
+            .iter()
+            .rev()
+            .find(|item| item.plaintext_cache.as_deref() == Some("after-move"))
+            .map(|item| item.envelope.lane.clone())
+            .expect("after-move envelope");
+        assert_eq!(after_lane, new_bob_inbound);
+        deliver_pending_outbox_to_device(&mut chat.bob, &chat.alice, &chat.bob_device_id);
+        assert!(chat
+            .bob
+            .state
+            .conversations
+            .get(&conversation_id)
+            .expect("bob conversation")
+            .messages
+            .iter()
+            .any(|message| message.plaintext.as_deref() == Some("after-move")));
+
+        chat.bob
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "after-move-reply".into(),
+            })
+            .expect("bob replies after move");
+        deliver_pending_outbox_to_device(&mut chat.alice, &chat.bob, &chat.alice_device_id);
+        assert!(chat
+            .alice
+            .state
+            .conversations
+            .get(&conversation_id)
+            .expect("alice conversation")
+            .messages
+            .iter()
+            .any(|message| message.plaintext.as_deref() == Some("after-move-reply")));
+
+        chat.alice = CoreEngine::try_from_restored_state(chat.alice.refresh_snapshot())
+            .expect("restore alice");
+        chat.bob =
+            CoreEngine::try_from_restored_state(chat.bob.refresh_snapshot()).expect("restore bob");
+        assert_eq!(
+            chat.alice
+                .state
+                .conversations
+                .get(&conversation_id)
+                .and_then(|conversation| conversation.lanes.as_ref())
+                .map(|lanes| lanes.outbound_lane.as_str()),
+            Some(new_bob_inbound.as_str())
+        );
+
+        chat.alice
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "after-restart".into(),
+            })
+            .expect("alice sends after restart");
+        let restart_lane = chat
+            .alice
+            .state
+            .pending_outbox
+            .iter()
+            .rev()
+            .find(|item| item.plaintext_cache.as_deref() == Some("after-restart"))
+            .map(|item| item.envelope.lane.clone())
+            .expect("after-restart envelope");
+        assert_eq!(restart_lane, new_bob_inbound);
+        deliver_pending_outbox_to_device(&mut chat.bob, &chat.alice, &chat.bob_device_id);
+        assert!(chat
+            .bob
+            .state
+            .conversations
+            .get(&conversation_id)
+            .expect("bob conversation")
+            .messages
+            .iter()
+            .any(|message| message.plaintext.as_deref() == Some("after-restart")));
+    }
+
+    #[test]
+    fn fetched_identity_bundle_must_match_requested_user() {
+        let mut alice = local_engine(ALICE_MNEMONIC, "phone");
+        let alice_bundle = alice.local_bundle().expect("alice bundle").clone();
+        let bob = local_engine(BOB_MNEMONIC, "phone");
+        let bob_bundle = bob.local_bundle().expect("bob bundle").clone();
+        alice
+            .handle_command(CoreCommand::ImportIdentityBundle {
+                bundle: bob_bundle.clone(),
+            })
+            .expect("alice imports bob");
+        let before = serde_json::to_vec(
+            &alice
+                .state
+                .contacts
+                .get(&bob_bundle.user_id)
+                .expect("bob contact")
+                .bundle,
+        )
+        .expect("contact bytes");
+
+        let error = alice
+            .handle_event(CoreEvent::IdentityBundleFetched {
+                user_id: bob_bundle.user_id.clone(),
+                bundle: alice_bundle,
+            })
+            .expect_err("mismatched subject");
+        assert_eq!(error.code(), "invalid_input");
+        let after = serde_json::to_vec(
+            &alice
+                .state
+                .contacts
+                .get(&bob_bundle.user_id)
+                .expect("bob contact")
+                .bundle,
+        )
+        .expect("contact bytes");
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn build_envelope_requires_an_outbound_lane() {
+        let mut chat = paired_direct_chat();
+        if let Some(conversation) = chat
+            .alice
+            .state
+            .conversations
+            .get_mut(&chat.conversation_id)
+        {
+            conversation.lanes = None;
+        }
+        chat.alice.state.lane_index.clear();
+        let error = chat
+            .alice
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: chat.conversation_id.clone(),
+                plaintext: "no-lane".into(),
+            })
+            .expect_err("missing outbound lane");
+        assert_eq!(error.code(), "invalid_state");
     }
 
     /// **Remark 2 / R1.** The decision test: a party completes a rotation with

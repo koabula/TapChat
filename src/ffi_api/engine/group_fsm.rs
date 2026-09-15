@@ -35,7 +35,7 @@ impl CoreEngine {
             .get(conversation_id)
             .and_then(|conversation| conversation.lanes.as_ref())
             .map(|lanes| lanes.outbound_lane.clone())
-            .unwrap_or_else(crate::model::random_opaque_id);
+            .ok_or_else(|| CoreError::invalid_state("conversation has no outbound lane"))?;
         let bytes = if message_type == MessageType::MlsWelcome {
             payload_b64
         } else {
