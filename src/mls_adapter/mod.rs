@@ -1373,46 +1373,6 @@ impl MlsAdapter {
         })
     }
 
-    /// Produce a self-update commit for the live epoch **without** advancing
-    /// this adapter, by building it on a `fork()`.
-    ///
-    /// The only way to construct a rival commit for a same-epoch collision, so
-    /// the arbitration tests can exercise a race that is otherwise a
-    /// one-message-wide window in wall-clock time.
-    pub fn create_forked_direct_self_update(
-        &self,
-        conversation_id: &str,
-    ) -> CoreResult<DirectSelfUpdate> {
-        if !self.groups.contains_key(conversation_id) {
-            return Err(CoreError::invalid_input(
-                "conversation MLS state does not exist",
-            ));
-        }
-        let base_epoch = self.export_group_summary(conversation_id)?.epoch;
-        let mut fork = self.fork()?;
-        let provider = &fork.provider;
-        let signer = &fork.signer;
-        let state = fork.groups.get_mut(conversation_id).ok_or_else(|| {
-            CoreError::invalid_state("forked MLS adapter is missing the conversation")
-        })?;
-        let bundle = state
-            .group
-            .self_update(provider, signer, LeafNodeParameters::default())
-            .map_err(|error| {
-                CoreError::invalid_state(format!(
-                    "failed to create forked direct PCS self-update: {error}"
-                ))
-            })?;
-        let commit = bundle.into_commit();
-        let commit_b64 = encode_mls_message(commit)?;
-        let commit_hash = crate::direct_pcs::commit_hash_from_b64(&commit_b64)?;
-        Ok(DirectSelfUpdate {
-            commit_b64,
-            commit_hash,
-            base_epoch,
-        })
-    }
-
     pub fn member_device_ids(&self, conversation_id: &str) -> CoreResult<Vec<String>> {
         Ok(self
             .export_group_summary(conversation_id)?

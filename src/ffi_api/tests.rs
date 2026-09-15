@@ -13039,6 +13039,110 @@ mod tests {
             .is_none_or(|view| view.messages.is_empty() && view.conversations.is_empty()));
     }
 
+    /// A genuine signature does not travel to another commit.
+    ///
+    /// The detached signature is what lets arbitration act on a rival commit
+    /// MLS refuses to process, so the thing that must not be forgeable is the
+    /// pair (this epoch, this commit). Here the attacker has a real signature
+    /// the peer made, and a stale wrap key to deliver with — everything the
+    /// previous test denied it — and still cannot move the signature onto a
+    /// commit the peer did not make.
+    #[test]
+    fn a_genuine_commit_signature_does_not_authenticate_another_commit() {
+        let mut chat = paired_direct_chat();
+        let conversation_id = chat.conversation_id.clone();
+        let alice_rotated = !alice_is_designated(&chat);
+        let victim_device = rotator_device_id(&chat, alice_rotated).to_string();
+        let victim_lanes = rotator_engine(&chat, alice_rotated).state.conversations
+            [&conversation_id]
+            .lanes
+            .as_ref()
+            .unwrap()
+            .clone();
+        let compromised_wrap_key = rotator_engine(&chat, alice_rotated)
+            .state
+            .mls_adapter
+            .as_ref()
+            .unwrap()
+            .export_lane_wrap_key(&conversation_id, victim_lanes.inbound_dir())
+            .unwrap();
+
+        // Make the peer rotate, so a commit it really signed exists.
+        set_direct_pcs_debt(
+            peer_engine_mut(&mut chat, alice_rotated),
+            &conversation_id,
+            DIRECT_PCS_COMMIT_INTERVAL * 2,
+        );
+        peer_engine_mut(&mut chat, alice_rotated)
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "peer-rotation".into(),
+            })
+            .unwrap();
+        let peer_commit = last_pending_envelope(
+            peer_engine(&chat, alice_rotated),
+            &victim_device,
+            MessageType::MlsCommit,
+        );
+
+        let wrapped = STANDARD.decode(peer_commit.payload_b64().unwrap()).unwrap();
+        let plaintext =
+            crate::lane_wrap::unwrap_with_cached_keys(&compromised_wrap_key, None, &wrapped)
+                .expect("the victim's inbound key opens the peer's commit");
+        let (genuine_commit_b64, genuine_signature) =
+            crate::direct_frame::decode(&plaintext).expect("a commit frame");
+        let genuine_signature = genuine_signature.expect("a commit carries a signature");
+
+        let mut tampered = STANDARD.decode(&genuine_commit_b64).unwrap();
+        *tampered.last_mut().unwrap() ^= 1;
+        let tampered_b64 = STANDARD.encode(tampered);
+        assert_ne!(tampered_b64, genuine_commit_b64);
+        assert_eq!(
+            MlsAdapter::classify_mls_payload(&tampered_b64),
+            Some(MessageType::MlsCommit),
+            "still a syntactic commit, which is all the arbitration gate used to need"
+        );
+
+        let forged = Envelope::with_bytes(
+            victim_device.clone(),
+            victim_lanes.inbound_lane.clone(),
+            crate::model::random_opaque_id(),
+            STANDARD.encode(
+                crate::lane_wrap::wrap_frame(
+                    &compromised_wrap_key,
+                    &crate::direct_frame::encode(&tampered_b64, Some(&genuine_signature)).unwrap(),
+                )
+                .unwrap(),
+            ),
+        );
+        let before = rotator_engine(&chat, alice_rotated)
+            .state
+            .mls_adapter
+            .as_ref()
+            .unwrap()
+            .state_fingerprint()
+            .unwrap();
+
+        deliver_inbox_envelope(
+            rotator_engine_mut(&mut chat, alice_rotated),
+            &victim_device,
+            forged,
+            100,
+        );
+
+        assert_eq!(
+            rotator_engine(&chat, alice_rotated)
+                .state
+                .mls_adapter
+                .as_ref()
+                .unwrap()
+                .state_fingerprint()
+                .unwrap(),
+            before,
+            "a signature bound to one commit must not authenticate another"
+        );
+    }
+
     #[test]
     fn old_wrap_key_without_commit_proof_cannot_trigger_arbitration() {
         let mut chat = paired_direct_chat();
@@ -13087,12 +13191,13 @@ mod tests {
             MlsAdapter::classify_mls_payload(&forged_commit_b64),
             Some(MessageType::MlsCommit)
         );
-        let forged_plaintext =
-            crate::direct_frame::encode(&crate::direct_frame::DirectWrappedFrame {
-                mls_b64: forged_commit_b64,
-                commit_proof: None,
-            })
-            .unwrap();
+        // Tagged as a commit, but carrying a signature of the wrong shape:
+        // the attacker holds a stale wrap key and nothing the peer signed.
+        let forged_plaintext = crate::direct_frame::encode(
+            &forged_commit_b64,
+            Some(&[0_u8; crate::direct_frame::COMMIT_SIGNATURE_LEN]),
+        )
+        .unwrap();
         let forged = Envelope::with_bytes(
             victim_device.clone(),
             inbound_lane,
@@ -13669,10 +13774,10 @@ mod tests {
         let Some(plaintext) = crate::lane_wrap::unwrap_with_cached_keys(&key, None, &raw) else {
             return false;
         };
-        let Ok(frame) = crate::direct_frame::decode(&plaintext) else {
+        let Ok((mls_b64, _)) = crate::direct_frame::decode(&plaintext) else {
             return false;
         };
-        MlsAdapter::classify_mls_payload(&frame.mls_b64) == Some(MessageType::MlsApplication)
+        MlsAdapter::classify_mls_payload(&mls_b64) == Some(MessageType::MlsApplication)
     }
 
     fn envelope_is_host_opaque_direct(envelope: &Envelope) -> bool {
@@ -13986,8 +14091,8 @@ mod tests {
             .ok()?;
         let wrapped = STANDARD.decode(payload).ok()?;
         let plaintext = crate::lane_wrap::unwrap_with_cached_keys(&key, None, &wrapped)?;
-        let frame = crate::direct_frame::decode(&plaintext).ok()?;
-        MlsAdapter::classify_mls_payload(&frame.mls_b64)
+        let (mls_b64, _) = crate::direct_frame::decode(&plaintext).ok()?;
+        MlsAdapter::classify_mls_payload(&mls_b64)
     }
 
     fn deliver_inbox_envelope(

@@ -279,7 +279,7 @@ impl CoreEngine {
         let plaintext = self.unwrap_inbound_plaintext(conversation_id, payload_b64)?;
         crate::direct_frame::decode(&plaintext)
             .ok()
-            .map(|frame| frame.mls_b64)
+            .map(|(mls_b64, _)| mls_b64)
     }
 
     pub(super) fn resolve_inbound_frame(
@@ -291,24 +291,27 @@ impl CoreEngine {
         let payload_b64 = record.envelope.payload_b64().unwrap_or_default();
         if let Some(conversation_id) = self.conversation_id_for_lane(&record.envelope.lane) {
             if let Some(plaintext) = self.unwrap_inbound_plaintext(&conversation_id, payload_b64) {
-                let Ok(frame) = crate::direct_frame::decode(&plaintext) else {
+                let Ok((mls_b64, commit_signature)) = crate::direct_frame::decode(&plaintext)
+                else {
                     return Ok(InboundFrameResolution::Rejected);
                 };
-                let Some(message_type) = MlsAdapter::classify_mls_payload(&frame.mls_b64) else {
+                let Some(message_type) = MlsAdapter::classify_mls_payload(&mls_b64) else {
                     return Ok(InboundFrameResolution::Rejected);
                 };
                 let authenticated_commit = match message_type {
                     MessageType::MlsCommit => {
                         let Some(commit) = self.authenticate_direct_commit(
                             &conversation_id,
-                            &frame.mls_b64,
-                            frame.commit_proof.as_ref(),
+                            &mls_b64,
+                            commit_signature.as_ref(),
                         ) else {
                             return Ok(InboundFrameResolution::Rejected);
                         };
                         Some(commit)
                     }
-                    _ if frame.commit_proof.is_some() => {
+                    // A signature on anything but a commit is a frame whose
+                    // shape does not match what it claims to be.
+                    _ if commit_signature.is_some() => {
                         return Ok(InboundFrameResolution::Rejected);
                     }
                     _ => None,
@@ -323,7 +326,7 @@ impl CoreEngine {
                     conversation_id,
                     peer_user_id,
                     message_type,
-                    payload_b64: frame.mls_b64,
+                    payload_b64: mls_b64,
                     welcome_author: None,
                     authenticated_commit,
                 }));
@@ -365,52 +368,67 @@ impl CoreEngine {
         }))
     }
 
+    /// Establish that a rival commit really came from the counterparty.
+    ///
+    /// MLS cannot say so: by now the local group has merged its own commit for
+    /// the same epoch, and a handshake message for a superseded epoch is
+    /// refused against the current group context before it is ever decrypted.
+    /// Without this the frame would only have to be a syntactically valid
+    /// commit at the right epoch, so a stale wrap key would be enough to force
+    /// a rebuild.
+    ///
+    /// The signature names no one on the wire. A two-party conversation has
+    /// one counterparty, so the candidates are its devices; each is accepted
+    /// only where the MLS member leaf key and the device key the identity
+    /// chain vouches for are the same key, which is the R0 invariant.
     fn authenticate_direct_commit(
         &self,
         conversation_id: &str,
         payload_b64: &str,
-        proof: Option<&crate::direct_frame::DirectCommitProof>,
+        signature: Option<&[u8; crate::direct_frame::COMMIT_SIGNATURE_LEN]>,
     ) -> Option<crate::direct_frame::AuthenticatedDirectCommit> {
-        let proof = proof?;
+        let signature_hex = crate::identity::encode_hex(signature?);
         let conversation = self.state.conversations.get(conversation_id)?;
-        if proof.sender_user_id != conversation.peer_user_id {
-            return None;
-        }
-        let message_epoch = MlsAdapter::protocol_message_epoch(payload_b64).ok()?;
-        if proof.base_epoch != message_epoch {
-            return None;
-        }
-        let trusted_key = self
-            .trusted_device_public_key(&proof.sender_user_id, &proof.sender_device_id)
-            .ok()?;
-        let adapter = self.state.mls_adapter.as_ref()?;
-        let member_key = adapter
-            .member_signature_key(
-                conversation_id,
-                &proof.sender_user_id,
-                &proof.sender_device_id,
-            )
-            .ok()?;
-        if member_key != trusted_key {
-            return None;
-        }
+        let peer_user_id = conversation.peer_user_id.clone();
+        let base_epoch = MlsAdapter::protocol_message_epoch(payload_b64).ok()?;
         let digest = crate::direct_frame::commit_sha256(payload_b64).ok()?;
-        crate::identity::verify_device_payload_signature(
-            &trusted_key,
-            crate::model::signing::direct_commit_arbitration_payload(
-                conversation_id,
-                &proof.sender_user_id,
-                &proof.sender_device_id,
-                proof.base_epoch,
-                &digest,
-            ),
-            &proof.signature,
-        )
-        .ok()?;
-        Some(crate::direct_frame::AuthenticatedDirectCommit {
-            base_epoch: proof.base_epoch,
-            commit_hash: crate::direct_frame::commit_hash(&digest),
-        })
+        let adapter = self.state.mls_adapter.as_ref()?;
+
+        let candidates = adapter
+            .member_device_ids_for_user(conversation_id, &peer_user_id)
+            .ok()?;
+        for device_id in candidates {
+            let Ok(trusted_key) = self.trusted_device_public_key(&peer_user_id, &device_id) else {
+                continue;
+            };
+            let Ok(member_key) =
+                adapter.member_signature_key(conversation_id, &peer_user_id, &device_id)
+            else {
+                continue;
+            };
+            if member_key != trusted_key {
+                continue;
+            }
+            if crate::identity::verify_device_payload_signature(
+                &trusted_key,
+                crate::model::signing::direct_commit_arbitration_payload(
+                    conversation_id,
+                    &peer_user_id,
+                    &device_id,
+                    base_epoch,
+                    &digest,
+                ),
+                &signature_hex,
+            )
+            .is_ok()
+            {
+                return Some(crate::direct_frame::AuthenticatedDirectCommit {
+                    base_epoch,
+                    commit_hash: crate::direct_frame::commit_hash(&digest),
+                });
+            }
+        }
+        None
     }
 
     pub(super) fn adopt_welcome_lanes(

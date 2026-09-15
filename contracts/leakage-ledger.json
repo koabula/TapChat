@@ -909,7 +909,7 @@
       ]
     },
     "localOnly": {
-      "reason": "Never serialized to a host. ProtectedAppMessage is covered separately by protectedFields.",
+      "reason": "Never serialized to a host. ProtectedAppMessage is covered separately by protectedFields, and AuthenticatedDirectCommit is what survives verifying a rival commit's detached signature — an epoch and a hash, with no name left in it.",
       "types": [
         "AuthenticatedDirectCommit",
         "ContactAcceptedBody",
@@ -925,13 +925,6 @@
         "ProtectedAppMessage",
         "ProtectedPayloadKind",
         "SyncCheckpoint"
-      ]
-    },
-    "insideTheWrap": {
-      "reason": "The plaintext of a wrapped direct frame. These are serialized, but into the AEAD that Envelope.bytes carries, so a host sees only ciphertext — the evidence is that append_request.envelope.bytes measures an empty carries set while the fixture frame embeds the conversation sentinel. Worth naming rather than folding into localOnly: DirectCommitProof puts sender_user_id and sender_device_id back inside the frame, under a second signature domain, which is a partial reversal of the decision that removed sender_proof. It is safe where it sits and it is not in the write-up; whether it can be removed is an open question, not an oversight.",
-      "types": [
-        "DirectCommitProof",
-        "DirectWrappedFrame"
       ]
     }
   }
