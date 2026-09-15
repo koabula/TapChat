@@ -210,20 +210,13 @@ impl CoreEngine {
         };
         let expected_origin =
             self.expected_attachment_storage_origin(&conversation_id, &message_id)?;
-        if blob_descriptor.storage_origin.is_empty() {
-            // AttachmentManifestV2 was initially shipped without a storage
-            // origin. Recover those manifests from the sender's signed
-            // identity bundle; never fall back to the receiver's runtime.
-            blob_descriptor.storage_origin = expected_origin;
-        } else {
-            let manifest_origin = normalize_storage_origin(&blob_descriptor.storage_origin)?;
-            if manifest_origin != expected_origin {
-                return Err(CoreError::invalid_input(
-                    "attachment storage origin does not match sender identity",
-                ));
-            }
-            blob_descriptor.storage_origin = manifest_origin;
+        let manifest_origin = normalize_storage_origin(&blob_descriptor.storage_origin)?;
+        if manifest_origin != expected_origin {
+            return Err(CoreError::invalid_input(
+                "attachment storage origin does not match the expected host",
+            ));
         }
+        blob_descriptor.storage_origin = manifest_origin;
         Ok(blob_descriptor)
     }
 
@@ -284,13 +277,58 @@ impl CoreEngine {
         )
     }
 
-    /// Resolve attachment ownership only from authenticated local state. The
-    /// manifest origin must agree with this value before any request is made.
+    fn local_storage_prepare_endpoint(&self) -> CoreResult<String> {
+        Ok(format!(
+            "{}/v1/storage/prepare-upload",
+            self.local_storage_origin()?
+        ))
+    }
+
+    fn direct_peer_user_id(&self, conversation_id: &str) -> CoreResult<String> {
+        self.state
+            .conversations
+            .get(conversation_id)
+            .map(|conversation| conversation.peer_user_id.clone())
+            .ok_or_else(|| CoreError::invalid_state("conversation is unknown"))
+    }
+
+    /// The lane the recipient admits us on. Missing means we were never
+    /// admitted, which is a hard error rather than a silent fallback: a
+    /// fabricated lane would be refused by the recipient's runtime anyway, and
+    /// only after the bytes had been encrypted and a request made.
+    fn direct_outbound_lane(&self, conversation_id: &str) -> CoreResult<String> {
+        self.state
+            .conversations
+            .get(conversation_id)
+            .and_then(|conversation| conversation.lanes.as_ref())
+            .map(|lanes| lanes.outbound_lane.clone())
+            .ok_or_else(|| CoreError::invalid_state("conversation has no outbound lane"))
+    }
+
+    /// Which runtime holds this attachment, resolved only from authenticated
+    /// local state. The manifest origin must agree before any request is made.
+    ///
+    /// Ownership follows the *recipient*, not the author. A 1:1 payload sits
+    /// in the storage of whoever receives it: mine when the peer sent it, the
+    /// peer's when I did. Group payloads keep the old rule and stay with their
+    /// uploader, because a group message has many recipients and "the
+    /// recipient's storage" names none of them.
+    ///
+    /// This is what keeps the sender's infrastructure out of the receiver's
+    /// fetch, and what stops a payload expiring under a retention policy the
+    /// receiver does not set.
     fn expected_attachment_storage_origin(
         &self,
         conversation_id: &str,
         message_id: &str,
     ) -> CoreResult<String> {
+        let is_direct = self
+            .state
+            .conversations
+            .get(conversation_id)
+            .map(|conversation| conversation.conversation.kind == ConversationKind::Direct)
+            .unwrap_or(false);
+
         let local_identity = self
             .state
             .local_identity
@@ -309,11 +347,43 @@ impl CoreEngine {
             item.envelope.conversation_id == conversation_id
                 && item.envelope.message_id == message_id
         });
-        if pending_is_local {
+
+        let authored_locally = pending_is_local
+            || self
+                .state
+                .conversations
+                .get(conversation_id)
+                .and_then(|conversation| {
+                    conversation.messages.iter().find(|message| {
+                        message.message_id == message_id
+                            || message.app_message_id.as_deref() == Some(message_id)
+                    })
+                })
+                .map(|message| {
+                    message.sender_user_id.as_deref() == Some(local_user_id)
+                        || message.sender_device_id == *local_device_id
+                })
+                .unwrap_or(false);
+
+        if is_direct {
+            // The recipient hosts. Mine to send means the peer receives it.
+            if authored_locally {
+                let peer_user_id = self
+                    .state
+                    .conversations
+                    .get(conversation_id)
+                    .map(|conversation| conversation.peer_user_id.clone())
+                    .ok_or_else(|| CoreError::invalid_input("attachment message is missing"))?;
+                return self.contact_storage_origin(&peer_user_id);
+            }
             return self.local_storage_origin();
         }
 
-        let message = self
+        // Group: the uploader hosts, so the origin follows authorship.
+        if authored_locally {
+            return self.local_storage_origin();
+        }
+        let author_user_id = self
             .state
             .conversations
             .get(conversation_id)
@@ -323,33 +393,21 @@ impl CoreEngine {
                         || message.app_message_id.as_deref() == Some(message_id)
                 })
             })
-            .ok_or_else(|| CoreError::invalid_input("attachment message is missing"))?;
-        if message.sender_user_id.as_deref() == Some(local_user_id)
-            || message.sender_device_id == *local_device_id
-        {
-            return self.local_storage_origin();
-        }
-        let sender_user_id = message
-            .sender_user_id
-            .as_deref()
-            .or_else(|| {
-                self.state
-                    .conversations
-                    .get(conversation_id)
-                    .filter(|conversation| {
-                        conversation.conversation.kind == ConversationKind::Direct
-                    })
-                    .map(|conversation| conversation.peer_user_id.as_str())
-            })
+            .and_then(|message| message.sender_user_id.clone())
             .ok_or_else(|| CoreError::invalid_state("attachment sender identity is unavailable"))?;
+        self.contact_storage_origin(&author_user_id)
+    }
+
+    /// The storage origin a contact publishes in its signed bundle.
+    fn contact_storage_origin(&self, user_id: &str) -> CoreResult<String> {
         let storage_origin = self
             .state
             .contacts
-            .get(sender_user_id)
+            .get(user_id)
             .and_then(|contact| contact.bundle.storage_profile.as_ref())
             .and_then(|profile| profile.base_url.as_deref())
             .ok_or_else(|| {
-                CoreError::invalid_state("attachment sender storage profile is unavailable")
+                CoreError::invalid_state("attachment peer storage profile is unavailable")
             })?;
         normalize_storage_origin(storage_origin)
     }
@@ -513,6 +571,33 @@ impl CoreEngine {
             urlencoding::encode(&device_id),
             suffix.trim_start_matches('/')
         ))
+    }
+
+    /// Where a 1:1 payload goes: the recipient's own storage, reached through
+    /// the recipient's inbox.
+    ///
+    /// Derived from the append capability's own endpoint rather than rebuilt
+    /// from parts, because that endpoint is the one the recipient signed. The
+    /// upload is admitted on the same lane and charged against the same quota
+    /// as the envelope that will reference it, so it belongs on the same
+    /// runtime and the same Durable Object.
+    pub(super) fn peer_blob_upload_endpoint(&self, peer_user_id: &str) -> CoreResult<String> {
+        let bundle = self.direct_peer_contact_bundle(peer_user_id)?;
+        let capability = bundle
+            .devices
+            .iter()
+            .filter(|device| device.status == DeviceStatusKind::Active)
+            .find_map(|device| device.inbox_append_capability.as_ref())
+            .ok_or_else(|| {
+                CoreError::invalid_state("recipient inbox append capability is unavailable")
+            })?;
+        let endpoint = capability
+            .endpoint
+            .strip_suffix("/messages")
+            .ok_or_else(|| {
+                CoreError::invalid_input("recipient append endpoint has an unexpected shape")
+            })?;
+        Ok(format!("{endpoint}/blob-upload"))
     }
 
     pub(super) fn local_device_status_document(&self) -> CoreResult<DeviceStatusDocument> {
@@ -1250,22 +1335,31 @@ impl CoreEngine {
                     .as_ref()
                     .map(|bytes| bytes.len() as u64)
                     .unwrap_or(task.descriptor.size_bytes);
-                effects.push(CoreEffect::PrepareBlobUpload {
-                    upload: PrepareBlobUploadRequest {
-                        task_id: task.task_id.clone(),
-                        conversation_id: task.conversation_id.clone(),
-                        group_id: task.group_id.clone(),
-                        storage_scope: Some(if task.group_id.is_some() {
-                            "group".into()
-                        } else {
-                            "direct".into()
-                        }),
-                        message_id: task.message_id.clone(),
-                        variant: task.variant.as_str().into(),
+                // Group payloads stay on the sender's own runtime, authorized
+                // as its owner. A 1:1 payload goes to the recipient's, on the
+                // lane the recipient admits — the same credential the envelope
+                // referencing it will use, so revoking the contact stops both.
+                let upload = if task.group_id.is_some() {
+                    PrepareBlobUploadRequest {
+                        lane: None,
                         size_bytes,
+                        endpoint: self.local_storage_prepare_endpoint()?,
                         headers: BTreeMap::new(),
                         auth: Some(auth.clone()),
-                    },
+                    }
+                } else {
+                    let peer_user_id = self.direct_peer_user_id(&task.conversation_id)?;
+                    PrepareBlobUploadRequest {
+                        lane: Some(self.direct_outbound_lane(&task.conversation_id)?),
+                        size_bytes,
+                        endpoint: self.peer_blob_upload_endpoint(&peer_user_id)?,
+                        headers: BTreeMap::new(),
+                        auth: None,
+                    }
+                };
+                effects.push(CoreEffect::PrepareBlobUpload {
+                    task_id: task.task_id.clone(),
+                    upload,
                 });
             }
             if let Some(entry) = self.state.pending_blob_uploads.get_mut(&task_id) {
@@ -2109,9 +2203,24 @@ impl CoreEngine {
     ) -> CoreResult<CoreOutput> {
         let storage_origin =
             storage_origin_from_download_target(&result.download_target, &result.blob_ref)?;
-        if storage_origin != self.local_storage_origin()? {
+        // The runtime that answered must be the one that will hold the object:
+        // the recipient's for a 1:1 payload, our own for a group one. Checking
+        // it here means a redirected prepare is refused before any ciphertext
+        // leaves, and it is the same rule the receiver applies to the manifest.
+        let pending = self
+            .state
+            .pending_blob_uploads
+            .get(&task_id)
+            .ok_or_else(|| CoreError::invalid_input("unknown blob upload task"))?;
+        let expected_origin = if pending.group_id.is_some() {
+            self.local_storage_origin()?
+        } else {
+            let peer_user_id = self.direct_peer_user_id(&pending.conversation_id)?;
+            self.contact_storage_origin(&peer_user_id)?
+        };
+        if storage_origin != expected_origin {
             return Err(CoreError::invalid_input(
-                "prepared blob download target does not match local storage runtime",
+                "prepared blob download target does not match the expected storage runtime",
             ));
         }
         let task = self

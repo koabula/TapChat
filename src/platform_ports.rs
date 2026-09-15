@@ -239,6 +239,7 @@ pub trait BlobIoPort {
 
     async fn prepare_blob_upload(
         &mut self,
+        task_id: String,
         upload: PrepareBlobUploadRequest,
     ) -> Result<Vec<CoreEvent>>;
 
@@ -374,7 +375,9 @@ where
             }
             CoreEffect::SealGroupOutbox { seal } => ports.seal_group_outbox(seal).await,
             CoreEffect::ReadAttachmentBytes { read } => ports.read_attachment_bytes(read).await,
-            CoreEffect::PrepareBlobUpload { upload } => ports.prepare_blob_upload(upload).await,
+            CoreEffect::PrepareBlobUpload { task_id, upload } => {
+                ports.prepare_blob_upload(task_id, upload).await
+            }
             CoreEffect::UploadBlob { upload } => ports.upload_blob(upload).await,
             CoreEffect::DownloadBlob { download } => ports.download_blob(download).await,
             CoreEffect::DeleteBlob { delete } => ports.delete_blob(delete).await,
@@ -505,6 +508,7 @@ mod tests {
 
         async fn prepare_blob_upload(
             &mut self,
+            _task_id: String,
             _upload: PrepareBlobUploadRequest,
         ) -> Result<Vec<CoreEvent>> {
             self.calls.push("prepare_blob_upload");

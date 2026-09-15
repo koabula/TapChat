@@ -959,6 +959,13 @@ pub enum CoreEffect {
         read: ReadAttachmentBytesEffect,
     },
     PrepareBlobUpload {
+        /// Correlates the reply with the pending upload. Client-local
+        /// bookkeeping, so it stays on the effect and out of the request: it
+        /// is `blob-upload:{message_id}:{variant}`, and the message id in turn
+        /// names the conversation, so sending it would have handed the storage
+        /// host exactly what taking the identifiers out of the object key was
+        /// meant to stop.
+        task_id: String,
         upload: PrepareBlobUploadRequest,
     },
     UploadBlob {

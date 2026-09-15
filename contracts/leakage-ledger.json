@@ -128,7 +128,9 @@
       "Inhabitation (bits) is declared, not yet measured. `constant` and `absent` claims are reviewed by hand until an engine-driven corpus check lands; the structural path set and the carries sets ARE measured.",
       "Compile-time exhaustiveness has holes: serde(flatten), a serde_json::Value-typed field, serde(untagged), or a non-exhaustive match elsewhere would each make these checks go quiet rather than red. None are present in the in-scope types today.",
       "Widening `carries` to silence a red check is still a one-line edit to this file. The generator that made such a widening show up in a published artifact is gone; its replacement is the partition test of the engine-driven corpus, which measures `carries` instead of reading it. Until that lands, this file is trusted where it asserts and checked only where it can be contradicted.",
-      "lane and mid are not sentinels, deliberately. Both are random per-conversation or per-message values, so within one execution they behave like the conversation sentinel and would report where they are carried — but the claim worth testing about a lane is that the two inboxes of one conversation share no token, and that needs a corpus with both sides in it. Adding them against a single-inbox fixture would produce a green that means nothing. Deferred to the engine-driven corpus."
+      "lane and mid are not sentinels, deliberately. Both are random per-conversation or per-message values, so within one execution they behave like the conversation sentinel and would report where they are carried — but the claim worth testing about a lane is that the two inboxes of one conversation share no token, and that needs a corpus with both sides in it. Adding them against a single-inbox fixture would produce a green that means nothing. Deferred to the engine-driven corpus.",
+      "The group-outbox spill keys are assembled inline at services/cloudflare/src/group-outbox/service.ts, not through leakage-keys.ts, so the TS check that every minted template is recorded here cannot see them. This is the same failure the module partition on the Rust side closed, one level down: a key built at a call site is invisible to a check that reads the builders. Not repaired in this round, because repairing it means deciding whether the group-outbox surface enters the enumeration at all, and scope.excludedSurfaces currently says it does not.",
+      "welcome-pickup is the one object named by a digest rather than by a fresh random: it is pure R2 with no Durable Object beside it, so the name has to be one both sides recompute from the capability the fetcher presents. The builder therefore does not itself guarantee the name carries nothing — the caller does, by passing a hash."
     ]
   },
   "sentinels": {
@@ -185,18 +187,11 @@
       "surface": "append_request",
       "path": "envelope.storageRef.ref",
       "bits": "inhabited",
-      "carries": [
-        "conversation",
-        "message_nonce",
-        "recipient_device",
-        "recipient_user",
-        "sender_device",
-        "sender_user"
-      ],
+      "carries": [],
       "signed": false,
       "parameter": "L_ibx",
-      "fate": "to_repair",
-      "note": "tab:inbox requires an opaque key here. Today it is the object key, which names the sending user, device, conversation and message. Same key as the L_stg blob row; one repair closes both (R4)."
+      "fate": "routing",
+      "note": "An opaque key: a namespace and a fresh 256-bit name. It used to name the sending user, the device, the conversation and the message, and the conversation segment was identical at both ends — a token shared across the two inboxes of one conversation, which is exactly what the per-direction lanes and the frame wrap existed to remove. Routing needs the reference; it never needed any of that."
     },
     {
       "surface": "append_request",
@@ -438,6 +433,29 @@
     },
     {
       "surface": "prepare_blob_upload_request",
+      "path": "lane",
+      "bits": "inhabited",
+      "carries": [],
+      "signed": false,
+      "parameter": "L_ibx",
+      "fate": "routing",
+      "note": "The admission credential, and the quota partition. A 1:1 payload is placed in the recipient runtime, which admits the sender on the same lane it admits its envelopes on; revoking the contact deletes one key and stops both."
+    },
+    {
+      "surface": "prepare_blob_upload_request",
+      "path": "endpoint",
+      "bits": "inhabited",
+      "carries": [
+        "recipient_device",
+        "recipient_user"
+      ],
+      "signed": false,
+      "parameter": "L_net",
+      "fate": "accepted",
+      "note": "The destination URL. It names the recipient device because that is the inbox being addressed, which is the same thing the append request line already discloses."
+    },
+    {
+      "surface": "prepare_blob_upload_request",
       "path": "auth.deviceId",
       "bits": "inhabited",
       "carries": [
@@ -469,73 +487,12 @@
     },
     {
       "surface": "prepare_blob_upload_request",
-      "path": "conversationId",
-      "bits": "inhabited",
-      "carries": [
-        "conversation"
-      ],
-      "signed": false,
-      "parameter": "L_stg",
-      "fate": "to_repair"
-    },
-    {
-      "surface": "prepare_blob_upload_request",
-      "path": "groupId",
-      "bits": "inhabited",
-      "carries": [],
-      "signed": false,
-      "parameter": "L_stg",
-      "fate": "to_repair"
-    },
-    {
-      "surface": "prepare_blob_upload_request",
-      "path": "messageId",
-      "bits": "inhabited",
-      "carries": [
-        "conversation",
-        "message_nonce",
-        "recipient_device",
-        "recipient_user"
-      ],
-      "signed": false,
-      "parameter": "L_stg",
-      "fate": "to_repair"
-    },
-    {
-      "surface": "prepare_blob_upload_request",
       "path": "sizeBytes",
       "bits": "inhabited",
       "carries": [],
       "signed": false,
       "parameter": "L_stg",
       "fate": "ideal"
-    },
-    {
-      "surface": "prepare_blob_upload_request",
-      "path": "storageScope",
-      "bits": "inhabited",
-      "carries": [],
-      "signed": false,
-      "parameter": "L_stg",
-      "fate": "accepted"
-    },
-    {
-      "surface": "prepare_blob_upload_request",
-      "path": "taskId",
-      "bits": "inhabited",
-      "carries": [],
-      "signed": false,
-      "parameter": "L_stg",
-      "fate": "accepted"
-    },
-    {
-      "surface": "prepare_blob_upload_request",
-      "path": "variant",
-      "bits": "inhabited",
-      "carries": [],
-      "signed": false,
-      "parameter": "L_stg",
-      "fate": "accepted"
     },
     {
       "surface": "inbox_do_key",
@@ -650,32 +607,23 @@
     },
     {
       "surface": "r2_key",
-      "path": "blobs/{variant}/{ownerUserId}/{ownerDeviceId}/{storageScope}/{groupSegment}/{conversationId}/{messageId}-{taskId}",
+      "path": "blobs/{opaque}",
       "bits": "inhabited",
-      "carries": [
-        "message_nonce",
-        "recipient_device",
-        "recipient_user",
-        "sender_device",
-        "sender_user"
-      ],
+      "carries": [],
       "signed": false,
       "parameter": "L_stg",
-      "fate": "to_repair",
-      "note": "Read access is already gated on an independent 256-bit capability, so these identifiers buy nothing. R4 makes the key opaque."
+      "fate": "accepted",
+      "note": "A fresh 256-bit name. Read access was always gated on an independent capability, so the identifiers this key used to carry bought nothing and cost a cross-inbox token: the same key reached the recipient inbox as envelope.storageRef.ref, and its conversation segment was identical at both ends."
     },
     {
       "surface": "r2_key",
-      "path": "inbox-payload/{deviceId}/{seq}.json",
+      "path": "inbox-payload/{opaque}",
       "bits": "inhabited",
-      "carries": [
-        "recipient_device",
-        "recipient_user"
-      ],
+      "carries": [],
       "signed": false,
       "parameter": "L_stg",
-      "fate": "to_repair",
-      "note": "Stores only ciphertext bytes for spilled records. The path still names the recipient device (C3 / R4)."
+      "fate": "accepted",
+      "note": "A fresh 256-bit name; the inbox records it on the record index, so nothing has to re-derive it."
     },
     {
       "surface": "r2_key",
@@ -713,16 +661,13 @@
     },
     {
       "surface": "r2_key",
-      "path": "welcome-pickup/{groupId}/{deviceId}/{requestId}.json",
+      "path": "welcome-pickup/{opaque}",
       "bits": "inhabited",
-      "carries": [
-        "recipient_device",
-        "recipient_user"
-      ],
+      "carries": [],
       "signed": false,
       "parameter": "L_stg",
-      "fate": "to_repair",
-      "note": "Group-scope, but it shares the single storage bucket, so one operator sees it alongside everything else."
+      "fate": "accepted",
+      "note": "Named by the SHA-256 of the pickup capability: pure R2 with no Durable Object beside it, so the name has to be one both sides recompute. Group scope, but it shares the single bucket."
     },
     {
       "surface": "realtime_event",
@@ -794,8 +739,8 @@
     },
     {
       "field": "app_message_id",
-      "visibility": "duplicated_in_header",
-      "note": "app:{conversation_id}:{nonce}:{sender_device_id} - every component is already in the cleartext header."
+      "visibility": "confidential",
+      "note": "app:{conversation_id}:{nonce}:{sender_device_id}. Nothing in the host view carries it; the earlier claim that the header duplicated it was left over from a header that no longer exists."
     },
     {
       "field": "conversation_id",
@@ -804,11 +749,13 @@
     },
     {
       "field": "sender_user_id",
-      "visibility": "duplicated_in_header"
+      "visibility": "confidential",
+      "note": "The 1:1 envelope header has not named the sender since the header shrank to four fields. Until the object key became opaque this still reached the host through envelope.storageRef.ref, which is why it was recorded as duplicated rather than confidential — a claim about a header that no longer held it."
     },
     {
       "field": "sender_device_id",
-      "visibility": "duplicated_in_header"
+      "visibility": "confidential",
+      "note": "Same as sender_user_id, and transitively worse: a device id names its user."
     },
     {
       "field": "recipient_user_id",

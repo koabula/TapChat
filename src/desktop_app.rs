@@ -2050,15 +2050,11 @@ fn onboarding_step(
 
 fn load_driver(profile: &Profile) -> Result<CoreDriver> {
     let snapshot = profile.load_snapshot()?;
-    let base_url = snapshot
-        .deployment
-        .as_ref()
-        .map(|deployment| deployment.deployment_bundle.inbox_http_endpoint.clone());
     let contact_share_url = profile
         .load_runtime_metadata()
         .ok()
         .and_then(|runtime| build_contact_share_url_from_snapshot(&snapshot, &runtime).ok());
-    CoreDriver::from_snapshot(snapshot, base_url, contact_share_url)
+    CoreDriver::from_snapshot(snapshot, contact_share_url)
 }
 
 async fn run_identity_command(

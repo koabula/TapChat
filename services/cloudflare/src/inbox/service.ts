@@ -188,6 +188,41 @@ export class InboxService {
     return { headSeq: meta.headSeq };
   }
 
+  /**
+   * Authorize a sender to place one payload in this runtime's storage.
+   *
+   * The credential is the lane and nothing else. A lane is admitted only
+   * because the owner of this inbox accepted the contact, and revoking it is
+   * a single key deletion, so the same act that stops a sender appending also
+   * stops it uploading. Issuing a second, storage-specific credential was the
+   * alternative, and it has nowhere to be delivered from: at first contact the
+   * only channel to the recipient runs through this host.
+   *
+   * A sender with no admitted lane cannot upload at all. That is the intent
+   * rather than a gap — an unaccepted stranger can consume a bounded message
+   * request queue, but not storage.
+   *
+   * The quota is charged on the lane because the lane is already the rate
+   * limit partition for appends; a payload and the envelope that references
+   * it are one act, and counting them once each against the same bucket is
+   * what keeps that true.
+   */
+  async authorizeBlobUpload(
+    lane: string,
+    sizeBytes: number,
+    now: number
+  ): Promise<{ accepted: true }> {
+    this.assertOpaqueId(lane, "lane");
+    if (!Number.isSafeInteger(sizeBytes) || sizeBytes <= 0) {
+      throw new HttpError(400, "invalid_input", "sizeBytes is required");
+    }
+    if (!(await this.isAcceptedLane(lane))) {
+      throw new HttpError(403, "invalid_capability", "lane is not admitted by this inbox");
+    }
+    await this.enforceRateLimit(INBOX_DO_KEYS.rateLimit(lane), now);
+    return { accepted: true };
+  }
+
   async registerAcceptedLane(lane: string, now: number): Promise<{ accepted: true; lane: string }> {
     this.assertOpaqueId(lane, "lane");
     await this.state.put(INBOX_DO_KEYS.acceptedLane(lane), { registeredAt: now } satisfies AcceptedLaneRecord);
@@ -383,7 +418,7 @@ export class InboxService {
         inlineBytes: bytes
       };
     } else if (decoded) {
-      const payloadRef = R2_KEYS.inboxPayload(this.deviceId, seq);
+      const payloadRef = R2_KEYS.inboxPayload();
       await this.spillStore.putBytes(payloadRef, decoded);
       index = {
         seq,

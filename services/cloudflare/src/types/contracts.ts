@@ -632,13 +632,15 @@ export interface GetHeadResult {
   headSeq: number;
 }
 
+/**
+ * What a sender tells a storage runtime before placing a payload in it.
+ *
+ * One field, because one field is all the runtime needs. Everything else this
+ * once carried — conversation, message, group, variant, task — existed only to
+ * build a structured object key, and that key reached the recipient's inbox on
+ * the envelope.
+ */
 export interface PrepareBlobUploadRequest {
-  taskId: string;
-  conversationId: string;
-  groupId?: string;
-  storageScope?: "direct" | "group";
-  messageId: string;
-  variant: "original" | "preview";
   sizeBytes: number;
 }
 

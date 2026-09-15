@@ -2229,10 +2229,6 @@ fn unix_time_ms() -> u64 {
 
 fn load_driver(profile: &Profile) -> Result<CoreDriver> {
     let snapshot = profile.load_snapshot()?;
-    let base_url = snapshot
-        .deployment
-        .as_ref()
-        .map(|deployment| deployment.deployment_bundle.inbox_http_endpoint.clone());
     let runtime_secrets = profile.load_runtime_secrets()?;
     let contact_share_url = snapshot.deployment.as_ref().and_then(|deployment| {
         let bundle = deployment.local_bundle.as_ref()?;
@@ -2246,7 +2242,7 @@ fn load_driver(profile: &Profile) -> Result<CoreDriver> {
         )
         .ok()
     });
-    let mut driver = CoreDriver::from_snapshot(snapshot, base_url, contact_share_url)?;
+    let mut driver = CoreDriver::from_snapshot(snapshot, contact_share_url)?;
     driver.set_runtime_credential(profile.load_runtime_credential()?);
     Ok(driver)
 }

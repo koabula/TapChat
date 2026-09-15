@@ -551,17 +551,26 @@ pub struct ClaimGroupLeaveResult {
     pub lease_expires_at: u64,
 }
 
+/// Ask a storage runtime to name an object and issue a token for it.
+///
+/// Two fields reach the host, and the runtime needs both: how many bytes are
+/// coming, and — on the 1:1 path, where the runtime belongs to the recipient
+/// rather than to the sender — the lane it admits the sender on. The
+/// conversation, the message, the group and the variant used to travel here
+/// too, entirely to assemble a structured object key; that key then reached
+/// the recipient's inbox as `envelope.storageRef.ref`, carrying a conversation
+/// segment identical at both ends. Making the key opaque was half the repair.
+/// Not sending what names it is the other half.
+///
+/// `lane` is `None` for group payloads, which stay on the sender's own runtime
+/// and authenticate as its owner: a group message has many recipients, and
+/// "the recipient's storage" names none of them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrepareBlobUploadRequest {
-    pub task_id: String,
-    pub conversation_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub group_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub storage_scope: Option<String>,
-    pub message_id: String,
-    pub variant: String,
+    pub lane: Option<String>,
     pub size_bytes: u64,
+    pub endpoint: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub headers: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

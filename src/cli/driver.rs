@@ -66,7 +66,6 @@ pub struct DriverRuntime {
     latest_snapshot: Option<CorePersistenceSnapshot>,
     notifications: Vec<String>,
     scheduled_timers: Vec<ScheduledTimer>,
-    storage_prepare_url: Option<String>,
     contact_share_url: Option<String>,
     recent_appends: Vec<Envelope>,
     recent_messages: Vec<(String, MessageType)>,
@@ -112,7 +111,6 @@ pub struct PendingMlsArtifacts {
 impl CoreDriver {
     pub fn from_snapshot(
         snapshot: CorePersistenceSnapshot,
-        base_url: Option<String>,
         contact_share_url: Option<String>,
     ) -> Result<Self> {
         let latest_snapshot = snapshot.clone();
@@ -131,9 +129,6 @@ impl CoreDriver {
                 latest_snapshot: Some(latest_snapshot),
                 notifications: Vec::new(),
                 scheduled_timers: Vec::new(),
-                storage_prepare_url: base_url.map(|value| {
-                    format!("{}/v1/storage/prepare-upload", value.trim_end_matches('/'))
-                }),
                 contact_share_url,
                 recent_appends: Vec::new(),
                 recent_messages: Vec::new(),
@@ -1036,16 +1031,15 @@ impl CoreDriver {
 
     async fn prepare_blob_upload(
         &self,
+        task_id: String,
         mut upload: PrepareBlobUploadRequest,
     ) -> Result<Vec<CoreEvent>> {
         let auth = upload.auth.clone();
         self.inject_runtime_authorization(&mut upload.headers, auth.as_ref())?;
-        let url = self
-            .runtime
-            .storage_prepare_url
-            .clone()
-            .ok_or_else(|| anyhow!("storage prepare url is not configured"))?;
-        let mut request = self.runtime.client.post(url);
+        // The core names the destination now. A 1:1 payload goes to the
+        // recipient's runtime, so a single locally configured storage URL can
+        // no longer be the answer.
+        let mut request = self.runtime.client.post(upload.endpoint.clone());
         for (key, value) in &upload.headers {
             request = request.header(key, value);
         }
@@ -1054,21 +1048,18 @@ impl CoreDriver {
             Ok(response) if response.status().is_success() => {
                 let body = response.text().await?;
                 let result = serde_json::from_str(&to_snake_case_json_string(&body)?)?;
-                Ok(vec![CoreEvent::BlobUploadPrepared {
-                    task_id: upload.task_id,
-                    result,
-                }])
+                Ok(vec![CoreEvent::BlobUploadPrepared { task_id, result }])
             }
             Ok(response) => {
                 let status = response.status().as_u16();
                 let body = response.text().await.unwrap_or_default();
                 Ok(vec![CoreEvent::BlobTransferFailed {
-                    task_id: upload.task_id,
+                    task_id,
                     failure: crate::AppErrorV1::from_http_response(status, &body),
                 }])
             }
             Err(_error) => Ok(vec![CoreEvent::BlobTransferFailed {
-                task_id: upload.task_id,
+                task_id,
                 failure: crate::AppErrorV1::network_unavailable(),
             }]),
         }
@@ -2384,9 +2375,10 @@ impl BlobIoPort for CoreDriver {
 
     async fn prepare_blob_upload(
         &mut self,
+        task_id: String,
         upload: PrepareBlobUploadRequest,
     ) -> Result<Vec<CoreEvent>> {
-        CoreDriver::prepare_blob_upload(self, upload).await
+        CoreDriver::prepare_blob_upload(self, task_id, upload).await
     }
 
     async fn upload_blob(&mut self, upload: BlobUploadRequest) -> Result<Vec<CoreEvent>> {
@@ -2624,7 +2616,7 @@ mod tests {
                 },
                 serialized_group_state: Some("{broken".into()),
             });
-        let error = CoreDriver::from_snapshot(snapshot, None, None)
+        let error = CoreDriver::from_snapshot(snapshot, None)
             .err()
             .expect("corrupt snapshot must fail");
         assert!(error.to_string().contains("restore_failed"));

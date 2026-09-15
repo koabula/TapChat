@@ -15,6 +15,22 @@ const CAPABILITY_METADATA_KEY = "read-capability-sha256";
 const DELETE_CAPABILITY_METADATA_KEY = "delete-capability-sha256";
 const BLOB_EXPIRY_METADATA_KEY = "blob-expires-at";
 
+/// The only namespace the capability-gated blob routes may address.
+///
+/// The bucket also holds objects written by other subsystems — the inbox
+/// spill, published bundles, welcome pickups — and none of them carry the
+/// capability metadata these routes expect. Reaching them through here is
+/// never correct, so it is refused by prefix rather than by whatever each
+/// object happens to hold.
+const BLOB_NAMESPACE = "blobs/";
+
+function requireBlobNamespace(blobKey: string): string {
+  if (!blobKey.startsWith(BLOB_NAMESPACE)) {
+    throw new HttpError(404, "blob_not_found", "blob does not exist");
+  }
+  return blobKey;
+}
+
 function requireNonEmpty(value: string | undefined, field: string): string {
   if (!value || value.trim().length === 0) {
     throw new HttpError(400, "invalid_input", `${field} is required`);
@@ -56,37 +72,25 @@ export class StorageService {
     this.retentionMs = Math.max(1, Math.floor(retentionDays)) * 24 * 60 * 60 * 1000;
   }
 
+  /**
+   * Mint a name and a one-shot upload token.
+   *
+   * The only thing this runtime needs to know is how many bytes are coming.
+   * The request used to also carry the conversation, the message, the group
+   * and the variant, all of it solely to assemble a structured key — and that
+   * key then travelled to the recipient's inbox as `envelope.storageRef.ref`,
+   * where its conversation segment was identical at both ends and undid what
+   * the per-direction lanes were for. Removing the identifiers from the key
+   * was not enough on its own: the honest form is not to send them.
+   */
   async prepareUpload(
     input: PrepareBlobUploadRequest,
-    owner: { userId: string; deviceId: string },
     now: number
   ): Promise<PrepareBlobUploadResult> {
-    const taskId = requireNonEmpty(input.taskId, "taskId");
-    const conversationId = requireNonEmpty(input.conversationId, "conversationId");
-    const messageId = requireNonEmpty(input.messageId, "messageId");
-    if (input.variant !== "original" && input.variant !== "preview") {
-      throw new HttpError(400, "invalid_input", "variant must be original or preview");
-    }
     if (!Number.isSafeInteger(input.sizeBytes) || input.sizeBytes <= 0 || input.sizeBytes > MAX_BLOB_BYTES) {
       throw new HttpError(400, "invalid_input", "sizeBytes is outside supported limits");
     }
-    const storageScope = input.storageScope ?? (input.groupId ? "group" : "direct");
-    if (storageScope !== "direct" && storageScope !== "group") {
-      throw new HttpError(400, "invalid_input", "storageScope is invalid");
-    }
-    if (storageScope === "group" && (!input.groupId || input.groupId.trim().length === 0)) {
-      throw new HttpError(400, "invalid_input", "groupId is required for group storage");
-    }
-    const blobKey = R2_KEYS.blob({
-      variant: input.variant,
-      ownerUserId: owner.userId,
-      ownerDeviceId: owner.deviceId,
-      storageScope,
-      groupSegment: storageScope === "group" ? input.groupId! : "direct",
-      conversationId,
-      messageId,
-      taskId
-    });
+    const blobKey = R2_KEYS.blob();
     const uploadExpiresAt = now + SHORT_BLOB_TOKEN_TTL_MS;
     const blobExpiresAt = now + this.retentionMs;
     const readCapability = randomCapability();
@@ -170,19 +174,23 @@ export class StorageService {
     if (!capability) {
       throw new HttpError(403, "invalid_capability", "blob capability cannot be verified");
     }
-    const metadata = await this.store.headBytes(blobKey);
+    const metadata = await this.store.headBytes(requireBlobNamespace(blobKey));
     if (!metadata) {
       throw new HttpError(404, "blob_not_found", "blob does not exist");
+    }
+    // Authorize first, and only then act on the object. The previous order
+    // deleted an object whose expiry metadata was unreadable *before* checking
+    // the capability, which made an unauthenticated request destructive
+    // against anything in the bucket that carries no such metadata.
+    const expectedHash = metadata.customMetadata[CAPABILITY_METADATA_KEY];
+    const actualHash = await capabilityHash(capability);
+    if (!expectedHash || !constantTimeEqual(expectedHash, actualHash)) {
+      throw new HttpError(403, "invalid_capability", "blob capability is not valid for this object");
     }
     const blobExpiresAt = Number(metadata.customMetadata[BLOB_EXPIRY_METADATA_KEY]);
     if (!Number.isSafeInteger(blobExpiresAt) || blobExpiresAt <= now) {
       await this.store.delete(blobKey);
       throw new HttpError(410, "capability_expired", "blob retention period has expired");
-    }
-    const expectedHash = metadata.customMetadata[CAPABILITY_METADATA_KEY];
-    const actualHash = await capabilityHash(capability);
-    if (!expectedHash || !constantTimeEqual(expectedHash, actualHash)) {
-      throw new HttpError(403, "invalid_capability", "blob capability is not valid for this object");
     }
     // Capability verification deliberately completes before R2 exposes a body.
     const range = rangeHeader ? parseRange(rangeHeader, metadata.size) : undefined;
@@ -212,7 +220,7 @@ export class StorageService {
     if (!capability) {
       throw new HttpError(403, "invalid_capability", "delete capability cannot be verified");
     }
-    const metadata = await this.store.headBytes(blobKey);
+    const metadata = await this.store.headBytes(requireBlobNamespace(blobKey));
     if (!metadata) return;
     const expectedHash = metadata.customMetadata[DELETE_CAPABILITY_METADATA_KEY];
     const actualHash = await capabilityHash(capability);

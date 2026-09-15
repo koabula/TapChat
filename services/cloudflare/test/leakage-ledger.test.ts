@@ -136,23 +136,13 @@ const RENDERED: ReadonlyArray<{ surface: string; template: string; key: string }
   },
   {
     surface: "r2_key",
-    template:
-      "blobs/{variant}/{ownerUserId}/{ownerDeviceId}/{storageScope}/{groupSegment}/{conversationId}/{messageId}-{taskId}",
-    key: R2_KEYS.blob({
-      variant: "original",
-      ownerUserId: senderUserId,
-      ownerDeviceId,
-      storageScope: "direct",
-      groupSegment: "direct",
-      conversationId,
-      messageId,
-      taskId: "task-1"
-    })
+    template: "blobs/{opaque}",
+    key: R2_KEYS.blob()
   },
   {
     surface: "r2_key",
-    template: "inbox-payload/{deviceId}/{seq}.json",
-    key: R2_KEYS.inboxPayload(recipientDeviceId, 7)
+    template: "inbox-payload/{opaque}",
+    key: R2_KEYS.inboxPayload()
   },
   {
     surface: "r2_key",
@@ -171,8 +161,13 @@ const RENDERED: ReadonlyArray<{ surface: string; template: string; key: string }
   },
   {
     surface: "r2_key",
-    template: "welcome-pickup/{groupId}/{deviceId}/{requestId}.json",
-    key: R2_KEYS.welcomePickup("group:example", recipientDeviceId, "req-1")
+    // The production caller passes a SHA-256 of the pickup capability, so the
+    // fixture passes one too. Feeding this builder an identifier would be a
+    // fixture that tests a key production never mints.
+    template: "welcome-pickup/{opaque}",
+    key: R2_KEYS.welcomePickup(
+      "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    )
   }
 ];
 

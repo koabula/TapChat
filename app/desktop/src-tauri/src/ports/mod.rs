@@ -1766,6 +1766,7 @@ impl BlobIoPort for DesktopPlatformPorts {
 
     async fn prepare_blob_upload(
         &mut self,
+        task_id: String,
         mut upload: PrepareBlobUploadRequest,
     ) -> Result<Vec<CoreEvent>> {
         let original = upload.clone();
@@ -1773,7 +1774,7 @@ impl BlobIoPort for DesktopPlatformPorts {
             .inject_runtime_authorization(&mut upload.headers, upload.auth.as_ref(), false)
             .await
         {
-            return Ok(vec![blob_prepare_failed_event(&upload.task_id, &error)]);
+            return Ok(vec![blob_prepare_failed_event(&task_id, &error)]);
         }
         // Use transport to prepare upload
         let result = match self.transport.prepare_blob_upload(upload.clone()).await {
@@ -1784,17 +1785,17 @@ impl BlobIoPort for DesktopPlatformPorts {
                     .inject_runtime_authorization(&mut retry.headers, retry.auth.as_ref(), true)
                     .await
                 {
-                    return Ok(vec![blob_prepare_failed_event(&upload.task_id, &error)]);
+                    return Ok(vec![blob_prepare_failed_event(&task_id, &error)]);
                 }
                 upload = retry;
                 match self.transport.prepare_blob_upload(upload.clone()).await {
                     Ok(result) => result,
                     Err(error) => {
-                        return Ok(vec![blob_prepare_failed_event(&upload.task_id, &error)]);
+                        return Ok(vec![blob_prepare_failed_event(&task_id, &error)]);
                     }
                 }
             }
-            Err(error) => return Ok(vec![blob_prepare_failed_event(&upload.task_id, &error)]),
+            Err(error) => return Ok(vec![blob_prepare_failed_event(&task_id, &error)]),
         };
 
         // Emit progress event
@@ -1802,18 +1803,15 @@ impl BlobIoPort for DesktopPlatformPorts {
             let _ = app.emit(
                 "upload-progress",
                 blob_io::UploadProgressEvent::simple(
-                    upload.task_id.clone(),
-                    upload.conversation_id.clone(),
+                    task_id.clone(),
+                    String::new(),
                     10,
                     "preparing",
                 ),
             );
         }
 
-        Ok(vec![CoreEvent::BlobUploadPrepared {
-            task_id: upload.task_id,
-            result,
-        }])
+        Ok(vec![CoreEvent::BlobUploadPrepared { task_id, result }])
     }
 
     async fn upload_blob(&mut self, upload: BlobUploadRequest) -> Result<Vec<CoreEvent>> {

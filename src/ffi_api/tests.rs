@@ -6077,11 +6077,14 @@ mod tests {
             .expect("attachment bytes loaded");
         assert!(prepared.effects.iter().any(|effect| matches!(
             effect,
-            CoreEffect::PrepareBlobUpload { upload }
+            CoreEffect::PrepareBlobUpload { upload, .. }
+                // A 1:1 payload is placed in the recipient's runtime, admitted
+                // on the lane the recipient already admits us on. No runtime
+                // credential of our own takes part: we are a stranger there.
                 if upload.headers.get("Authorization").is_none()
-                    && matches!(upload.auth.as_ref(), Some(TransportAuthRequirement::DeviceRuntime { .. }))
-                    && upload.storage_scope.as_deref() == Some("direct")
-                    && upload.group_id.is_none()
+                    && upload.auth.is_none()
+                    && upload.lane.is_some()
+                    && upload.endpoint.ends_with("/blob-upload")
         )));
         let upload_ready = alice
             .handle_event(CoreEvent::BlobUploadPrepared {
@@ -6248,7 +6251,7 @@ mod tests {
             .expect("encrypt video");
         assert!(prepared.effects.iter().any(|effect| matches!(
             effect,
-            CoreEffect::PrepareBlobUpload { upload } if upload.size_bytes == 20
+            CoreEffect::PrepareBlobUpload { upload, .. } if upload.size_bytes == 20
         )));
         let upload_ready = alice
             .handle_event(CoreEvent::BlobUploadPrepared {
@@ -6761,14 +6764,123 @@ mod tests {
         )));
     }
 
+    /// Payloads are hosted by whoever receives them.
+    ///
+    /// This is what keeps the sender's infrastructure out of the receiver's
+    /// fetch: nothing reports back to the sender that the receiver looked, when,
+    /// or from where. It is also what makes delivery final — the object cannot
+    /// expire under a retention policy the receiver did not set, because the
+    /// runtime holding it is the receiver's own.
+    ///
+    /// Stated as the polarity of the resolved origin, in both directions of one
+    /// conversation, because that is the whole of the claim.
+    #[test]
+    fn a_direct_payload_is_hosted_by_its_recipient() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let bob_user_id = bob_bundle.user_id.clone();
+        let mut engine = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle);
+        // The fixtures share one deployment, so both parties would otherwise
+        // publish the same storage origin and the polarity would be untestable.
+        // Each party provisions its own; give the peer its own here.
+        let bob_storage = "https://storage.bob.example".to_string();
+        engine
+            .state
+            .contacts
+            .get_mut(&bob_user_id)
+            .expect("peer contact")
+            .bundle
+            .storage_profile
+            .as_mut()
+            .expect("peer storage profile")
+            .base_url = Some(bob_storage.clone());
+        let local_device_id = engine
+            .state
+            .local_identity
+            .as_ref()
+            .expect("local identity")
+            .device_identity
+            .device_id
+            .clone();
+
+        // What I send names the peer's runtime; what I receive names mine.
+        let mut outbound = sample_attachment_payload_metadata();
+        outbound.original.storage_origin = bob_storage.clone();
+        let mut inbound = sample_attachment_payload_metadata();
+        inbound.original.object_ref = "blob:inbound".into();
+
+        let message = |message_id: &str, sender_user: &str, sender_device: &str, manifest: &_| {
+            crate::conversation::StoredMessage {
+                message_id: message_id.into(),
+                app_message_id: None,
+                mls_ciphertext_sha256: None,
+                sender_user_id: Some(sender_user.into()),
+                sender_device_id: sender_device.into(),
+                recipient_device_id: "device:recipient".into(),
+                message_type: MessageType::MlsApplication,
+                created_at: 0,
+                plaintext: Some(serde_json::to_string(manifest).expect("manifest")),
+                storage_refs: vec![],
+                delivery_state: None,
+                message_request_id: None,
+            }
+        };
+
+        engine.state.conversations.insert(
+            "conv:test".into(),
+            crate::conversation::LocalConversationState {
+                conversation: crate::model::Conversation {
+                    conversation_id: "conv:test".into(),
+                    kind: ConversationKind::Direct,
+                    member_users: vec!["user:alice".into(), bob_user_id.clone()],
+                    member_devices: vec![],
+                    state: crate::model::ConversationState::Active,
+                    updated_at: 0,
+                },
+                messages: vec![
+                    message("msg:mine", "user:alice", &local_device_id, &outbound),
+                    message("msg:theirs", &bob_user_id, "device:bob:phone", &inbound),
+                ],
+                last_message_type: Some(MessageType::MlsApplication),
+                peer_user_id: bob_user_id,
+                last_known_peer_active_devices: Default::default(),
+                recovery_status: crate::conversation::RecoveryStatus::Healthy,
+                archive_metadata: None,
+                pcs: Default::default(),
+                lanes: None,
+            },
+        );
+
+        // What I send is fetched by the peer, so it sits in the peer's storage.
+        let sent = engine
+            .resolve_attachment_descriptor(
+                "conv:test".into(),
+                "msg:mine".into(),
+                "blob:test".into(),
+            )
+            .expect("outbound descriptor");
+        assert_eq!(sent.storage_origin, bob_storage);
+
+        // What the peer sends is fetched by me, so it sits in mine.
+        let received = engine
+            .resolve_attachment_descriptor(
+                "conv:test".into(),
+                "msg:theirs".into(),
+                "blob:inbound".into(),
+            )
+            .expect("inbound descriptor");
+        assert_eq!(received.storage_origin, "https://storage.example.com");
+        assert_ne!(received.storage_origin, bob_storage);
+    }
+
     #[test]
     fn download_attachment_uses_unique_task_ids_for_distinct_destinations() {
         let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
         let bob_user_id = bob_bundle.user_id.clone();
         let mut engine = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle);
         let conversation_id = "conv:test".to_string();
-        let mut legacy_metadata = sample_attachment_payload_metadata();
-        legacy_metadata.original.storage_origin.clear();
+        // Inbound attachment: the payload sits in our own storage, because
+        // this is the runtime the sender was admitted to place it in.
+        let legacy_metadata = sample_attachment_payload_metadata();
         engine.state.conversations.insert(
             conversation_id.clone(),
             crate::conversation::LocalConversationState {
@@ -7241,13 +7353,14 @@ mod tests {
             .expect("attachment bytes loaded");
         assert!(output.effects.iter().any(|effect| matches!(
             effect,
-            CoreEffect::PrepareBlobUpload { upload }
+            CoreEffect::PrepareBlobUpload { upload, .. }
+                // A 1:1 payload is placed in the recipient's runtime, where we
+                // hold no credential of our own. The lane is the whole of the
+                // authorization, and it is the same lane the envelope that
+                // references the payload will travel on.
                 if upload.headers.get("Authorization").is_none()
-                    && matches!(
-                        upload.auth.as_ref(),
-                        Some(TransportAuthRequirement::DeviceRuntime { runtime_id, device_id: _ })
-                            if runtime_id == "runtime:test"
-                    )
+                    && upload.auth.is_none()
+                    && upload.lane.is_some()
         )));
     }
 
@@ -9363,7 +9476,6 @@ mod tests {
             .local_identity
             .as_ref()
             .expect("local identity");
-        let local_user_id = local_identity.user_identity.user_id.clone();
         let local_device_id = local_identity.device_identity.device_id.clone();
         engine.state.conversations.insert(
             "conv:test".into(),
@@ -9380,9 +9492,11 @@ mod tests {
                     message_id: "msg:download".into(),
                     app_message_id: None,
                     mls_ciphertext_sha256: None,
-                    sender_user_id: Some(local_user_id),
-                    sender_device_id: local_device_id,
-                    recipient_device_id: "device:recipient".into(),
+                    // Inbound: the peer sent it, so the payload sits in our own
+                    // storage and the download is against our own runtime.
+                    sender_user_id: Some("user:bob".into()),
+                    sender_device_id: "device:bob:phone".into(),
+                    recipient_device_id: local_device_id,
                     message_type: MessageType::MlsApplication,
                     created_at: 0,
                     plaintext: Some(
@@ -11128,14 +11242,18 @@ mod tests {
                             })
                             .expect("attachment bytes loaded")
                     }
-                    CoreEffect::PrepareBlobUpload { upload } => {
-                        let scope = if upload.group_id.is_some() {
-                            "group"
-                        } else {
-                            "direct"
-                        };
-                        assert_eq!(upload.storage_scope.as_deref(), Some(scope));
-                        let blob_ref = format!("blob-ref:{}", upload.task_id);
+                    CoreEffect::PrepareBlobUpload { task_id, upload } => {
+                        // This harness drives group conversations, and group
+                        // payloads stay on their uploader's runtime. A 1:1
+                        // payload carries a lane and goes to the recipient's
+                        // runtime instead; if one ever reaches here, the
+                        // uploader-origin answer below would be wrong, so say
+                        // so rather than answer quietly.
+                        assert!(
+                            upload.lane.is_none(),
+                            "group harness received a 1:1 payload upload"
+                        );
+                        let blob_ref = format!("blob-ref:{task_id}");
                         let storage_origin = user
                             .bundle
                             .storage_profile
@@ -11150,7 +11268,7 @@ mod tests {
                             .insert(blob_ref.clone(), download_target.clone());
                         user.engine
                             .handle_event(CoreEvent::BlobUploadPrepared {
-                                task_id: upload.task_id,
+                                task_id,
                                 result: crate::transport_contract::PrepareBlobUploadResult {
                                     blob_ref: blob_ref.clone(),
                                     upload_target: "memory-upload".into(),

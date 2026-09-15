@@ -201,6 +201,17 @@ class MemoryR2Store implements JsonBlobStore {
     return this.map.has(key);
   }
 
+  /**
+   * Object keys under a namespace.
+   *
+   * Spill and blob names are random, so a test can no longer spell one out.
+   * What these tests were ever asserting is that a payload object exists, or
+   * stopped existing — the name was only how they reached it.
+   */
+  keysUnder(prefix: string): string[] {
+    return [...this.map.keys()].filter((key) => key.startsWith(prefix)).sort();
+  }
+
   asBucket(): R2Bucket {
     const self = this;
     return {
@@ -1983,6 +1994,110 @@ test("rate limit is per accepted lane and idempotent retries do not consume extr
   assert.equal(other.status, 200);
 });
 
+async function requestBlobUpload(
+  env: Env,
+  lane: string,
+  sizeBytes = 4,
+  deviceId = "device:bob:phone"
+): Promise<Response> {
+  return handleRequest(
+    new Request(`https://example.com/v1/inbox/${deviceId}/blob-upload`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ lane, sizeBytes })
+    }),
+    env
+  );
+}
+
+test("a payload upload is admitted on the lane and nothing else", async () => {
+  const { env } = createEnv();
+  const bundle = await issueDeviceBundle(env);
+  const admitted = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+  const stranger = "cccccccccccccccccccccccccccccccc";
+  await registerAcceptedLane(env, bundle.runtimeCredential.token, "device:bob:phone", admitted);
+
+  // The sender holds no credential of this runtime's owner. The lane is the
+  // whole of the authorization, and it is the same lane the envelope that
+  // references the payload will travel on: revoking the contact deletes one
+  // key and stops both.
+  const granted = await requestBlobUpload(env, admitted);
+  assert.equal(granted.status, 200);
+  const prepared = (await granted.json()) as { blobRef: string; readCapability: string };
+  assert.match(prepared.blobRef, /^blobs\/[A-Za-z0-9_-]{43}$/);
+  assert.ok(prepared.readCapability);
+
+  // A lane this inbox never admitted buys nothing. An unaccepted stranger can
+  // fill a bounded message-request queue, but not storage.
+  const refused = await requestBlobUpload(env, stranger);
+  assert.equal(refused.status, 403);
+});
+
+test("payload uploads are charged against the lane's own quota", async () => {
+  const { env } = createEnv({ rateLimitPerMinute: "1", rateLimitPerHour: "10" });
+  const bundle = await issueDeviceBundle(env);
+  const admitted = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+  await registerAcceptedLane(env, bundle.runtimeCredential.token, "device:bob:phone", admitted);
+
+  assert.equal((await requestBlobUpload(env, admitted)).status, 200);
+  // Assert the refusal, not the success: a test that only checks the first
+  // call passes just as well with no quota at all.
+  assert.equal((await requestBlobUpload(env, admitted)).status, 429);
+});
+
+test("a delivered payload expires under the retention of the runtime that holds it", async () => {
+  // Delivery is final: content the receiver has already received cannot later
+  // become unavailable. The payload now sits in the recipient's runtime, so
+  // the only retention policy over it is the recipient's own — the sender has
+  // no say, and no way to withdraw it.
+  const { env } = createEnv({ retentionDays: "7" });
+  const bundle = await issueDeviceBundle(env);
+  const admitted = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+  await registerAcceptedLane(env, bundle.runtimeCredential.token, "device:bob:phone", admitted);
+
+  const before = Date.now();
+  const granted = await requestBlobUpload(env, admitted);
+  assert.equal(granted.status, 200);
+  const prepared = (await granted.json()) as { blobExpiresAt: number };
+  const sevenDays = 7 * 24 * 60 * 60 * 1000;
+  assert.ok(
+    prepared.blobExpiresAt >= before + sevenDays,
+    "expiry must follow this runtime's retention, not the uploader's"
+  );
+  assert.ok(prepared.blobExpiresAt <= Date.now() + sevenDays + 5_000);
+});
+
+test("the blob routes cannot reach, or destroy, objects in another namespace", async () => {
+  const { env, bucket } = createEnv();
+  // Written by another subsystem, so it carries none of the capability
+  // metadata the blob routes expect. Reading it used to delete it before any
+  // capability was checked, and its key was derivable from a public user id.
+  await bucket.putBytes("shared-state/user:bob/identity_bundle.json", new TextEncoder().encode("{}"));
+
+  const read = await handleRequest(
+    new Request("https://example.com/v1/storage/blob/shared-state%2Fuser%3Abob%2Fidentity_bundle.json", {
+      headers: { Authorization: "TapChat-Blob anything" }
+    }),
+    env
+  );
+  assert.equal(read.status, 404);
+  assert.equal(
+    bucket.has("shared-state/user:bob/identity_bundle.json"),
+    true,
+    "an unauthenticated read must not be destructive"
+  );
+
+  const remove = await handleRequest(
+    new Request("https://example.com/v1/storage/blob/shared-state%2Fuser%3Abob%2Fidentity_bundle.json", {
+      method: "DELETE",
+      headers: { Authorization: "TapChat-Delete anything" }
+    }),
+    env
+  );
+  assert.equal(remove.status, 404);
+  assert.equal(bucket.has("shared-state/user:bob/identity_bundle.json"), true);
+});
+
 test("prepare-upload requires runtime auth and blob-scoped capability gates access", async () => {
   const { env } = createEnv();
   const bundle = await issueDeviceBundle(env);
@@ -2032,7 +2147,11 @@ test("prepare-upload requires runtime auth and blob-scoped capability gates acce
     blobRef: string;
   };
   assert.equal(prepared.version, CURRENT_MODEL_VERSION);
-  assert.equal(prepared.blobRef, "blobs/original/user:bob/device:bob:phone/direct/direct/conv:alice:bob/msg:blob-task-1");
+  assert.match(
+    prepared.blobRef,
+    /^blobs\/[A-Za-z0-9_-]{43}$/,
+    "the object key is a namespace and a fresh 256-bit name, and nothing else"
+  );
   assert.ok(prepared.downloadTarget);
   assert.ok(prepared.readCapability);
 
@@ -2908,7 +3027,7 @@ test("inbox hard retention advances history floor even while the client is offli
   await service.registerAcceptedLane("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", 500);
   const delivered = await service.appendEnvelope(sampleAppend(), 1_000);
   assert.equal(delivered.seq, 1);
-  assert.equal(spillStore.has("inbox-payload/device:bob:phone/1.json"), true);
+  assert.equal(spillStore.keysUnder("inbox-payload/").length, 1);
 
   await assert.rejects(
     () => service.ack({
@@ -2946,7 +3065,7 @@ test("inbox hard retention advances history floor even while the client is offli
   assert.equal(withoutAck.records.length, 0);
   assert.equal(withoutAck.historyFloorSeq, 1);
   assert.equal(withoutAck.toSeq, 1);
-  assert.equal(spillStore.has("inbox-payload/device:bob:phone/1.json"), false);
+  assert.equal(spillStore.keysUnder("inbox-payload/").length, 0);
 
   await service.ack({
     ack: {
@@ -3072,7 +3191,7 @@ test("inbox DO commit failure retains the spill and retries at the same sequence
   );
   assert.deepEqual(await service.getHead(), { headSeq: 0 });
   assert.equal((await state.list({ prefix: "record:" })).size, 0);
-  assert.ok(await spillStore.getBytes("inbox-payload/device:bob:phone/1.json"));
+  assert.equal(spillStore.keysUnder("inbox-payload/").length, 1);
 
   const committed = await operations.run(() => service.appendEnvelope(request, 1_001));
   assert.deepEqual(committed, { accepted: true, seq: 1 });
@@ -3130,7 +3249,7 @@ test("inbox fetch fails closed when an R2 spill payload is missing", async () =>
 
   await service.registerAcceptedLane("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", 500);
   await service.appendEnvelope(sampleAppend(), 1_000);
-  await spillStore.delete("inbox-payload/device:bob:phone/1.json");
+  await spillStore.delete(spillStore.keysUnder("inbox-payload/")[0]);
 
   await assert.rejects(
     () => service.fetchMessages({ deviceId: "device:bob:phone", fromSeq: 1, limit: 10 }),

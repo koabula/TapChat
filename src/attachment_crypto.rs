@@ -56,10 +56,15 @@ impl AttachmentVariant {
 pub struct EncryptedBlobDescriptor {
     pub variant: AttachmentVariant,
     pub object_ref: String,
-    /// Stable origin of the user-provisioned storage runtime that owns the
-    /// object. Older manifests omit this field; the receiver then derives it
-    /// from the sender's signed identity bundle instead of its local runtime.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
+    /// The user-provisioned storage runtime that holds the object.
+    ///
+    /// For a 1:1 payload that is the *recipient's* runtime, so the sender's
+    /// infrastructure takes no part in the fetch and the object cannot expire
+    /// under a retention policy the recipient did not set. Group payloads stay
+    /// with their uploader. Either way the receiver re-derives the value it
+    /// expects from local authenticated state and refuses a manifest that
+    /// disagrees, so this field locates the object without being trusted for
+    /// where it may point.
     pub storage_origin: String,
     pub read_capability: String,
     pub mime_type: String,
@@ -666,7 +671,7 @@ mod tests {
     }
 
     #[test]
-    fn manifest_v2_accepts_legacy_cipher_metadata_without_chunk_size() {
+    fn manifest_v2_accepts_cipher_metadata_without_chunk_size() {
         let legacy = r#"{
           "version":2,
           "attachment_id":"attachment:legacy",
@@ -674,6 +679,7 @@ mod tests {
           "original":{
             "variant":"original",
             "object_ref":"blob:legacy",
+            "storage_origin":"https://storage.example",
             "read_capability":"cap",
             "mime_type":"application/octet-stream",
             "plaintext_size":1,

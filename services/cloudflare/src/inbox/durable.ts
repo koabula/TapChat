@@ -210,6 +210,16 @@ export async function handleInboxDurableRequest(
       return jsonResponse(result);
     }
 
+    if (url.pathname.endsWith("/blob-upload") && request.method === "POST") {
+      const body = await readJsonLimited<{ lane?: string; sizeBytes?: number }>(
+        request,
+        deps.messageRequestMaxBodyBytes ?? DEFAULT_MESSAGE_REQUEST_MAX_BODY_BYTES
+      );
+      return jsonResponse(
+        await service.authorizeBlobUpload(body.lane ?? "", body.sizeBytes ?? 0, now)
+      );
+    }
+
     const acceptedLaneMatch = url.pathname.match(/\/accepted-lanes\/([^/]+)$/);
     if (acceptedLaneMatch && request.method === "PUT") {
       const lane = decodeURIComponent(acceptedLaneMatch[1]);

@@ -676,21 +676,16 @@ pub(crate) fn maximal_append_request() -> crate::transport_contract::AppendEnvel
         mid,
         bytes: Some(base64::engine::general_purpose::STANDARD.encode(wrapped)),
         storage_ref: Some(EnvelopeStorageRef {
-            // The production key template, not an abbreviation of it:
-            // `blobs/{variant}/{ownerUserId}/{ownerDeviceId}/{storageScope}/
-            //  {groupSegment}/{conversationId}/{messageId}-{taskId}`.
-            // Shortening the last three segments to `conv/msg-task` is what
-            // kept this ref from ever reporting the conversation it names.
+            // The production key: a namespace and a fresh 256-bit name. It
+            // used to be assembled from the sending user, the device, the
+            // conversation and the message, and this field is how that key
+            // reached the recipient's inbox — the conversation segment being
+            // identical at both ends of a conversation is what the
+            // per-direction lanes existed to prevent.
             object_ref: format!(
-                "blobs/original/user:{}/device:{}:{}/direct/direct/{}/msg:{}:{}:device:{}:{}-task-1",
-                sentinel::SENDER_USER_FP,
-                sentinel::SENDER_USER_FP,
-                sentinel::SENDER_DEVICE_FP,
-                conversation_id,
-                conversation_id,
-                sentinel::MESSAGE_NONCE,
-                sentinel::RECIPIENT_USER_FP,
-                sentinel::RECIPIENT_DEVICE_FP,
+                "blobs/{}",
+                base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .encode(crate::model::random_opaque_id().as_bytes())
             ),
             size: 4096,
         }),
@@ -801,16 +796,12 @@ pub(crate) fn inbox_path_surfaces() -> Vec<(&'static str, Value)> {
         (
             "prepare_blob_upload_request",
             host_view(&PrepareBlobUploadRequest {
-                task_id: "task-1".to_string(),
-                conversation_id: conversation_id.to_string(),
-                message_id: format!(
-                    "msg:{conversation_id}:{}:{recipient_device_id}",
-                    sentinel::MESSAGE_NONCE
-                ),
-                variant: "original".to_string(),
+                lane: Some(crate::model::random_opaque_id()),
                 size_bytes: 4096,
-                storage_scope: Some("direct".to_string()),
-                group_id: Some("group:example".to_string()),
+                endpoint: format!(
+                    "https://runtime.example/v1/inbox/{}/blob-upload",
+                    urlencoding_colon(&recipient_device_id)
+                ),
                 headers: BTreeMap::new(),
                 auth: auth.clone(),
             }),

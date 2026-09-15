@@ -461,12 +461,10 @@ impl DesktopTransport {
         &self,
         request: PrepareBlobUploadRequest,
     ) -> Result<PrepareBlobUploadResult> {
-        let base_url = self
-            .get_base_url()
-            .await
-            .ok_or_else(|| anyhow::anyhow!("no base URL configured"))?;
-
-        let url = format!("{}/v1/storage/prepare-upload", base_url);
+        // The core names the destination. A 1:1 payload is placed in the
+        // recipient's runtime, so the locally configured base URL is no longer
+        // the right answer for every upload.
+        let url = request.endpoint.clone();
 
         // Serialize to snake_case JSON, then convert to camelCase for server
         let snake_case_body = serde_json::to_string(&request)?;

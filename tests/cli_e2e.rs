@@ -4204,7 +4204,7 @@ fn import_deployment_and_enroll(
 ) -> Result<()> {
     let mut profile = open_test_profile(profile_root)?;
     let snapshot = profile.load_snapshot()?;
-    let mut driver = CoreDriver::from_snapshot(snapshot, None, None)?;
+    let mut driver = CoreDriver::from_snapshot(snapshot, None)?;
     let identity = driver
         .local_identity()
         .cloned()

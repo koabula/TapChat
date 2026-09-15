@@ -1,11 +1,11 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use futures_util::StreamExt;
 use reqwest::Client;
 use tapchat_core::conversation::RecoveryStatus;
-use tapchat_core::external_fetch::{ExternalResourceKind, fetch_external_json};
+use tapchat_core::external_fetch::{fetch_external_json, ExternalResourceKind};
 use tapchat_core::ffi_api::{
     CoreCommand, CoreEffect, CoreEngine, CoreEvent, CoreOutput, HttpMethod, PersistStateEffect,
     RealtimeEvent, RealtimeSessionSnapshot, RecoveryContextSnapshot, SyncCheckpointSnapshot,
@@ -15,8 +15,8 @@ use tapchat_core::model::{
 };
 use tapchat_core::persistence::CorePersistenceSnapshot;
 use tapchat_core::platform_ports::{
-    BlobIoPort, NotificationPort, PersistencePort, RealtimePort, SecureStoragePort, TimerPort,
-    TransportPort, execute_platform_effect,
+    execute_platform_effect, BlobIoPort, NotificationPort, PersistencePort, RealtimePort,
+    SecureStoragePort, TimerPort, TransportPort,
 };
 use tapchat_core::transport_contract::{
     AppendEnvelopeRequest, BlobDownloadRequest, BlobUploadRequest, FetchIdentityBundleRequest,
@@ -26,9 +26,9 @@ use tapchat_core::transport_contract::{
 };
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
-use tokio::time::{Duration, Instant, timeout};
+use tokio::time::{timeout, Duration, Instant};
 use tokio_tungstenite::connect_async;
-use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest};
+use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
 
 use tapchat_core::transport_contract::json_case::{
     to_camel_case_json_string, to_snake_case_json_string,
@@ -48,7 +48,6 @@ pub struct DriverRuntime {
     latest_snapshot: Option<CorePersistenceSnapshot>,
     notifications: Vec<String>,
     scheduled_timers: Vec<(String, u64)>,
-    storage_prepare_url: Option<String>,
     recent_appends: Vec<Envelope>,
     recent_messages: Vec<(String, MessageType)>,
     injected_identity_fetch_failures: BTreeMap<String, Vec<bool>>,
@@ -80,14 +79,7 @@ pub struct PendingMlsArtifacts {
 }
 
 impl CoreDriver {
-    pub fn new() -> Result<Self> {
-        Self::new_with_storage_base(None)
-    }
-
-    pub fn from_snapshot(
-        snapshot: CorePersistenceSnapshot,
-        base_url: Option<String>,
-    ) -> Result<Self> {
+    pub fn from_snapshot(snapshot: CorePersistenceSnapshot) -> Result<Self> {
         let latest_snapshot = snapshot.clone();
         let (websocket_tx, websocket_rx) = mpsc::unbounded_channel();
         let engine = CoreEngine::try_from_restored_state(snapshot)
@@ -104,9 +96,6 @@ impl CoreDriver {
                 latest_snapshot: Some(latest_snapshot),
                 notifications: Vec::new(),
                 scheduled_timers: Vec::new(),
-                storage_prepare_url: base_url.map(|value| {
-                    format!("{}/v1/storage/prepare-upload", value.trim_end_matches('/'))
-                }),
                 recent_appends: Vec::new(),
                 recent_messages: Vec::new(),
                 injected_identity_fetch_failures: BTreeMap::new(),
@@ -115,7 +104,7 @@ impl CoreDriver {
         })
     }
 
-    pub fn new_with_storage_base(base_url: Option<String>) -> Result<Self> {
+    pub fn new() -> Result<Self> {
         let (websocket_tx, websocket_rx) = mpsc::unbounded_channel();
         Ok(Self {
             engine: CoreEngine::new(),
@@ -129,9 +118,6 @@ impl CoreDriver {
                 latest_snapshot: None,
                 notifications: Vec::new(),
                 scheduled_timers: Vec::new(),
-                storage_prepare_url: base_url.map(|value| {
-                    format!("{}/v1/storage/prepare-upload", value.trim_end_matches('/'))
-                }),
                 recent_appends: Vec::new(),
                 recent_messages: Vec::new(),
                 injected_identity_fetch_failures: BTreeMap::new(),
@@ -943,14 +929,13 @@ impl CoreDriver {
 
     async fn prepare_blob_upload(
         &self,
+        task_id: String,
         upload: PrepareBlobUploadRequest,
     ) -> Result<Vec<CoreEvent>> {
-        let url = self
-            .runtime
-            .storage_prepare_url
-            .clone()
-            .ok_or_else(|| anyhow!("storage prepare url is not configured"))?;
-        let mut request = self.runtime.client.post(url);
+        // The core names the destination now: a 1:1 payload goes to the
+        // recipient's runtime, so one locally configured storage URL can no
+        // longer be the answer.
+        let mut request = self.runtime.client.post(upload.endpoint.clone());
         for (key, value) in &upload.headers {
             request = request.header(key, value);
         }
@@ -959,21 +944,18 @@ impl CoreDriver {
             Ok(response) if response.status().is_success() => {
                 let body = response.text().await?;
                 let result = serde_json::from_str(&to_snake_case_json_string(&body)?)?;
-                Ok(vec![CoreEvent::BlobUploadPrepared {
-                    task_id: upload.task_id,
-                    result,
-                }])
+                Ok(vec![CoreEvent::BlobUploadPrepared { task_id, result }])
             }
             Ok(response) => {
                 let status = response.status().as_u16();
                 let body = response.text().await.unwrap_or_default();
                 Ok(vec![CoreEvent::BlobTransferFailed {
-                    task_id: upload.task_id,
+                    task_id,
                     failure: tapchat_core::AppErrorV1::from_http_response(status, &body),
                 }])
             }
             Err(_error) => Ok(vec![CoreEvent::BlobTransferFailed {
-                task_id: upload.task_id,
+                task_id,
                 failure: tapchat_core::AppErrorV1::network_unavailable(),
             }]),
         }
@@ -1184,9 +1166,10 @@ impl BlobIoPort for CoreDriver {
 
     async fn prepare_blob_upload(
         &mut self,
+        task_id: String,
         upload: PrepareBlobUploadRequest,
     ) -> Result<Vec<CoreEvent>> {
-        CoreDriver::prepare_blob_upload(self, upload).await
+        CoreDriver::prepare_blob_upload(self, task_id, upload).await
     }
 
     async fn upload_blob(&mut self, upload: BlobUploadRequest) -> Result<Vec<CoreEvent>> {
@@ -1332,7 +1315,7 @@ fn merge_outputs(mut left: CoreOutput, right: CoreOutput) -> CoreOutput {
 
 #[cfg(test)]
 mod tests {
-    use super::{CoreDriver, parse_realtime_event};
+    use super::{parse_realtime_event, CoreDriver};
 
     #[test]
     fn driver_restore_failure_does_not_create_empty_engine() {
@@ -1350,7 +1333,7 @@ mod tests {
                 },
                 serialized_group_state: Some("{broken".into()),
             });
-        let error = CoreDriver::from_snapshot(snapshot, None)
+        let error = CoreDriver::from_snapshot(snapshot)
             .err()
             .expect("corrupt snapshot must fail");
         assert!(error.to_string().contains("restore_failed"));

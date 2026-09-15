@@ -515,7 +515,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       return jsonResponse({ runtimeCredential: await issueDeviceRuntimeAuth(env, userId, deviceId, result.registrationVersion, now) });
     }
 
-    const inboxMatch = url.pathname.match(/^\/v1\/inbox\/([^/]+)\/(messages|ack|head|subscribe|accepted-lanes(?:\/[^/]+)?|message-requests(?:\/[^/]+\/(?:accept|reject))?)$/);
+    const inboxMatch = url.pathname.match(/^\/v1\/inbox\/([^/]+)\/(messages|ack|head|subscribe|blob-upload|accepted-lanes(?:\/[^/]+)?|message-requests(?:\/[^/]+\/(?:accept|reject))?)$/);
     if (inboxMatch) {
       const deviceId = decodeURIComponent(inboxMatch[1]);
       const operation = inboxMatch[2];
@@ -548,6 +548,19 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
         operation.startsWith("message-requests/")
       ) {
         await validateRegisteredRuntimeAuthorizationForDevice(request, env, deviceId, "inbox_manage", now);
+      }
+
+      // A payload above the inline threshold is placed in this runtime's
+      // storage by the sender, admitted on the lane and charged against the
+      // lane's quota. The Durable Object decides both, because that is where
+      // the admitted set and the rate limit already live; the token is minted
+      // here afterwards, because that is where the signing secret is.
+      if (request.method === "POST" && operation === "blob-upload") {
+        const bodyText = await readRequestTextLimited(request, CONTROL_JSON_MAX_BYTES);
+        const grant = await stub.fetch(forwardRequestWithBody(request, bodyText));
+        if (!grant.ok) return grant;
+        const { sizeBytes } = JSON.parse(bodyText) as { sizeBytes?: number };
+        return jsonResponse(await store.prepareUpload({ sizeBytes: sizeBytes ?? 0 }, now));
       }
 
       if (request.method !== "GET" && request.method !== "HEAD") {
@@ -852,11 +865,14 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       }
     }
 
+    // The owner's own devices uploading to their own runtime. Group payloads
+    // stay here: a group message has many recipients and "the recipient's
+    // storage" names none of them, so only the 1:1 path moves to the
+    // recipient (see /v1/inbox/{deviceId}/blob-upload).
     if (request.method === "POST" && url.pathname === "/v1/storage/prepare-upload") {
-      const auth = await validateRegisteredRuntimeAuthorization(request, env, "storage_prepare_upload", now);
+      await validateRegisteredRuntimeAuthorization(request, env, "storage_prepare_upload", now);
       const body = await readJsonLimited<PrepareBlobUploadRequest>(request, CONTROL_JSON_MAX_BYTES);
-      const result = await store.prepareUpload(body, { userId: auth.userId, deviceId: auth.deviceId }, now);
-      return jsonResponse(result);
+      return jsonResponse(await store.prepareUpload(body, now));
     }
 
     const uploadMatch = url.pathname.match(/^\/v1\/storage\/upload\/(.+)$/);

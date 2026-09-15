@@ -840,13 +840,7 @@ test("runtime integration: storage prepare-upload/upload/download uses real R2 b
 
   const bundle = await issueDeviceBundle(mf, "user:bob", "device:bob:laptop");
   const token = bundle.runtimeCredential.token;
-  const request: PrepareBlobUploadRequest = {
-    taskId: "task-1",
-    conversationId: "conv:alice:bob",
-    messageId: "msg:blob-1",
-    variant: "original",
-    sizeBytes: 4
-  };
+  const request: PrepareBlobUploadRequest = { sizeBytes: 4 };
   const prepareResponse = await mf.dispatchFetch(`${BASE_URL}/v1/storage/prepare-upload`, {
     method: "POST",
     headers: {
