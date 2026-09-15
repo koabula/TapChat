@@ -74,16 +74,17 @@
       "support": {
         "reason": "Signature framing, error plumbing, logging, filesystem helpers, outbound fetch, and this checker itself. Nothing here defines a type that is serialized anywhere.",
         "prefixes": [
-          "src/model/signing.rs",
-          "src/model/welcome_pickup_property_tests.rs",
-          "src/transport_contract/json_case.rs",
           "src/error.rs",
           "src/error_codes_generated.rs",
-          "src/logging.rs",
-          "src/log_sanitize.rs",
-          "src/fs_util.rs",
           "src/external_fetch.rs",
-          "src/leakage_ledger.rs"
+          "src/fs_util.rs",
+          "src/leakage_corpus.rs",
+          "src/leakage_ledger.rs",
+          "src/log_sanitize.rs",
+          "src/logging.rs",
+          "src/model/signing.rs",
+          "src/model/welcome_pickup_property_tests.rs",
+          "src/transport_contract/json_case.rs"
         ]
       }
     },
@@ -94,8 +95,9 @@
       },
       {
         "channel": "ciphertext_length",
-        "checked": false,
-        "note": "Rotation is now the loudest thing on a lane. A rotation carries the rotating party's whole signed bundle rather than a reference to it — roughly four to six times an ordinary message, separable by size alone — and rotation is triggered by how many messages a party has itself sent, so the two directions of one conversation rotate on correlated schedules. Both inboxes therefore show a size-distinctive, time-correlated periodic event. This stays inside the ceiling tab:inbox already concedes (volume and timing), and it bought the counterparty callback and Definition 3; it is recorded because a repair that moves a conceded parameter should be written down, and it is the first quantity the partition test should measure rather than estimate."
+        "checked": true,
+        "note": "Measured, not conceded: the corpus derives a `#len` leaf for every string a host sees, and a payload's length reports as carrying the message it wraps. The assertion is the ideal's own statement about `|m|` - content may reach the host as a length and in no other shape. Rotation is now the loudest thing on a lane. A rotation carries the rotating party's whole signed bundle rather than a reference to it — roughly four to six times an ordinary message, separable by size alone — and rotation is triggered by how many messages a party has itself sent, so the two directions of one conversation rotate on correlated schedules. Both inboxes therefore show a size-distinctive, time-correlated periodic event. This stays inside the ceiling tab:inbox already concedes (volume and timing), and it bought the counterparty callback and Definition 3; it is recorded because a repair that moves a conceded parameter should be written down, and it is the first quantity the partition test should measure rather than estimate.",
+        "measuredBy": "only_a_payloads_size_reaches_the_host"
       },
       {
         "channel": "inter_arrival_timing",
@@ -108,8 +110,9 @@
       },
       {
         "channel": "mls_frame_header_epoch_and_content_type",
-        "checked": false,
-        "note": "PrivateMessage.epoch and content_type are cleartext in every frame and identical at both inboxes; not a sentinel so not caught by Check X. Removed by the R3 frame wrap."
+        "checked": true,
+        "note": "PrivateMessage.group_id, epoch and content_type are cleartext in every frame and identical at both inboxes, which is why the lane wrap exists. Measured now rather than argued: the corpus parses a frame header out of any payload it can, at each offset a frame can begin at, and finds none - while making the wrap a pass-through puts the conversation id at both inboxes and fails the assertion. The first attempt at this probe was silent because direct_frame prefixes a tag byte, which hid the header without the wrap doing any work; the offsets close that.",
+        "measuredBy": "host_view_shares_no_token_across_inboxes"
       },
       {
         "channel": "retention_window",
@@ -123,15 +126,18 @@
       }
     ],
     "limits": [
-      "Containment is not information. This checks for a sentinel SUBSTRING, so any leak that is a FUNCTION of a secret - a hash, a size bucket, a first byte, a few bits of tag - passes clean. This limit has already bitten once, and not in the way it was written: the prediction named hashing conversation_id as the trigger, while what actually happened is that R3 made it random, after which every field carrying it reported clean. The repair was to capture the generated value as a sentinel, which works only because one value is shared across the fixtures; it does nothing for a genuine hash.",
+      "Containment is not information, and on the TypeScript side that is still the only question asked: the key checks look for a sentinel SUBSTRING, so a key that was a hash or a bucket of a secret would pass clean. It is tolerable there because the key builders are pure functions of their arguments and the test renders them on known inputs. On the Rust side the limit is gone: src/leakage_corpus.rs measures `carries` by varying real secrets across real engine runs and comparing partitions, which catches a hash exactly as it catches the cleartext. The hash is not hypothetical — a SHA-256 of the sender's user id inserted as a header was reported as carrying that identity, and the substring check is provably silent on it.",
       "Non-syntactic channels are not modelled at all; see nonSyntacticLeakage, where checked:false records that their absence is a decision and not an oversight.",
       "`fate` uses the Fate column's vocabulary, but nothing here checks that the write-up actually assigns that fate. CI proves a human recorded a decision in a coordinate system the write-up cannot silently rename, not that the two agree. That reconciliation is still by hand, and it is deliberately the only coupling: a generator that rendered these entries into a table the write-up did not read was deleted rather than repaired.",
-      "Inhabitation (bits) is declared, not yet measured. `constant` and `absent` claims are reviewed by hand until an engine-driven corpus check lands; the structural path set and the carries sets ARE measured.",
+      "Inhabitation (bits) is measured asymmetrically, because that is all a finite script can support. `constant` and `absent` are refutable and are refuted: one varying observation in the corpus fails the row. `inhabited` is not established by the corpus, because a value this script holds still - a sequence number, the single runtime id both parties share here - moves in a longer execution, and declaring it constant would be a false claim about the protocol. So an `inhabited` row the corpus never sees vary is corroborated where it can be and left standing otherwise.",
       "Compile-time exhaustiveness has holes: serde(flatten), a serde_json::Value-typed field, serde(untagged), or a non-exhaustive match elsewhere would each make these checks go quiet rather than red. None are present in the in-scope types today.",
-      "Widening `carries` to silence a red check is still a one-line edit to this file. The generator that made such a widening show up in a published artifact is gone; its replacement is the partition test of the engine-driven corpus, which measures `carries` instead of reading it. Until that lands, this file is trusted where it asserts and checked only where it can be contradicted.",
-      "lane and mid are not sentinels, deliberately. Both are random per-conversation or per-message values, so within one execution they behave like the conversation sentinel and would report where they are carried — but the claim worth testing about a lane is that the two inboxes of one conversation share no token, and that needs a corpus with both sides in it. Adding them against a single-inbox fixture would produce a green that means nothing. Deferred to the engine-driven corpus.",
+      "Widening `carries` to silence a red is still a one-line edit to this file, but it no longer helps: host_view_is_a_function_of_l compares the measured set to the declared one by EQUALITY in both directions, so a row that claims more than the corpus observes fails exactly as loudly as one that claims less.",
+      "lane and mid are not sentinels and do not need to be: the claim worth testing about a lane is that the two inboxes of one conversation share no token, and host_view_shares_no_token_across_inboxes states exactly that over a corpus with both sides in it. Collapsing new_lane_pair to one value, or removing the lane wrap so the MLS frame header is readable, each makes it red.",
       "The group-outbox spill keys are assembled inline at services/cloudflare/src/group-outbox/service.ts, not through leakage-keys.ts, so the TS check that every minted template is recorded here cannot see them. This is the same failure the module partition on the Rust side closed, one level down: a key built at a call site is invisible to a check that reads the builders. Not repaired in this round, because repairing it means deciding whether the group-outbox surface enters the enumeration at all, and scope.excludedSurfaces currently says it does not.",
-      "welcome-pickup is the one object named by a digest rather than by a fresh random: it is pure R2 with no Durable Object beside it, so the name has to be one both sides recompute from the capability the fetcher presents. The builder therefore does not itself guarantee the name carries nothing — the caller does, by passing a hash."
+      "welcome-pickup is the one object named by a digest rather than by a fresh random: it is pure R2 with no Durable Object beside it, so the name has to be one both sides recompute from the capability the fetcher presents. The builder therefore does not itself guarantee the name carries nothing — the caller does, by passing a hash.",
+      "The corpus varies six inputs: each party's identity, each party's message text, the attachment's name and its length. A field determined by an input held fixed measures as constant, and a field determined by one generated per execution measures as fresh. The device key is the case that matters: it is minted at enrolment, not supplied, so no matrix separates it, and `recipient_device` accordingly left the carries vocabulary on the Rust surfaces. In the modelled scope of one device per party it adds nothing to `recipient_user`, and within a single execution the cross-inbox assertion covers it.",
+      "The corpus's recorder plays the host, and every value it writes on the host's behalf - a sequence number, an object name, a first-contact request id - is minted the way the real host mints it and never derived from what the client sent. This is the one hand-maintained edge in the mechanism. Deriving a blob name from the client's task id, for instance, would manufacture a conversation identifier into storageRef.ref, and the red would be the recorder's fault rather than the protocol's.",
+      "Relocation is not in the corpus. Its host-visible delta is an endpoint origin, which belongs to L_net and is already accepted there; the signed bundle and the new inbound lane it announces ride inside the wrap, where the host sees only a payload length."
     ]
   },
   "sentinels": {
@@ -157,11 +163,125 @@
   },
   "entries": [
     {
+      "surface": "ack_request",
+      "path": "@auth.deviceId",
+      "bits": "inhabited",
+      "carries": [
+        "recipient_user"
+      ],
+      "parameter": "L_ibx",
+      "fate": "routing",
+      "note": "Names a device, and through the device id's first segment its owner. `recipient_device` left the carries vocabulary when the corpus started measuring rather than declaring: a device key is minted per enrolment and is not a run input, so no matrix can separate it. In the modelled scope of one device per party it also adds nothing to `recipient_user`, and within one execution the cross-inbox assertion covers it."
+    },
+    {
+      "surface": "ack_request",
+      "path": "@auth.runtimeId",
+      "bits": "inhabited",
+      "carries": [],
+      "parameter": "L_ibx",
+      "fate": "accepted"
+    },
+    {
+      "surface": "ack_request",
+      "path": "@auth.type",
+      "bits": "constant",
+      "value": "device_runtime",
+      "carries": [],
+      "parameter": "L_ibx",
+      "fate": "accepted"
+    },
+    {
+      "surface": "ack_request",
+      "path": "@header.Content-Type",
+      "bits": "constant",
+      "value": "application/json",
+      "carries": [],
+      "parameter": "L_ibx",
+      "fate": "accepted"
+    },
+    {
+      "surface": "ack_request",
+      "path": "@url",
+      "bits": "inhabited",
+      "carries": [
+        "recipient_user"
+      ],
+      "parameter": "L_ibx",
+      "fate": "routing",
+      "note": "The route names the destination device, which is the one field routing cannot do without. Measured on the URL rather than in a body: this request has none."
+    },
+    {
+      "surface": "ack_request",
+      "path": "ack.ackSeq",
+      "bits": "inhabited",
+      "carries": [],
+      "parameter": "L_ibx",
+      "fate": "ideal"
+    },
+    {
+      "surface": "ack_request",
+      "path": "ack.ackedAt",
+      "bits": "inhabited",
+      "carries": [],
+      "parameter": "L_ibx",
+      "fate": "accepted"
+    },
+    {
+      "surface": "ack_request",
+      "path": "ack.deviceId",
+      "bits": "inhabited",
+      "carries": [
+        "recipient_user"
+      ],
+      "parameter": "L_ibx",
+      "fate": "routing",
+      "note": "Names a device, and through the device id's first segment its owner. `recipient_device` left the carries vocabulary when the corpus started measuring rather than declaring: a device key is minted per enrolment and is not a run input, so no matrix can separate it. In the modelled scope of one device per party it also adds nothing to `recipient_user`, and within one execution the cross-inbox assertion covers it."
+    },
+    {
+      "surface": "append_request",
+      "path": "@header.Authorization",
+      "bits": "inhabited",
+      "carries": [],
+      "parameter": "L_ibx",
+      "fate": "routing",
+      "note": "The capability signature, which is a bearer token over the lane and names no one."
+    },
+    {
+      "surface": "append_request",
+      "path": "@header.Content-Type",
+      "bits": "constant",
+      "value": "application/json",
+      "carries": [],
+      "parameter": "L_ibx",
+      "fate": "accepted"
+    },
+    {
+      "surface": "append_request",
+      "path": "@header.X-Tapchat-Capability",
+      "bits": "inhabited",
+      "carries": [
+        "recipient_user"
+      ],
+      "parameter": "L_ibx",
+      "fate": "routing",
+      "note": "The whole serialized append capability, including the recipient's user id and target device. It is the recipient's own inbox that reads it, so it discloses nothing that inbox does not already hold — but nothing had enumerated it until the corpus did."
+    },
+    {
+      "surface": "append_request",
+      "path": "@url",
+      "bits": "inhabited",
+      "carries": [
+        "recipient_user"
+      ],
+      "parameter": "L_ibx",
+      "fate": "routing",
+      "note": "The route names the destination device, which is the one field routing cannot do without. Measured on the URL rather than in a body: this request has none."
+    },
+    {
       "surface": "append_request",
       "path": "envelope.bytes",
       "bits": "inhabited",
       "carries": [],
-      "signed": false,
       "parameter": "L_ibx",
       "fate": "routing",
       "note": "Wrapped MLS frame (nonce || ChaCha20-Poly1305). Check X must stay empty, and since the fixture frame now carries the shared conversation sentinel in its PrivateMessage group_id, an empty result is evidence that the wrap hides the frame header rather than an artefact of the id being random. Unwrapping it would report conversation."
@@ -171,7 +291,6 @@
       "path": "envelope.lane",
       "bits": "inhabited",
       "carries": [],
-      "signed": false,
       "parameter": "L_ibx",
       "fate": "routing"
     },
@@ -180,16 +299,25 @@
       "path": "envelope.mid",
       "bits": "inhabited",
       "carries": [],
-      "signed": false,
       "parameter": "L_ibx",
       "fate": "routing"
+    },
+    {
+      "surface": "append_request",
+      "path": "envelope.recipientDeviceId",
+      "bits": "inhabited",
+      "carries": [
+        "recipient_user"
+      ],
+      "parameter": "L_ibx",
+      "fate": "routing",
+      "note": "Names a device, and through the device id's first segment its owner. `recipient_device` left the carries vocabulary when the corpus started measuring rather than declaring: a device key is minted per enrolment and is not a run input, so no matrix can separate it. In the modelled scope of one device per party it also adds nothing to `recipient_user`, and within one execution the cross-inbox assertion covers it."
     },
     {
       "surface": "append_request",
       "path": "envelope.storageRef.ref",
       "bits": "inhabited",
       "carries": [],
-      "signed": false,
       "parameter": "L_ibx",
       "fate": "routing",
       "note": "An opaque key: a namespace and a fresh 256-bit name. It used to name the sending user, the device, the conversation and the message, and the conversation segment was identical at both ends — a token shared across the two inboxes of one conversation, which is exactly what the per-direction lanes and the frame wrap existed to remove. Routing needs the reference; it never needed any of that."
@@ -199,33 +327,19 @@
       "path": "envelope.storageRef.size",
       "bits": "inhabited",
       "carries": [],
-      "signed": false,
       "parameter": "L_ibx",
       "fate": "ideal"
-    },
-    {
-      "surface": "append_request",
-      "path": "envelope.recipientDeviceId",
-      "bits": "inhabited",
-      "carries": [
-        "recipient_device",
-        "recipient_user"
-      ],
-      "signed": false,
-      "parameter": "L_ibx",
-      "fate": "routing"
     },
     {
       "surface": "append_request",
       "path": "recipientDeviceId",
       "bits": "inhabited",
       "carries": [
-        "recipient_device",
         "recipient_user"
       ],
-      "signed": false,
       "parameter": "L_ibx",
-      "fate": "routing"
+      "fate": "routing",
+      "note": "Names a device, and through the device id's first segment its owner. `recipient_device` left the carries vocabulary when the corpus started measuring rather than declaring: a device key is minted per enrolment and is not a run input, so no matrix can separate it. In the modelled scope of one device per party it also adds nothing to `recipient_user`, and within one execution the cross-inbox assertion covers it."
     },
     {
       "surface": "append_request",
@@ -233,293 +347,53 @@
       "bits": "constant",
       "value": "0.1",
       "carries": [],
-      "signed": false,
       "parameter": "L_ibx",
       "fate": "accepted"
-    },
-    {
-      "surface": "ack_request",
-      "path": "ack.ackSeq",
-      "bits": "inhabited",
-      "carries": [],
-      "signed": false,
-      "parameter": "L_ibx",
-      "fate": "ideal"
-    },
-    {
-      "surface": "ack_request",
-      "path": "ack.ackedAt",
-      "bits": "inhabited",
-      "carries": [],
-      "signed": false,
-      "parameter": "L_ibx",
-      "fate": "accepted"
-    },
-    {
-      "surface": "ack_request",
-      "path": "ack.deviceId",
-      "bits": "inhabited",
-      "carries": [
-        "recipient_device",
-        "recipient_user"
-      ],
-      "signed": false,
-      "parameter": "L_ibx",
-      "fate": "routing"
     },
     {
       "surface": "fetch_messages_request",
-      "path": "deviceId",
+      "path": "@auth.deviceId",
       "bits": "inhabited",
       "carries": [
-        "recipient_device",
         "recipient_user"
       ],
-      "signed": false,
-      "parameter": "L_ibx",
-      "fate": "routing"
-    },
-    {
-      "surface": "fetch_messages_request",
-      "path": "fromSeq",
-      "bits": "inhabited",
-      "carries": [],
-      "signed": false,
-      "parameter": "L_ibx",
-      "fate": "ideal"
-    },
-    {
-      "surface": "fetch_messages_request",
-      "path": "limit",
-      "bits": "inhabited",
-      "carries": [],
-      "signed": false,
-      "parameter": "L_ibx",
-      "fate": "accepted"
-    },
-    {
-      "surface": "register_accepted_lane_request",
-      "path": "auth.deviceId",
-      "bits": "inhabited",
-      "carries": [
-        "recipient_device",
-        "recipient_user"
-      ],
-      "signed": false,
-      "parameter": "L_ibx",
-      "fate": "routing"
-    },
-    {
-      "surface": "register_accepted_lane_request",
-      "path": "auth.runtimeId",
-      "bits": "inhabited",
-      "carries": [],
-      "signed": false,
-      "parameter": "L_ibx",
-      "fate": "accepted"
-    },
-    {
-      "surface": "register_accepted_lane_request",
-      "path": "auth.type",
-      "bits": "constant",
-      "value": "device_runtime",
-      "carries": [],
-      "signed": false,
-      "parameter": "L_ibx",
-      "fate": "accepted"
-    },
-    {
-      "surface": "register_accepted_lane_request",
-      "path": "deviceId",
-      "bits": "inhabited",
-      "carries": [
-        "recipient_device",
-        "recipient_user"
-      ],
-      "signed": false,
-      "parameter": "L_ibx",
-      "fate": "routing"
-    },
-    {
-      "surface": "register_accepted_lane_request",
-      "path": "endpoint",
-      "bits": "inhabited",
-      "carries": [
-        "recipient_device",
-        "recipient_user"
-      ],
-      "signed": false,
-      "parameter": "L_net",
-      "fate": "accepted"
-    },
-    {
-      "surface": "register_accepted_lane_request",
-      "path": "lane",
-      "bits": "inhabited",
-      "carries": [],
-      "signed": false,
-      "parameter": "L_ibx",
-      "fate": "routing"
-    },
-    {
-      "surface": "message_request_action_request",
-      "path": "action",
-      "bits": "inhabited",
-      "carries": [],
-      "signed": false,
-      "parameter": "L_ibx",
-      "fate": "accepted"
-    },
-    {
-      "surface": "message_request_action_request",
-      "path": "auth.deviceId",
-      "bits": "inhabited",
-      "carries": [
-        "recipient_device",
-        "recipient_user"
-      ],
-      "signed": false,
-      "parameter": "L_ibx",
-      "fate": "routing"
-    },
-    {
-      "surface": "message_request_action_request",
-      "path": "auth.runtimeId",
-      "bits": "inhabited",
-      "carries": [],
-      "signed": false,
-      "parameter": "L_ibx",
-      "fate": "accepted"
-    },
-    {
-      "surface": "message_request_action_request",
-      "path": "auth.type",
-      "bits": "constant",
-      "value": "device_runtime",
-      "carries": [],
-      "signed": false,
-      "parameter": "L_ibx",
-      "fate": "accepted"
-    },
-    {
-      "surface": "message_request_action_request",
-      "path": "deviceId",
-      "bits": "inhabited",
-      "carries": [
-        "recipient_device",
-        "recipient_user"
-      ],
-      "signed": false,
-      "parameter": "L_ibx",
-      "fate": "routing"
-    },
-    {
-      "surface": "message_request_action_request",
-      "path": "endpoint",
-      "bits": "inhabited",
-      "carries": [],
-      "signed": false,
-      "parameter": "L_net",
-      "fate": "accepted"
-    },
-    {
-      "surface": "message_request_action_request",
-      "path": "requestId",
-      "bits": "inhabited",
-      "carries": [],
-      "signed": false,
-      "parameter": "L_ibx",
-      "fate": "accepted",
-      "note": "Random opaque id minted by the inbox (`request:{randomOpaqueId()}`), the host's own handle for a queued first contact. It carries nothing about the sender."
-    },
-    {
-      "surface": "prepare_blob_upload_request",
-      "path": "lane",
-      "bits": "inhabited",
-      "carries": [],
-      "signed": false,
       "parameter": "L_ibx",
       "fate": "routing",
-      "note": "The admission credential, and the quota partition. A 1:1 payload is placed in the recipient runtime, which admits the sender on the same lane it admits its envelopes on; revoking the contact deletes one key and stops both."
+      "note": "Names a device, and through the device id's first segment its owner. `recipient_device` left the carries vocabulary when the corpus started measuring rather than declaring: a device key is minted per enrolment and is not a run input, so no matrix can separate it. In the modelled scope of one device per party it also adds nothing to `recipient_user`, and within one execution the cross-inbox assertion covers it."
     },
     {
-      "surface": "prepare_blob_upload_request",
-      "path": "endpoint",
-      "bits": "inhabited",
-      "carries": [
-        "recipient_device",
-        "recipient_user"
-      ],
-      "signed": false,
-      "parameter": "L_net",
-      "fate": "accepted",
-      "note": "The destination URL. It names the recipient device because that is the inbox being addressed, which is the same thing the append request line already discloses."
-    },
-    {
-      "surface": "prepare_blob_upload_request",
-      "path": "auth.deviceId",
-      "bits": "inhabited",
-      "carries": [
-        "recipient_device",
-        "recipient_user"
-      ],
-      "signed": false,
-      "parameter": "L_stg",
-      "fate": "routing"
-    },
-    {
-      "surface": "prepare_blob_upload_request",
-      "path": "auth.runtimeId",
+      "surface": "fetch_messages_request",
+      "path": "@auth.runtimeId",
       "bits": "inhabited",
       "carries": [],
-      "signed": false,
-      "parameter": "L_stg",
+      "parameter": "L_ibx",
       "fate": "accepted"
     },
     {
-      "surface": "prepare_blob_upload_request",
-      "path": "auth.type",
+      "surface": "fetch_messages_request",
+      "path": "@auth.type",
       "bits": "constant",
       "value": "device_runtime",
       "carries": [],
-      "signed": false,
-      "parameter": "L_stg",
+      "parameter": "L_ibx",
       "fate": "accepted"
     },
     {
-      "surface": "prepare_blob_upload_request",
-      "path": "sizeBytes",
+      "surface": "fetch_messages_request",
+      "path": "@url",
       "bits": "inhabited",
-      "carries": [],
-      "signed": false,
-      "parameter": "L_stg",
-      "fate": "ideal"
-    },
-    {
-      "surface": "inbox_do_key",
-      "path": "meta",
-      "bits": "inhabited",
-      "carries": [],
-      "signed": false,
+      "carries": [
+        "recipient_user"
+      ],
       "parameter": "L_ibx",
-      "fate": "accepted",
-      "note": "Inbox bookkeeping: the record head, the ack watermark, the retention and limit settings, and the append counter the inbox answers every append with. That counter runs over every append whatever becomes of the record, so the number discloses nothing about whether the record was admitted or queued; it is also the closer analogue of the i the ideal returns, which counts every send rather than the ones an adversary chose to deliver."
+      "fate": "routing",
+      "note": "The route names the destination device, which is the one field routing cannot do without. Measured on the URL rather than in a body: this request has none. The cursor and limit ride in the query string."
     },
     {
       "surface": "inbox_do_key",
       "path": "accepted-lane:{lane}",
       "bits": "inhabited",
       "carries": [],
-      "signed": false,
-      "parameter": "L_ibx",
-      "fate": "routing"
-    },
-    {
-      "surface": "inbox_do_key",
-      "path": "idempotency:{mid}",
-      "bits": "inhabited",
-      "carries": [],
-      "signed": false,
       "parameter": "L_ibx",
       "fate": "routing"
     },
@@ -528,53 +402,22 @@
       "path": "append-result:{mid}",
       "bits": "inhabited",
       "carries": [],
-      "signed": false,
       "parameter": "L_ibx",
       "fate": "routing"
     },
     {
       "surface": "inbox_do_key",
-      "path": "message-request:{lane}",
+      "path": "idempotency:{mid}",
       "bits": "inhabited",
       "carries": [],
-      "signed": false,
       "parameter": "L_ibx",
       "fate": "routing"
-    },
-    {
-      "surface": "inbox_do_key",
-      "path": "rate-limit:{lane}",
-      "bits": "inhabited",
-      "carries": [],
-      "signed": false,
-      "parameter": "L_ibx",
-      "fate": "routing",
-      "note": "Accepted-lane buckets. Unknown lanes share rate-limit:first-contact."
-    },
-    {
-      "surface": "inbox_do_key",
-      "path": "rate-limit:first-contact",
-      "bits": "inhabited",
-      "carries": [],
-      "signed": false,
-      "parameter": "L_ibx",
-      "fate": "accepted"
-    },
-    {
-      "surface": "inbox_do_key",
-      "path": "record:{seq}",
-      "bits": "inhabited",
-      "carries": [],
-      "signed": false,
-      "parameter": "L_ibx",
-      "fate": "ideal"
     },
     {
       "surface": "inbox_do_key",
       "path": "message-request:index",
       "bits": "inhabited",
       "carries": [],
-      "signed": false,
       "parameter": "L_ibx",
       "fate": "accepted",
       "note": "Holds the list of first-contact lanes that have attempted contact."
@@ -584,7 +427,6 @@
       "path": "message-request:meta",
       "bits": "inhabited",
       "carries": [],
-      "signed": false,
       "parameter": "L_ibx",
       "fate": "accepted"
     },
@@ -593,16 +435,178 @@
       "path": "message-request:rate-limit",
       "bits": "inhabited",
       "carries": [],
-      "signed": false,
       "parameter": "L_ibx",
       "fate": "accepted"
+    },
+    {
+      "surface": "inbox_do_key",
+      "path": "message-request:{lane}",
+      "bits": "inhabited",
+      "carries": [],
+      "parameter": "L_ibx",
+      "fate": "routing"
+    },
+    {
+      "surface": "inbox_do_key",
+      "path": "meta",
+      "bits": "inhabited",
+      "carries": [],
+      "parameter": "L_ibx",
+      "fate": "accepted",
+      "note": "Inbox bookkeeping: the record head, the ack watermark, the retention and limit settings, and the append counter the inbox answers every append with. That counter runs over every append whatever becomes of the record, so the number discloses nothing about whether the record was admitted or queued; it is also the closer analogue of the i the ideal returns, which counts every send rather than the ones an adversary chose to deliver."
+    },
+    {
+      "surface": "inbox_do_key",
+      "path": "rate-limit:first-contact",
+      "bits": "inhabited",
+      "carries": [],
+      "parameter": "L_ibx",
+      "fate": "accepted"
+    },
+    {
+      "surface": "inbox_do_key",
+      "path": "rate-limit:{lane}",
+      "bits": "inhabited",
+      "carries": [],
+      "parameter": "L_ibx",
+      "fate": "routing",
+      "note": "Accepted-lane buckets. Unknown lanes share rate-limit:first-contact."
+    },
+    {
+      "surface": "inbox_do_key",
+      "path": "record:{seq}",
+      "bits": "inhabited",
+      "carries": [],
+      "parameter": "L_ibx",
+      "fate": "ideal"
+    },
+    {
+      "surface": "message_request_action_request",
+      "path": "action",
+      "bits": "inhabited",
+      "carries": [],
+      "parameter": "L_ibx",
+      "fate": "accepted"
+    },
+    {
+      "surface": "message_request_action_request",
+      "path": "auth.deviceId",
+      "bits": "inhabited",
+      "carries": [
+        "recipient_user"
+      ],
+      "parameter": "L_ibx",
+      "fate": "routing",
+      "note": "Names a device, and through the device id's first segment its owner. `recipient_device` left the carries vocabulary when the corpus started measuring rather than declaring: a device key is minted per enrolment and is not a run input, so no matrix can separate it. In the modelled scope of one device per party it also adds nothing to `recipient_user`, and within one execution the cross-inbox assertion covers it."
+    },
+    {
+      "surface": "message_request_action_request",
+      "path": "auth.runtimeId",
+      "bits": "inhabited",
+      "carries": [],
+      "parameter": "L_ibx",
+      "fate": "accepted"
+    },
+    {
+      "surface": "message_request_action_request",
+      "path": "auth.type",
+      "bits": "constant",
+      "value": "device_runtime",
+      "carries": [],
+      "parameter": "L_ibx",
+      "fate": "accepted"
+    },
+    {
+      "surface": "message_request_action_request",
+      "path": "deviceId",
+      "bits": "inhabited",
+      "carries": [
+        "recipient_user"
+      ],
+      "parameter": "L_ibx",
+      "fate": "routing",
+      "note": "Names a device, and through the device id's first segment its owner. `recipient_device` left the carries vocabulary when the corpus started measuring rather than declaring: a device key is minted per enrolment and is not a run input, so no matrix can separate it. In the modelled scope of one device per party it also adds nothing to `recipient_user`, and within one execution the cross-inbox assertion covers it."
+    },
+    {
+      "surface": "message_request_action_request",
+      "path": "endpoint",
+      "bits": "inhabited",
+      "carries": [
+        "recipient_user"
+      ],
+      "parameter": "L_net",
+      "fate": "accepted",
+      "note": "The endpoint names the acting device, percent-encoded. Declared empty until the corpus decoded it."
+    },
+    {
+      "surface": "message_request_action_request",
+      "path": "requestId",
+      "bits": "inhabited",
+      "carries": [],
+      "parameter": "L_ibx",
+      "fate": "accepted",
+      "note": "Random opaque id minted by the inbox (`request:{randomOpaqueId()}`), the host's own handle for a queued first contact. It carries nothing about the sender."
+    },
+    {
+      "surface": "prepare_blob_upload_request",
+      "path": "auth.deviceId",
+      "bits": "absent",
+      "carries": [],
+      "parameter": "L_stg",
+      "fate": "accepted",
+      "note": "A 1:1 payload upload presents no credential of its own: the lane is the authorisation, and the sender is a stranger at the recipient's runtime. The field exists on the type and the maximal fixture populates it, so this row records what would be visible if a producer ever set it. The corpus never observes it."
+    },
+    {
+      "surface": "prepare_blob_upload_request",
+      "path": "auth.runtimeId",
+      "bits": "absent",
+      "carries": [],
+      "parameter": "L_stg",
+      "fate": "accepted",
+      "note": "A 1:1 payload upload presents no credential of its own: the lane is the authorisation, and the sender is a stranger at the recipient's runtime. The field exists on the type and the maximal fixture populates it, so this row records what would be visible if a producer ever set it. The corpus never observes it."
+    },
+    {
+      "surface": "prepare_blob_upload_request",
+      "path": "auth.type",
+      "bits": "absent",
+      "carries": [],
+      "parameter": "L_stg",
+      "fate": "accepted",
+      "note": "A 1:1 payload upload presents no credential of its own: the lane is the authorisation, and the sender is a stranger at the recipient's runtime. The field exists on the type and the maximal fixture populates it, so this row records what would be visible if a producer ever set it. The corpus never observes it."
+    },
+    {
+      "surface": "prepare_blob_upload_request",
+      "path": "endpoint",
+      "bits": "inhabited",
+      "carries": [
+        "recipient_user"
+      ],
+      "parameter": "L_net",
+      "fate": "accepted",
+      "note": "Names a device, and through the device id's first segment its owner. `recipient_device` left the carries vocabulary when the corpus started measuring rather than declaring: a device key is minted per enrolment and is not a run input, so no matrix can separate it. In the modelled scope of one device per party it also adds nothing to `recipient_user`, and within one execution the cross-inbox assertion covers it."
+    },
+    {
+      "surface": "prepare_blob_upload_request",
+      "path": "lane",
+      "bits": "inhabited",
+      "carries": [],
+      "parameter": "L_ibx",
+      "fate": "routing",
+      "note": "The admission credential, and the quota partition. A 1:1 payload is placed in the recipient runtime, which admits the sender on the same lane it admits its envelopes on; revoking the contact deletes one key and stops both."
+    },
+    {
+      "surface": "prepare_blob_upload_request",
+      "path": "sizeBytes",
+      "bits": "inhabited",
+      "carries": [],
+      "parameter": "L_stg",
+      "fate": "ideal"
     },
     {
       "surface": "r2_key",
       "path": "blobs/{opaque}",
       "bits": "inhabited",
       "carries": [],
-      "signed": false,
       "parameter": "L_stg",
       "fate": "accepted",
       "note": "A fresh 256-bit name. Read access was always gated on an independent capability, so the identifiers this key used to carry bought nothing and cost a cross-inbox token: the same key reached the recipient inbox as envelope.storageRef.ref, and its conversation segment was identical at both ends."
@@ -612,22 +616,9 @@
       "path": "inbox-payload/{opaque}",
       "bits": "inhabited",
       "carries": [],
-      "signed": false,
       "parameter": "L_stg",
       "fate": "accepted",
       "note": "A fresh 256-bit name; the inbox records it on the record index, so nothing has to re-derive it."
-    },
-    {
-      "surface": "r2_key",
-      "path": "shared-state/{userId}/identity_bundle.json",
-      "bits": "inhabited",
-      "carries": [
-        "sender_user"
-      ],
-      "signed": false,
-      "parameter": "L_stg",
-      "fate": "accepted",
-      "note": "Served unauthenticated, so anyone who has ever seen a share link can re-fetch the current append capability indefinitely."
     },
     {
       "surface": "r2_key",
@@ -636,7 +627,6 @@
       "carries": [
         "sender_user"
       ],
-      "signed": false,
       "parameter": "L_stg",
       "fate": "accepted"
     },
@@ -647,26 +637,34 @@
       "carries": [
         "sender_user"
       ],
-      "signed": false,
       "parameter": "L_stg",
       "fate": "accepted"
+    },
+    {
+      "surface": "r2_key",
+      "path": "shared-state/{userId}/identity_bundle.json",
+      "bits": "inhabited",
+      "carries": [
+        "sender_user"
+      ],
+      "parameter": "L_stg",
+      "fate": "accepted",
+      "note": "Served unauthenticated, so anyone who has ever seen a share link can re-fetch the current append capability indefinitely."
     },
     {
       "surface": "r2_key",
       "path": "welcome-pickup/{opaque}",
       "bits": "inhabited",
       "carries": [],
-      "signed": false,
       "parameter": "L_stg",
       "fate": "accepted",
       "note": "Named by the SHA-256 of the pickup capability: pure R2 with no Durable Object beside it, so the name has to be one both sides recompute. Group scope, but it shares the single bucket."
     },
     {
       "surface": "realtime_event",
-      "path": "event",
+      "path": "change",
       "bits": "inhabited",
       "carries": [],
-      "signed": false,
       "parameter": "L_ibx",
       "fate": "accepted"
     },
@@ -678,18 +676,16 @@
         "recipient_device",
         "recipient_user"
       ],
-      "signed": false,
       "parameter": "L_ibx",
       "fate": "routing"
     },
     {
       "surface": "realtime_event",
-      "path": "seq",
+      "path": "event",
       "bits": "inhabited",
       "carries": [],
-      "signed": false,
       "parameter": "L_ibx",
-      "fate": "ideal"
+      "fate": "accepted"
     },
     {
       "surface": "realtime_event",
@@ -699,7 +695,6 @@
         "recipient_device",
         "recipient_user"
       ],
-      "signed": false,
       "parameter": "L_ibx",
       "fate": "routing",
       "note": "InboxRecord with the four-field envelope; sender identifiers are no longer in the header."
@@ -709,19 +704,75 @@
       "path": "requestId",
       "bits": "inhabited",
       "carries": [],
-      "signed": false,
       "parameter": "L_ibx",
       "fate": "accepted",
       "note": "Random request id; no longer request:{senderUserId}."
     },
     {
       "surface": "realtime_event",
-      "path": "change",
+      "path": "seq",
       "bits": "inhabited",
       "carries": [],
-      "signed": false,
+      "parameter": "L_ibx",
+      "fate": "ideal"
+    },
+    {
+      "surface": "register_accepted_lane_request",
+      "path": "auth.deviceId",
+      "bits": "inhabited",
+      "carries": [
+        "recipient_user"
+      ],
+      "parameter": "L_ibx",
+      "fate": "routing",
+      "note": "Names a device, and through the device id's first segment its owner. `recipient_device` left the carries vocabulary when the corpus started measuring rather than declaring: a device key is minted per enrolment and is not a run input, so no matrix can separate it. In the modelled scope of one device per party it also adds nothing to `recipient_user`, and within one execution the cross-inbox assertion covers it."
+    },
+    {
+      "surface": "register_accepted_lane_request",
+      "path": "auth.runtimeId",
+      "bits": "inhabited",
+      "carries": [],
       "parameter": "L_ibx",
       "fate": "accepted"
+    },
+    {
+      "surface": "register_accepted_lane_request",
+      "path": "auth.type",
+      "bits": "constant",
+      "value": "device_runtime",
+      "carries": [],
+      "parameter": "L_ibx",
+      "fate": "accepted"
+    },
+    {
+      "surface": "register_accepted_lane_request",
+      "path": "deviceId",
+      "bits": "inhabited",
+      "carries": [
+        "recipient_user"
+      ],
+      "parameter": "L_ibx",
+      "fate": "routing",
+      "note": "Names a device, and through the device id's first segment its owner. `recipient_device` left the carries vocabulary when the corpus started measuring rather than declaring: a device key is minted per enrolment and is not a run input, so no matrix can separate it. In the modelled scope of one device per party it also adds nothing to `recipient_user`, and within one execution the cross-inbox assertion covers it."
+    },
+    {
+      "surface": "register_accepted_lane_request",
+      "path": "endpoint",
+      "bits": "inhabited",
+      "carries": [
+        "recipient_user"
+      ],
+      "parameter": "L_net",
+      "fate": "accepted",
+      "note": "Names a device, and through the device id's first segment its owner. `recipient_device` left the carries vocabulary when the corpus started measuring rather than declaring: a device key is minted per enrolment and is not a run input, so no matrix can separate it. In the modelled scope of one device per party it also adds nothing to `recipient_user`, and within one execution the cross-inbox assertion covers it."
+    },
+    {
+      "surface": "register_accepted_lane_request",
+      "path": "lane",
+      "bits": "inhabited",
+      "carries": [],
+      "parameter": "L_ibx",
+      "fate": "routing"
     }
   ],
   "protectedFields": [

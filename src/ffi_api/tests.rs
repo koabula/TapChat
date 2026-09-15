@@ -1,5 +1,5 @@
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use crate::attachment_crypto::{
         AttachmentCipherMetadata, AttachmentPayloadMetadata, ATTACHMENT_CHUNK_SIZE_BYTES,
         ATTACHMENT_CIPHER_ALGORITHM, CHUNKED_ATTACHMENT_CIPHER_ALGORITHM,
@@ -33,8 +33,8 @@ mod tests {
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use std::collections::{BTreeMap, BTreeSet};
 
-    const ALICE_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
-    const BOB_MNEMONIC: &str =
+    pub(crate) const ALICE_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+    pub(crate) const BOB_MNEMONIC: &str =
         "legal winner thank year wave sausage worth useful legal winner thank yellow";
 
     fn test_now_ms() -> u64 {
@@ -50,9 +50,9 @@ mod tests {
         failure.http_status = status;
         failure
     }
-    const CAROL_MNEMONIC: &str =
+    pub(crate) const CAROL_MNEMONIC: &str =
         "letter advice cage absurd amount doctor acoustic avoid letter advice cage above";
-    const DANA_MNEMONIC: &str = "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong";
+    pub(crate) const DANA_MNEMONIC: &str = "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong";
 
     #[test]
     fn module_name_is_stable() {
@@ -8669,6 +8669,140 @@ mod tests {
     /// stored message, no epoch or status movement, no recovery context, no
     /// retained retry copy, no view-model entry, no outbound effect beyond the
     /// ack, and no loss of the ability to send.
+
+    /// `Deliver(Q, i)` returns the i-th entry of the transcript, and an entry
+    /// is there only because some party called `Send`. So the set a receiver
+    /// surfaces is the set that was sent — no more, which is the half a host
+    /// could violate by injecting, and no less, which is the half it could
+    /// violate by dropping while the receiver stayed quiet.
+    ///
+    /// `invalid_ciphertext_leaves_no_trace` already proves that an injected
+    /// record changes nothing observable. This proves the complementary thing
+    /// it does not: that the delivered *set* equals the sent set.
+    #[test]
+    fn deliver_returns_only_sent_messages() {
+        let mut chat = paired_direct_chat();
+        let sent = ["first", "second", "third"];
+        for body in sent {
+            chat.alice
+                .handle_command(CoreCommand::SendTextMessage {
+                    conversation_id: chat.conversation_id.clone(),
+                    plaintext: body.to_string(),
+                })
+                .expect("send");
+        }
+        let bob_device_id = chat.bob_device_id.clone();
+        deliver_pending_outbox_to_device(&mut chat.bob, &chat.alice, &bob_device_id);
+
+        let delivered = |engine: &CoreEngine| -> BTreeSet<String> {
+            engine
+                .state
+                .conversations
+                .get(&chat.conversation_id)
+                .expect("conversation")
+                .messages
+                .iter()
+                .filter_map(|message| message.plaintext.clone())
+                .collect()
+        };
+        let received = delivered(&chat.bob);
+        assert_eq!(
+            received,
+            sent.iter().map(|body| body.to_string()).collect(),
+            "the delivered set must be exactly the sent set"
+        );
+
+        // Now a record the transcript never held: a well-formed envelope on the
+        // live lane whose payload nobody sent. The set must not grow.
+        let live_lane = chat
+            .alice
+            .state
+            .conversations
+            .get(&chat.conversation_id)
+            .expect("conversation")
+            .lanes
+            .as_ref()
+            .expect("lanes")
+            .outbound_lane
+            .clone();
+        let forged = Envelope::with_bytes(
+            &bob_device_id,
+            live_lane,
+            crate::model::random_opaque_id(),
+            STANDARD.encode([0x5A_u8; 96]),
+        );
+        deliver_inbox_envelope(&mut chat.bob, &bob_device_id, forged, 500);
+        assert_eq!(
+            delivered(&chat.bob),
+            received,
+            "a record that was never sent must not become a delivered message"
+        );
+    }
+
+    /// The lane wrap hides the MLS frame header, whose `group_id` is the
+    /// conversation and is identical at both inboxes.
+    ///
+    /// This is the reverse of the deleted existence proof
+    /// `mls_frame_header_names_the_conversation_in_the_clear`. What one
+    /// execution can show is that the header is not readable off a wrapped
+    /// payload while it *is* readable off the one frame that goes unwrapped;
+    /// that the two inboxes therefore share no token is the corpus's
+    /// `host_view_shares_no_token_across_inboxes`.
+    #[test]
+    fn a_wrapped_frame_does_not_name_the_conversation() {
+        use openmls::prelude::{tls_codec::Deserialize, MlsMessageIn};
+
+        let mut chat = paired_direct_chat();
+        let welcome = chat
+            .alice
+            .state
+            .pending_outbox
+            .first()
+            .map(|item| item.envelope.clone());
+        chat.alice
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: chat.conversation_id.clone(),
+                plaintext: "a message whose frame header is hidden".into(),
+            })
+            .expect("send");
+        let wrapped = last_pending_application_envelope(&chat.alice, &chat.bob_device_id);
+
+        let payload = |envelope: &Envelope| -> Vec<u8> {
+            STANDARD
+                .decode(envelope.payload_b64().expect("payload"))
+                .expect("base64")
+        };
+        let names_conversation = |bytes: &[u8]| -> bool {
+            bytes
+                .windows(chat.conversation_id.len())
+                .any(|window| window == chat.conversation_id.as_bytes())
+        };
+
+        let wrapped_bytes = payload(&wrapped);
+        assert!(
+            !names_conversation(&wrapped_bytes),
+            "the conversation id must not appear in a wrapped payload"
+        );
+        // Not merely absent as a substring: the header is not parseable at any
+        // offset a frame can begin at, so no field of it is readable either.
+        for start in [0, 1, 1 + crate::direct_frame::COMMIT_SIGNATURE_LEN] {
+            assert!(
+                start >= wrapped_bytes.len()
+                    || MlsMessageIn::tls_deserialize_exact(&wrapped_bytes[start..]).is_err(),
+                "a wrapped payload must not parse as an MLS message at offset {start}"
+            );
+        }
+
+        // The control: the welcome is the one frame that is not wrapped, and it
+        // does parse. Without this the assertion above would pass on any
+        // payload at all, including an empty one.
+        let welcome = welcome.expect("the create step enqueued a welcome");
+        assert!(
+            MlsMessageIn::tls_deserialize_exact(payload(&welcome).as_slice()).is_ok(),
+            "the welcome is sent unwrapped, so it must still parse"
+        );
+    }
+
     #[test]
     fn invalid_ciphertext_leaves_no_trace() {
         struct Vector {
@@ -13598,14 +13732,14 @@ mod tests {
     /// ignores the device name and generates a new device key — so a bundle
     /// rebuilt from the same mnemonic describes a different device and its
     /// signatures will not verify.
-    fn link_contact(receiver: &mut CoreEngine, sender: &CoreEngine) {
+    pub(crate) fn link_contact(receiver: &mut CoreEngine, sender: &CoreEngine) {
         let bundle = sender.local_bundle().expect("sender bundle").clone();
         receiver
             .handle_command(CoreCommand::ImportIdentityBundle { bundle })
             .expect("receiver imports sender bundle");
     }
 
-    fn local_engine(mnemonic: &str, device_name: &str) -> CoreEngine {
+    pub(crate) fn local_engine(mnemonic: &str, device_name: &str) -> CoreEngine {
         let mut engine = CoreEngine::new();
         engine
             .handle_command(CoreCommand::ImportDeploymentBundle {
@@ -13644,6 +13778,49 @@ mod tests {
             .unwrap_or_else(|| panic!("missing HTTP request containing {needle}"))
     }
 
+    /// The body a key-package pool answers a claim with, for the device the
+    /// claim URL names.
+    ///
+    /// Shared with [`crate::leakage_corpus`], whose recorder drains effects one
+    /// at a time and so cannot use the loop below.
+    pub(crate) fn key_package_claim_response(engine: &CoreEngine, url: &str) -> String {
+        let device_id = url
+            .split("/keypackage-pool/")
+            .nth(1)
+            .and_then(|rest| rest.strip_suffix("/claim"))
+            .map(|encoded| {
+                urlencoding::decode(encoded)
+                    .expect("valid device id encoding")
+                    .into_owned()
+            })
+            .expect("claim url must contain a device id");
+        let key_package_b64 = engine
+            .state
+            .contacts
+            .values()
+            .find_map(|contact| {
+                contact
+                    .bundle
+                    .devices
+                    .iter()
+                    .find(|device| device.device_id == device_id)
+                    .and_then(|device| device.keypackage_ref.as_ref())
+                    .map(|keypackage_ref| keypackage_ref.object_ref.clone())
+            })
+            .expect("test harness must have a cached key package to simulate a claim response");
+        serde_json::json!({
+            "keyPackage": {
+                "keyPackageId": "test-claim",
+                "keyPackage": key_package_b64,
+                "lifecycleVersion": 1,
+                "notBefore": 0,
+                "createdAt": 0,
+                "expiresAt": 0,
+            }
+        })
+        .to_string()
+    }
+
     /// Resolves every in-flight `ClaimKeyPackage` HTTP effect in `output` by
     /// synthesizing a successful `/v1/keypackage-pool/{deviceId}/claim`
     /// response (claims are strictly sequential, so this loops until none
@@ -13652,7 +13829,7 @@ mod tests {
     /// test purposes since the bytes just need to be a validly encoded MLS
     /// KeyPackage. Returns the final output (from whichever call resolved
     /// the last outstanding claim), which carries the real view model.
-    fn simulate_pending_key_package_claims(
+    pub(crate) fn simulate_pending_key_package_claims(
         engine: &mut CoreEngine,
         mut output: CoreOutput,
     ) -> CoreOutput {
@@ -13669,41 +13846,7 @@ mod tests {
             let Some((request_id, url)) = claim else {
                 break;
             };
-            let device_id = url
-                .split("/keypackage-pool/")
-                .nth(1)
-                .and_then(|rest| rest.strip_suffix("/claim"))
-                .map(|encoded| {
-                    urlencoding::decode(encoded)
-                        .expect("valid device id encoding")
-                        .into_owned()
-                })
-                .expect("claim url must contain a device id");
-            let key_package_b64 = engine
-                .state
-                .contacts
-                .values()
-                .find_map(|contact| {
-                    contact
-                        .bundle
-                        .devices
-                        .iter()
-                        .find(|device| device.device_id == device_id)
-                        .and_then(|device| device.keypackage_ref.as_ref())
-                        .map(|keypackage_ref| keypackage_ref.object_ref.clone())
-                })
-                .expect("test harness must have a cached key package to simulate a claim response");
-            let body = serde_json::json!({
-                "keyPackage": {
-                    "keyPackageId": "test-claim",
-                    "keyPackage": key_package_b64,
-                    "lifecycleVersion": 1,
-                    "notBefore": 0,
-                    "createdAt": 0,
-                    "expiresAt": 0,
-                }
-            })
-            .to_string();
+            let body = key_package_claim_response(engine, &url);
             output = engine
                 .handle_event(CoreEvent::HttpResponseReceived {
                     request_id,
@@ -13715,7 +13858,10 @@ mod tests {
         output
     }
 
-    fn create_direct_conversation(engine: &mut CoreEngine, peer_user_id: String) -> String {
+    pub(crate) fn create_direct_conversation(
+        engine: &mut CoreEngine,
+        peer_user_id: String,
+    ) -> String {
         let output = engine
             .handle_command(CoreCommand::CreateConversation {
                 peer_user_id,
@@ -13833,21 +13979,21 @@ mod tests {
             .expect("recipient inbox records fetched")
     }
 
-    struct PairedDirectChat {
-        alice: CoreEngine,
-        bob: CoreEngine,
-        conversation_id: String,
-        alice_device_id: String,
-        bob_device_id: String,
+    pub(crate) struct PairedDirectChat {
+        pub(crate) alice: CoreEngine,
+        pub(crate) bob: CoreEngine,
+        pub(crate) conversation_id: String,
+        pub(crate) alice_device_id: String,
+        pub(crate) bob_device_id: String,
     }
 
-    fn paired_direct_chat() -> PairedDirectChat {
+    pub(crate) fn paired_direct_chat() -> PairedDirectChat {
         let mut chat = unjoined_direct_chat();
         deliver_pending_outbox_to_device(&mut chat.bob, &chat.alice, &chat.bob_device_id);
         chat
     }
 
-    fn unjoined_direct_chat() -> PairedDirectChat {
+    pub(crate) fn unjoined_direct_chat() -> PairedDirectChat {
         let mut alice = local_engine(ALICE_MNEMONIC, "phone");
         let alice_bundle = alice.local_bundle().expect("alice bundle").clone();
         let mut bob = local_engine(BOB_MNEMONIC, "phone");
@@ -13906,7 +14052,7 @@ mod tests {
         .expect("committer")
     }
 
-    fn alice_is_designated(chat: &PairedDirectChat) -> bool {
+    pub(crate) fn alice_is_designated(chat: &PairedDirectChat) -> bool {
         designated_device_id(chat) == chat.alice_device_id
     }
 
@@ -13923,7 +14069,10 @@ mod tests {
         }
     }
 
-    fn rotator_engine_mut(chat: &mut PairedDirectChat, alice_rotated: bool) -> &mut CoreEngine {
+    pub(crate) fn rotator_engine_mut(
+        chat: &mut PairedDirectChat,
+        alice_rotated: bool,
+    ) -> &mut CoreEngine {
         if alice_rotated {
             &mut chat.alice
         } else {
@@ -13965,13 +14114,13 @@ mod tests {
 
     /// Both sides observe the same application messages, so their rotation
     /// debts advance together; only the thresholds differ by role.
-    fn set_direct_pcs_debt(engine: &mut CoreEngine, conversation_id: &str, debt: u32) {
+    pub(crate) fn set_direct_pcs_debt(engine: &mut CoreEngine, conversation_id: &str, debt: u32) {
         if let Some(state) = engine.state.conversations.get_mut(conversation_id) {
             state.pcs.self_debt = debt;
         }
     }
 
-    fn prime_direct_pcs_debt(chat: &mut PairedDirectChat, debt: u32) {
+    pub(crate) fn prime_direct_pcs_debt(chat: &mut PairedDirectChat, debt: u32) {
         for engine in [&mut chat.alice, &mut chat.bob] {
             if let Some(state) = engine.state.conversations.get_mut(&chat.conversation_id) {
                 state.pcs.self_debt = debt;
@@ -14427,7 +14576,7 @@ mod tests {
         serde_json::to_string(&bundle).expect("bundle json")
     }
 
-    fn sample_attachment_descriptor() -> AttachmentDescriptor {
+    pub(crate) fn sample_attachment_descriptor() -> AttachmentDescriptor {
         let path = unique_temp_path("attachment");
         std::fs::write(&path, [1_u8, 2, 3, 4]).expect("write attachment temp file");
         AttachmentDescriptor {
@@ -14532,7 +14681,7 @@ mod tests {
             .collect()
     }
 
-    fn sample_deployment() -> DeploymentBundle {
+    pub(crate) fn sample_deployment() -> DeploymentBundle {
         DeploymentBundle {
             version: CURRENT_MODEL_VERSION.to_string(),
             runtime_id: "runtime:test".into(),
@@ -14567,7 +14716,7 @@ mod tests {
         }
     }
 
-    fn unique_temp_path(prefix: &str) -> std::path::PathBuf {
+    pub(crate) fn unique_temp_path(prefix: &str) -> std::path::PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("time")

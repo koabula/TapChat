@@ -16,6 +16,8 @@ pub mod group_pcs;
 pub mod identity;
 pub mod lane_wrap;
 #[cfg(test)]
+mod leakage_corpus;
+#[cfg(test)]
 mod leakage_ledger;
 pub mod local_store;
 pub(crate) mod log_sanitize;

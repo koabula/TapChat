@@ -31,7 +31,6 @@ interface LedgerEntry {
   bits: string;
   value?: string;
   carries: string[];
-  signed: boolean;
   note?: string;
 }
 

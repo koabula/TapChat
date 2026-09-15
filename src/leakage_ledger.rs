@@ -144,7 +144,6 @@ pub(crate) struct Entry {
     pub(crate) value: Option<String>,
     #[serde(default)]
     pub(crate) carries: Vec<String>,
-    pub(crate) signed: bool,
     pub(crate) parameter: Parameter,
     pub(crate) fate: Fate,
     /// Prose for a human reading the ledger. Declared so `deny_unknown_fields`
@@ -198,6 +197,11 @@ pub(crate) struct ExcludedSurface {
 pub(crate) struct NonSyntactic {
     pub(crate) channel: String,
     pub(crate) checked: bool,
+    /// The test that measures this channel. Required exactly when `checked`,
+    /// and it must name a test that exists — a channel cannot be declared
+    /// measured by nothing.
+    #[serde(default)]
+    pub(crate) measured_by: Option<String>,
     /// Prose for a human reading the ledger. Declared so `deny_unknown_fields`
     /// accepts it; nothing machine-checks prose.
     #[serde(default)]
@@ -296,6 +300,23 @@ impl Ledger {
             .collect()
     }
 
+    /// The entries whose surface the Rust corpus produces. The rest
+    /// (`inbox_do_key`, `r2_key`, `realtime_event`) are minted inside the
+    /// Worker and are checked on the TypeScript side.
+    pub(crate) fn rust_surface_entries(&self) -> impl Iterator<Item = &Entry> {
+        const RUST_SURFACES: [&str; 6] = [
+            "append_request",
+            "ack_request",
+            "fetch_messages_request",
+            "register_accepted_lane_request",
+            "message_request_action_request",
+            "prepare_blob_upload_request",
+        ];
+        self.entries
+            .iter()
+            .filter(|entry| RUST_SURFACES.contains(&entry.surface.as_str()))
+    }
+
     pub(crate) fn entry(&self, surface: &str, path: &str) -> Option<&Entry> {
         self.entries
             .iter()
@@ -353,7 +374,7 @@ pub(crate) fn occurrences(value: &Value, needle: &str) -> BTreeSet<String> {
     out
 }
 
-fn walk(value: &Value, prefix: &str, visit: &mut impl FnMut(&str, &Value)) {
+pub(crate) fn walk(value: &Value, prefix: &str, visit: &mut impl FnMut(&str, &Value)) {
     match value {
         Value::Object(map) => {
             for (key, child) in map {
@@ -391,31 +412,6 @@ pub(crate) fn decode_inline(payload: &str) -> (Vec<u8>, Option<Value>) {
     (bytes, parsed)
 }
 
-/// Names of the sentinels that appear inside a decoded payload.
-pub(crate) fn sentinels_in_payload(
-    payload: &str,
-    bindings: &BTreeMap<String, String>,
-) -> BTreeSet<String> {
-    let (bytes, parsed) = decode_inline(payload);
-    let text = String::from_utf8_lossy(&bytes).to_string();
-    let mut found = BTreeSet::new();
-    for (name, value) in bindings {
-        if value.is_empty() {
-            continue;
-        }
-        if text.contains(value.as_str()) {
-            found.insert(name.clone());
-            continue;
-        }
-        if let Some(json) = parsed.as_ref() {
-            if !occurrences(json, value).is_empty() {
-                found.insert(name.clone());
-            }
-        }
-    }
-    found
-}
-
 /// A *maximal* protected application message, for the confidentiality boundary
 /// check. Exhaustive literal: a new field must be classified before it compiles.
 pub(crate) fn maximal_protected_message() -> crate::model::ProtectedAppMessage {
@@ -445,52 +441,6 @@ pub(crate) fn maximal_protected_message() -> crate::model::ProtectedAppMessage {
         body: sentinel::PLAINTEXT_BODY.to_string(),
         sent_at: 1_664_111_222_333,
     }
-}
-
-/// Replace the scalar at `path` with a distinguishable value, in place.
-///
-/// Used to prove that a field the ledger marks `signed` really is covered by
-/// the sender-proof domain. Returns whether the path was found.
-pub(crate) fn mutate_at(value: &mut Value, path: &str) -> bool {
-    let (head, rest) = match path.split_once('.') {
-        Some((head, rest)) => (head, Some(rest)),
-        None => (path, None),
-    };
-    let (key, is_array) = match head.strip_suffix("[]") {
-        Some(key) => (key, true),
-        None => (head, false),
-    };
-    let Some(child) = value.get_mut(key) else {
-        return false;
-    };
-    let targets: Vec<&mut Value> = if is_array {
-        match child.as_array_mut() {
-            Some(items) => items.iter_mut().collect(),
-            None => return false,
-        }
-    } else {
-        vec![child]
-    };
-    let mut touched = false;
-    for target in targets {
-        match rest {
-            Some(rest) => touched |= mutate_at(target, rest),
-            None => {
-                match target {
-                    Value::String(text) => *text = format!("{text}-mutated"),
-                    Value::Number(number) => {
-                        *target = Value::from(number.as_u64().unwrap_or(0).wrapping_add(1))
-                    }
-                    Value::Bool(flag) => *target = Value::Bool(!*flag),
-                    // A single-variant enum has nothing to mutate to; the
-                    // caller skips these and the ledger records why.
-                    _ => return false,
-                }
-                touched = true;
-            }
-        }
-    }
-    touched
 }
 
 /// Every exported `struct` / `enum` declared in a Rust source file, at either
@@ -574,6 +524,11 @@ pub(crate) fn declared_wire_types(source: &str) -> BTreeSet<String> {
 /// (`.../inbox/device%3A.../allowlist`), so a sentinel containing `:` would be
 /// invisible at exactly the places worth checking.
 ///
+/// What they are for now is Check P — proving a confidential field does not
+/// escape into a host-visible surface. Measuring what a field *carries* moved
+/// to [`crate::leakage_corpus`], which varies real identities across real runs
+/// and so catches a hash of one; a substring search never could.
+///
 /// The *shape* of an identifier cannot be chosen. `user_id` is
 /// `format!("user:{}", fingerprint(pubkey))` and `device_id` is
 /// `format!("device:{user_fp}:{device_fp}")` (`src/identity/mod.rs`), both key
@@ -586,9 +541,6 @@ pub(crate) mod sentinel {
     pub(crate) const SENDER_DEVICE_FP: &str = "K4N8VR2WQJ";
     pub(crate) const RECIPIENT_DEVICE_FP: &str = "D9WFC5XKQZ";
     pub(crate) const PLAINTEXT_BODY: &str = "M2JQ8NVTXR";
-    pub(crate) const ATTACHMENT_FILE_NAME: &str = "F7RKD4XNPW";
-    pub(crate) const GROUP_TITLE: &str = "G3HLW8QTYB";
-    pub(crate) const DISPLAY_NAME: &str = "N5VPX2CJRK";
     pub(crate) const MESSAGE_NONCE: u64 = 8_675_309;
 }
 
@@ -608,39 +560,6 @@ pub(crate) mod sentinel {
 pub(crate) fn fixture_conversation_id() -> &'static str {
     static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     ID.get_or_init(crate::model::random_opaque_id)
-}
-
-/// Bind sentinel names to the bare tokens to search for.
-///
-/// Bind the **token**, never the scaffolded id. `device:A:B` is percent-encoded
-/// to `device%3AA%3AB` inside `endpoint` fields, so searching for the assembled
-/// id reports "clean" at exactly the places worth checking; searching for `B`
-/// finds it either way.
-///
-/// A consequence falls out that the hand enumeration missed: because
-/// `device_id` is `format!("device:{user_fp}:{device_fp}")`, **every device id
-/// transitively names its user**. So `sender_device` sites also report
-/// `sender_user`, and removing `sender_user_id` from the envelope while keeping
-/// `sender_device_id` would not stop naming the sender.
-pub(crate) fn fixture_bindings() -> BTreeMap<String, String> {
-    [
-        ("sender_user", sentinel::SENDER_USER_FP),
-        ("recipient_user", sentinel::RECIPIENT_USER_FP),
-        ("sender_device", sentinel::SENDER_DEVICE_FP),
-        ("recipient_device", sentinel::RECIPIENT_DEVICE_FP),
-        ("attachment_file_name", sentinel::ATTACHMENT_FILE_NAME),
-        ("plaintext_body", sentinel::PLAINTEXT_BODY),
-        ("group_title", sentinel::GROUP_TITLE),
-        ("display_name", sentinel::DISPLAY_NAME),
-        ("conversation", fixture_conversation_id()),
-    ]
-    .into_iter()
-    .map(|(name, value)| (name.to_string(), value.to_string()))
-    .chain(std::iter::once((
-        "message_nonce".to_string(),
-        sentinel::MESSAGE_NONCE.to_string(),
-    )))
-    .collect()
 }
 
 /// A *maximal* append request: every `Option` is `Some` and every `Vec` is
@@ -698,9 +617,11 @@ pub(crate) fn maximal_append_request() -> crate::transport_contract::AppendEnvel
     }
 }
 
-/// RFC 9420 §6.3 MLSMessage wrapping a PrivateMessage. Existence proof:
-/// `mls_frame_header_names_the_conversation_in_the_clear` in mls_adapter.
-fn representative_mls_frame(conversation_id: &str) -> String {
+/// RFC 9420 §6.3 MLSMessage wrapping a PrivateMessage.
+///
+/// Shared with [`crate::leakage_corpus`], which uses it to show that a frame
+/// header is readable until the lane wrap hides it.
+pub(crate) fn representative_mls_frame(conversation_id: &str) -> String {
     fn push_vlbytes(out: &mut Vec<u8>, bytes: &[u8]) {
         let len = bytes.len();
         if len < 64 {
@@ -730,8 +651,8 @@ fn representative_mls_frame(conversation_id: &str) -> String {
 pub(crate) fn inbox_path_surfaces() -> Vec<(&'static str, Value)> {
     use crate::model::Ack;
     use crate::transport_contract::{
-        AckRequest, FetchMessagesRequest, MessageRequestAction, MessageRequestActionRequest,
-        PrepareBlobUploadRequest, RegisterAcceptedLaneRequest, TransportAuthRequirement,
+        AckRequest, MessageRequestAction, MessageRequestActionRequest, PrepareBlobUploadRequest,
+        RegisterAcceptedLaneRequest, TransportAuthRequirement,
     };
     use std::collections::BTreeMap;
 
@@ -740,10 +661,6 @@ pub(crate) fn inbox_path_surfaces() -> Vec<(&'static str, Value)> {
         sentinel::RECIPIENT_USER_FP,
         sentinel::RECIPIENT_DEVICE_FP
     );
-    let sender_user_id = format!("user:{}", sentinel::SENDER_USER_FP);
-    let recipient_user_id = format!("user:{}", sentinel::RECIPIENT_USER_FP);
-    let conversation_id = fixture_conversation_id();
-
     let auth = Some(TransportAuthRequirement::DeviceRuntime {
         runtime_id: "runtime:example".to_string(),
         device_id: recipient_device_id.clone(),
@@ -760,14 +677,11 @@ pub(crate) fn inbox_path_surfaces() -> Vec<(&'static str, Value)> {
                 },
             }),
         ),
-        (
-            "fetch_messages_request",
-            host_view(&FetchMessagesRequest {
-                device_id: recipient_device_id.clone(),
-                from_seq: 1,
-                limit: 100,
-            }),
-        ),
+        // `FetchMessagesRequest` has no fixture: the corpus measured that it
+        // never reaches a host as a document. The engine builds it only to
+        // interpolate a GET URL, so its three fields are enumerated on that URL
+        // (`fetch_messages_request:@url`). A literal here would describe a
+        // request that does not exist.
         (
             "register_accepted_lane_request",
             host_view(&RegisterAcceptedLaneRequest {
@@ -926,31 +840,6 @@ mod tests {
         );
     }
 
-    /// Bootstrap aid: prints the observed surface so ledger entries are derived
-    /// rather than transcribed. Ignored by default; run with
-    /// `cargo test --lib bootstrap_dump -- --ignored --nocapture`.
-    #[test]
-    #[ignore = "bootstrap aid, not a check"]
-    fn bootstrap_dump() {
-        let bindings = fixture_bindings();
-        let mut surfaces = vec![("append_request", host_view(&maximal_append_request()))];
-        surfaces.extend(inbox_path_surfaces());
-        for (surface, view) in &surfaces {
-            for path in leaf_paths(view) {
-                let carried: Vec<&str> = bindings
-                    .iter()
-                    .filter(|(_, value)| occurrences(view, value).contains(&path))
-                    .map(|(name, _)| name.as_str())
-                    .collect();
-                println!("{surface}\t{path}\t{}", carried.join(","));
-            }
-        }
-        println!("---- wire types ----");
-        for name in wire_module_types(&Ledger::load()) {
-            println!("{name}");
-        }
-    }
-
     /// Every surface the fixtures build, paired with its ledger name.
     fn surfaces() -> Vec<(&'static str, Value)> {
         let mut all = vec![("append_request", host_view(&maximal_append_request()))];
@@ -968,7 +857,14 @@ mod tests {
         let ledger = Ledger::load();
         for (surface, view) in surfaces() {
             let observed = leaf_paths(&view);
-            let declared = ledger.paths_for(surface);
+            // `@`-prefixed rows are the URL, headers and credential of a raw
+            // HTTP effect. There is no struct literal to be exhaustive over,
+            // so they belong to the corpus's enumeration, not this fixture's.
+            let declared: BTreeSet<String> = ledger
+                .paths_for(surface)
+                .into_iter()
+                .filter(|path| !path.starts_with('@'))
+                .collect();
             let undeclared: Vec<&String> = observed.difference(&declared).collect();
             let stale: Vec<&String> = declared.difference(&observed).collect();
             assert!(
@@ -985,44 +881,6 @@ mod tests {
                  Remove them - leaving them in overstates the leakage claim.",
                 stale.len()
             );
-        }
-    }
-
-    /// **Check X.** Each path carries exactly the sentinels the ledger declares.
-    ///
-    /// This is the check with teeth, and the only one that catches a derived
-    /// identifier regardless of how it was derived: `conversation_id` is
-    /// `conv:{userA}:{userB}` and `message_id` embeds it, so both report the
-    /// user sentinels without anyone having to notice the `format!`.
-    ///
-    /// Measured against the *maximal* fixture, so an `absent` field reports
-    /// what it WOULD carry if a producer ever populated it. That is the
-    /// conservative direction: it documents the latent leak rather than hiding
-    /// it behind "no producer sets this today".
-    #[test]
-    fn sentinels_appear_only_where_the_ledger_says() {
-        let ledger = Ledger::load();
-        let bindings = fixture_bindings();
-        for (surface, view) in surfaces() {
-            for path in leaf_paths(&view) {
-                let observed: BTreeSet<String> = bindings
-                    .iter()
-                    .filter(|(_, value)| occurrences(&view, value).contains(&path))
-                    .map(|(name, _)| name.clone())
-                    .collect();
-                let entry = ledger
-                    .entry(surface, &path)
-                    .unwrap_or_else(|| panic!("{surface}:{path} missing from the ledger"));
-                let declared: BTreeSet<String> = entry.carries.iter().cloned().collect();
-                assert_eq!(
-                    observed, declared,
-                    "{surface}:{path} carries {observed:?} but the ledger declares \
-                     {declared:?}.\nA new sentinel here is an unrecorded leak. Do not \
-                     simply widen `carries` to make this pass - that publishes a wider \
-                     leakage claim, and it is the same failure as the two this mechanism \
-                     exists to prevent."
-                );
-            }
         }
     }
 
@@ -1146,31 +1004,15 @@ mod tests {
         }
     }
 
-    /// **Check `signed`.** Each path the ledger marks `signed` really is covered
-    /// by the sender-proof domain, and each unsigned one really is not.
-    ///
-    /// This also repairs a known weakness of `every_field_is_covered` in
-    /// `src/model/signing.rs`: that test drives a *hand-written* mutation list,
-    /// so a newly added `Envelope` field does not fail it. Here the list comes
-    /// from the ledger, whose completeness `surface_paths_match_the_ledger`
-    /// guarantees.
-    #[test]
-    fn one_to_one_envelope_fields_are_unsigned() {
-        let ledger = Ledger::load();
-        let signed: Vec<&str> = ledger
-            .entries
-            .iter()
-            .filter(|entry| {
-                entry.surface == "append_request" && entry.path.starts_with("envelope.")
-            })
-            .filter(|entry| entry.signed)
-            .map(|entry| entry.path.as_str())
-            .collect();
-        assert!(
-            signed.is_empty(),
-            "1:1 envelope fields are not signed; leftover signed annotations: {signed:?}"
-        );
-    }
+    /// The assertions in [`crate::leakage_corpus`] a non-syntactic channel may
+    /// name as its measurement. Listed rather than discovered, because Rust
+    /// cannot enumerate its own tests — so the list is short on purpose and a
+    /// new measurement has to be added deliberately.
+    const CORPUS_MEASUREMENTS: [&str; 3] = [
+        "host_view_is_a_function_of_l",
+        "host_view_shares_no_token_across_inboxes",
+        "only_a_payloads_size_reaches_the_host",
+    ];
 
     /// The scope prose is part of the contract: an excluded surface without a
     /// reason, or an unchecked channel without a name, is an oversight wearing
@@ -1187,12 +1029,29 @@ mod tests {
         }
         for channel in &ledger.scope.non_syntactic_leakage {
             assert!(!channel.channel.is_empty(), "unnamed non-syntactic channel");
-            assert!(
-                !channel.checked,
-                "{} claims to be checked, but nothing here measures a non-syntactic \
-                 channel; say so honestly or implement the check",
-                channel.channel
-            );
+            // A channel may claim to be checked only by naming the test that
+            // measures it, and only if that test exists. Two became measurable
+            // when the corpus started deriving payload lengths and parsing
+            // frame headers; the rest are honest concessions, and a concession
+            // must not quietly acquire a measurer either.
+            match (channel.checked, channel.measured_by.as_deref()) {
+                (true, Some(name)) => assert!(
+                    CORPUS_MEASUREMENTS.contains(&name),
+                    "{} claims checked:true by `{name}`, which is not one of the \
+                     corpus assertions {CORPUS_MEASUREMENTS:?}",
+                    channel.channel
+                ),
+                (true, None) => panic!(
+                    "{} claims to be checked without naming what measures it",
+                    channel.channel
+                ),
+                (false, Some(name)) => panic!(
+                    "{} names `{name}` as its measurement but is still recorded \
+                     as unchecked",
+                    channel.channel
+                ),
+                (false, None) => {}
+            }
         }
         for bucket in ledger.not_enumerated.values() {
             assert!(
@@ -1386,6 +1245,42 @@ mod tests {
         );
     }
 
+    /// A payload that is `serde_json::to_vec` then base64 is not searchable
+    /// as a substring: base64 alignment shifts with offset. Check P depends on
+    /// the decode.
+    #[test]
+    fn base64_payloads_are_searched_after_decoding() {
+        let secret = "ZQ7X2M1PDA";
+        let payload = serde_json::json!({ "actorUserId": format!("user:{secret}") });
+        let encoded = base64::engine::general_purpose::STANDARD
+            .encode(serde_json::to_vec(&payload).expect("encode"));
+        assert!(
+            !encoded.contains(secret),
+            "precondition: the sentinel must not survive base64 as a substring, \
+             otherwise this test proves nothing"
+        );
+        let view = serde_json::json!({ "inlineCiphertext": encoded });
+        assert_eq!(
+            occurrences(&view, secret).into_iter().collect::<Vec<_>>(),
+            vec!["inlineCiphertext".to_string()],
+            "decoding must reveal the sentinel"
+        );
+    }
+
+    /// A payload that never was base64 must still be searched once the decode
+    /// attempt fails.
+    #[test]
+    fn plain_ascii_payloads_are_searched() {
+        let secret = "TP6YB3HSLM";
+        let view = serde_json::json!({
+            "inlineCiphertext": format!("membership_changed:conv:x:user:{secret}:2")
+        });
+        assert_eq!(
+            occurrences(&view, secret).into_iter().collect::<Vec<_>>(),
+            vec!["inlineCiphertext".to_string()]
+        );
+    }
+
     #[test]
     fn occurrences_finds_numbers_and_nested_strings() {
         let value = serde_json::json!({
@@ -1404,50 +1299,6 @@ mod tests {
 
     /// The detail that decides whether the sentinel check works at all.
     ///
-    /// Control payloads are `serde_json::to_vec` then base64 into
-    /// `inline_ciphertext`. Base64 alignment shifts with offset, so a plain
-    /// substring search over the serialized envelope finds nothing.
-    #[test]
-    fn base64_payloads_are_searched_after_decoding() {
-        let secret = "ZQ7X2M1PDA";
-        let payload = serde_json::json!({ "actorUserId": format!("user:{secret}") });
-        let encoded = base64::engine::general_purpose::STANDARD
-            .encode(serde_json::to_vec(&payload).expect("encode"));
-
-        assert!(
-            !encoded.contains(secret),
-            "precondition: the sentinel must not survive base64 as a substring, \
-             otherwise this test proves nothing"
-        );
-
-        let bindings: BTreeMap<String, String> = [("actor".to_string(), secret.to_string())]
-            .into_iter()
-            .collect();
-        assert_eq!(
-            sentinels_in_payload(&encoded, &bindings)
-                .iter()
-                .collect::<Vec<_>>(),
-            vec!["actor"],
-            "decoding must reveal the sentinel"
-        );
-    }
-
-    /// A bare ASCII payload (`ControlDeviceMembershipChanged` is not even
-    /// base64'd) must still be searched.
-    #[test]
-    fn plain_ascii_payloads_are_searched() {
-        let secret = "TP6YB3HSLM";
-        let payload = format!("membership_changed:conv:x:user:{secret}:2");
-        let bindings: BTreeMap<String, String> = [("peer".to_string(), secret.to_string())]
-            .into_iter()
-            .collect();
-        assert_eq!(
-            sentinels_in_payload(&payload, &bindings)
-                .iter()
-                .collect::<Vec<_>>(),
-            vec!["peer"]
-        );
-    }
 
     #[test]
     fn representative_frame_parses_as_an_mls_private_message() {

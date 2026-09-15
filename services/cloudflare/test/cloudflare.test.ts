@@ -2051,6 +2051,118 @@ test("append_response_does_not_disclose_disposition", async () => {
   assert.equal(((await head.json()) as { headSeq: number }).headSeq, 2);
 });
 
+/**
+ * What an inbox holds is what routing needed, and routing never needed to know
+ * who is writing. The only device id anywhere in its state is its owner's,
+ * which the recipient chose and which is the destination; every other opaque
+ * identifier is a lane, a message id, or a request id the host minted itself.
+ *
+ * Enumerated rather than spot-checked: every key is listed and every value
+ * walked in its serialized form, so a sender field added to a stored record
+ * fails here even though no test names that field.
+ */
+test("inbox_state_does_not_name_the_sender", async () => {
+  const state = new MemoryState();
+  const owner = "device:bob:phone";
+  const service = new InboxService(owner, state, new MemoryR2Store(), [], {
+    appendSeq: 0,
+    headSeq: 0,
+    ackedSeq: 0,
+    retentionDays: 30,
+    maxInlineBytes: 4096,
+    rateLimitPerMinute: 100,
+    rateLimitPerHour: 1000
+  });
+
+  const admitted = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+  const stranger = "cccccccccccccccccccccccccccccccc";
+  const mids = ["11111111111111111111111111111111", "22222222222222222222222222222222"];
+  await service.registerAcceptedLane(admitted, 500);
+  // One record in the stream and one in the first-contact queue, so both
+  // shapes of stored state are covered.
+  await service.appendEnvelope(sampleAppend(owner, mids[0], admitted), 1_000);
+  await service.appendEnvelope(sampleAppend(owner, mids[1], stranger), 1_001);
+
+  const stored = await state.list();
+  const queued = stored.get(`message-request:${stranger}`) as { requestId: string };
+  // The request id is minted by the host out of its own randomness and is not
+  // derived from anything the sender supplied, so it names no one.
+  const permitted = new Set<string>([admitted, stranger, ...mids, queued.requestId.split(":")[1]]);
+
+  const offences: string[] = [];
+  for (const [key, value] of stored) {
+    const text = `${key} ${JSON.stringify(value)}`;
+    for (const found of text.match(/\bdevice:[^"\s/]+/g) ?? []) {
+      if (found !== owner) offences.push(`${key}: device id ${found}`);
+    }
+    for (const found of text.match(/\buser:[^"\s/]+/g) ?? []) {
+      offences.push(`${key}: user id ${found}`);
+    }
+    for (const found of text.match(/\b[0-9a-f]{32}\b/g) ?? []) {
+      if (!permitted.has(found)) offences.push(`${key}: unaccounted identifier ${found}`);
+    }
+  }
+  assert.deepEqual(offences, [], `inbox state names something it should not: ${offences.join(", ")}`);
+
+  // Non-vacuity: both shapes must actually have been walked.
+  const keys = [...stored.keys()];
+  assert.ok(keys.some((key) => key.startsWith("record:")), "no delivered record was inspected");
+  assert.ok(keys.some((key) => key.startsWith("message-request:")), "no queued request was inspected");
+
+  // And a stored record carries no more than the wire format gives it.
+  const record = (await state.get("record:1")) as Record<string, unknown>;
+  const known = ["seq", "messageId", "recipientDeviceId", "receivedAt", "expiresAt", "state", "lane", "storageRef", "inlineBytes", "payloadRef"];
+  assert.deepEqual(
+    Object.keys(record).filter((field) => !known.includes(field)),
+    [],
+    "a stored record grew a field the wire format does not have"
+  );
+});
+
+/**
+ * A lane partitions the rate limit, so a stranger cannot spend someone else's
+ * quota. This is the `LIVE` half of the admission design: flooding is always
+ * available to whoever holds a lane, and the guarantee is only that it stays
+ * inside that lane.
+ *
+ * The first assertion is the teeth. Asserting only that the admitted lane
+ * still answers 200 would pass even if the stranger's appends had all been
+ * accepted quietly, so the flood has to be shown to have exhausted something —
+ * and shown to have exhausted the *append* bucket rather than the queue's own
+ * limiter or its capacity, which are different limits with different codes.
+ *
+ * The residual this deliberately does not assert away: every unknown lane
+ * shares one first-contact bucket, so strangers can still starve each other.
+ * That is recorded under LIVE and is not a claim of the design.
+ */
+test("rate_limit_bucket_cannot_be_poisoned_by_a_third_party", async () => {
+  const { env } = createEnv({ rateLimitPerMinute: "2", rateLimitPerHour: "100" });
+  const bundle = await issueDeviceBundle(env);
+  const admitted = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+  const stranger = "cccccccccccccccccccccccccccccccc";
+  await registerAcceptedLane(env, bundle.runtimeCredential.token, "device:bob:phone", admitted);
+
+  let refusals = 0;
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    const mid = String(attempt).repeat(32).slice(0, 32);
+    const response = await appendWithCapability(env, sampleAppend("device:bob:phone", mid, stranger));
+    if (response.status === 429) {
+      assert.equal(
+        ((await response.json()) as { code: string }).code,
+        "rate_limited",
+        "the refusal must come from the append bucket, not the queue's limiter or its capacity"
+      );
+      refusals += 1;
+    }
+  }
+  assert.ok(refusals > 0, "the flood exhausted nothing, so this test has no teeth");
+
+  for (const mid of ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa2"]) {
+    const response = await appendWithCapability(env, sampleAppend("device:bob:phone", mid, admitted));
+    assert.equal(response.status, 200, "an admitted lane keeps its own quota");
+  }
+});
+
 test("a payload upload is admitted on the lane and nothing else", async () => {
   const { env } = createEnv();
   const bundle = await issueDeviceBundle(env);
