@@ -116,6 +116,13 @@ enum InboxRecordSource {
 /// unwrap (or a bare Welcome). Control traffic lives inside application
 /// plaintext (`ProtectedPayloadKind`); the remaining `MessageType` variants
 /// are local / group-outbox projections and are not inbox-deliverable.
+///
+/// **Consumer:** `crate::leakage_ledger`'s
+/// `deliverable_message_types_declare_payload_protection`, which requires the
+/// ledger's `inlineCiphertext` map to name exactly the types returning `true`
+/// here. That is the only caller, and it is test-only, which is why the
+/// compiler reports this function as unused in a normal build. Deleting it
+/// silently drops that check.
 pub(crate) const fn inbox_deliverable(message_type: MessageType) -> bool {
     match message_type {
         MessageType::MlsApplication | MessageType::MlsCommit | MessageType::MlsWelcome => true,
@@ -734,7 +741,6 @@ impl CoreEngine {
                 request_nonce: 0,
                 message_nonce: snapshot.message_nonce,
                 recovery_contexts,
-                pending_allowlist_mutation: None,
                 local_display_name,
                 pending_sync_group_head: BTreeSet::new(),
                 group_sync_target_head: BTreeMap::new(),

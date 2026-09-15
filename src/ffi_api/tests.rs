@@ -10612,29 +10612,6 @@ mod tests {
         )));
     }
 
-    #[test]
-    fn add_allowlist_user_fetches_then_replaces_allowlist_document() {
-        let mut engine = CoreEngine::new();
-        engine
-            .handle_command(CoreCommand::ImportDeploymentBundle {
-                bundle: sample_deployment(),
-            })
-            .expect("deployment");
-        engine
-            .handle_command(CoreCommand::CreateOrLoadIdentity {
-                mnemonic: Some(ALICE_MNEMONIC.into()),
-                device_name: Some("phone".into()),
-                display_name: None,
-            })
-            .expect("identity");
-
-        let _ = engine
-            .handle_command(CoreCommand::RevokeContact {
-                user_id: "user:bob".into(),
-            })
-            .expect("revoke contact");
-    }
-
     #[derive(Debug)]
     struct HarnessUser {
         name: &'static str,

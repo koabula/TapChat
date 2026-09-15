@@ -28,6 +28,65 @@
       "services/cloudflare/src/group-outbox/durable.ts",
       "services/cloudflare/src/device-registry/durable.ts"
     ],
+    "wireModules": [
+      "src/model/mod.rs",
+      "src/transport_contract/mod.rs",
+      "src/direct_frame.rs",
+      "src/lane_wrap.rs"
+    ],
+    "nonWireModules": {
+      "engineAndFrontEnds": {
+        "reason": "The core engine, its FFI surface, and the CLI and desktop front ends. Their types are commands, events, effects and view models; whatever of theirs reaches a host does so by being one of the wire types, never by being serialized itself.",
+        "prefixes": [
+          "src/ffi_api/",
+          "src/cli/",
+          "src/desktop_app.rs",
+          "src/platform_ports.rs",
+          "src/contact_workflows.rs",
+          "src/lib.rs",
+          "src/main.rs"
+        ]
+      },
+      "localState": {
+        "reason": "Client state, in memory or in the local store. Serialized to disk behind the passphrase-derived key, never to a host; Corrupt is where the write-up accounts for it.",
+        "prefixes": [
+          "src/persistence/",
+          "src/conversation/",
+          "src/identity/",
+          "src/sync_engine/",
+          "src/capability/mod.rs",
+          "src/local_store.rs",
+          "src/direct_pcs.rs",
+          "src/group_pcs.rs",
+          "src/profile_crypto.rs",
+          "src/attachment_crypto.rs",
+          "src/safety_number.rs",
+          "src/passphrase_strength.rs",
+          "src/contact_share.rs"
+        ]
+      },
+      "mlsBoundary": {
+        "reason": "The MLS library boundary. What crosses it is RFC 9420's wire format, which the write-up assumes rather than models; the only part of it a host sees is the wrapped frame in Envelope.bytes, enumerated there.",
+        "prefixes": [
+          "src/mls_adapter/"
+        ]
+      },
+      "support": {
+        "reason": "Signature framing, error plumbing, logging, filesystem helpers, outbound fetch, and this checker itself. Nothing here defines a type that is serialized anywhere.",
+        "prefixes": [
+          "src/model/signing.rs",
+          "src/model/welcome_pickup_property_tests.rs",
+          "src/transport_contract/json_case.rs",
+          "src/error.rs",
+          "src/error_codes_generated.rs",
+          "src/logging.rs",
+          "src/log_sanitize.rs",
+          "src/fs_util.rs",
+          "src/external_fetch.rs",
+          "src/leakage_ledger.rs"
+        ]
+      }
+    },
     "nonSyntacticLeakage": [
       {
         "channel": "record_count_per_device",
@@ -63,24 +122,14 @@
       }
     ],
     "limits": [
-      "Containment is not information. This checks for a sentinel SUBSTRING, so any leak that is a FUNCTION of a secret - a hash, a size bucket, a first byte, a few bits of tag - passes clean. Consequence worth stating plainly: if conversation_id is ever 'fixed' by hashing it, these checks go quiet while the leak may be unchanged.",
+      "Containment is not information. This checks for a sentinel SUBSTRING, so any leak that is a FUNCTION of a secret - a hash, a size bucket, a first byte, a few bits of tag - passes clean. This limit has already bitten once, and not in the way it was written: the prediction named hashing conversation_id as the trigger, while what actually happened is that R3 made it random, after which every field carrying it reported clean. The repair was to capture the generated value as a sentinel, which works only because one value is shared across the fixtures; it does nothing for a genuine hash.",
       "Non-syntactic channels are not modelled at all; see nonSyntacticLeakage, where checked:false records that their absence is a decision and not an oversight.",
-      "`table` is not reconciled against the write-up. CI proves a human recorded a placement, not that the table contains that row. Closing this needs the table vendored into the repo.",
+      "`fate` uses the Fate column's vocabulary, but nothing here checks that the write-up actually assigns that fate. CI proves a human recorded a decision in a coordinate system the write-up cannot silently rename, not that the two agree. That reconciliation is still by hand, and it is deliberately the only coupling: a generator that rendered these entries into a table the write-up did not read was deleted rather than repaired.",
       "Inhabitation (bits) is declared, not yet measured. `constant` and `absent` claims are reviewed by hand until an engine-driven corpus check lands; the structural path set and the carries sets ARE measured.",
-      "Compile-time exhaustiveness has holes: serde(flatten), a serde_json::Value-typed field, serde(untagged), or a non-exhaustive match elsewhere would each make these checks go quiet rather than red. None are present in the in-scope types today."
+      "Compile-time exhaustiveness has holes: serde(flatten), a serde_json::Value-typed field, serde(untagged), or a non-exhaustive match elsewhere would each make these checks go quiet rather than red. None are present in the in-scope types today.",
+      "Widening `carries` to silence a red check is still a one-line edit to this file. The generator that made such a widening show up in a published artifact is gone; its replacement is the partition test of the engine-driven corpus, which measures `carries` instead of reading it. Until that lands, this file is trusted where it asserts and checked only where it can be contradicted.",
+      "lane and mid are not sentinels, deliberately. Both are random per-conversation or per-message values, so within one execution they behave like the conversation sentinel and would report where they are carried — but the claim worth testing about a lane is that the two inboxes of one conversation share no token, and that needs a corpus with both sides in it. Adding them against a single-inbox fixture would produce a green that means nothing. Deferred to the engine-driven corpus."
     ]
-  },
-  "tables": {
-    "sender_identity": "tab:inbox, Social graph rows",
-    "message_index": "tab:inbox, Linkability rows",
-    "envelope_metadata": "tab:inbox, Timing and Traffic type rows",
-    "attachment_refs": "tab:inbox, storage-ref rows (new; not in the table as published)",
-    "non_repudiation": "tab:inbox, Non-repudiation row",
-    "transport_addressing": "L_net, request-line addressing",
-    "storage_namespaces": "L_stg, object key namespaces",
-    "unmapped": "NO DECISION RECORDED - this value fails CI",
-    "inbox_state_keys": "tab:inbox, inbox-side state keys (new; not in the table as published)",
-    "realtime_push": "tab:inbox, Receiver behaviour rows"
   },
   "sentinels": {
     "literal": [
@@ -90,11 +139,12 @@
       "attachment_file_name"
     ],
     "captured": [
-      "sender_user",
+      "conversation",
+      "message_nonce",
+      "recipient_device",
       "recipient_user",
       "sender_device",
-      "recipient_device",
-      "message_nonce"
+      "sender_user"
     ]
   },
   "inlineCiphertext": {
@@ -109,8 +159,9 @@
       "bits": "inhabited",
       "carries": [],
       "signed": false,
-      "table": "envelope_metadata",
-      "note": "Wrapped MLS frame (nonce || ChaCha20-Poly1305). Check X must stay empty: the wrap hides group_id / conversation_id / usernames."
+      "parameter": "L_ibx",
+      "fate": "routing",
+      "note": "Wrapped MLS frame (nonce || ChaCha20-Poly1305). Check X must stay empty, and since the fixture frame now carries the shared conversation sentinel in its PrivateMessage group_id, an empty result is evidence that the wrap hides the frame header rather than an artefact of the id being random. Unwrapping it would report conversation."
     },
     {
       "surface": "append_request",
@@ -118,7 +169,8 @@
       "bits": "inhabited",
       "carries": [],
       "signed": false,
-      "table": "message_index"
+      "parameter": "L_ibx",
+      "fate": "routing"
     },
     {
       "surface": "append_request",
@@ -126,19 +178,25 @@
       "bits": "inhabited",
       "carries": [],
       "signed": false,
-      "table": "message_index"
+      "parameter": "L_ibx",
+      "fate": "routing"
     },
     {
       "surface": "append_request",
       "path": "envelope.storageRef.ref",
       "bits": "inhabited",
       "carries": [
+        "conversation",
+        "message_nonce",
+        "recipient_device",
+        "recipient_user",
         "sender_device",
         "sender_user"
       ],
       "signed": false,
-      "table": "attachment_refs",
-      "note": "R4 still owns making storage_ref.ref opaque."
+      "parameter": "L_ibx",
+      "fate": "to_repair",
+      "note": "tab:inbox requires an opaque key here. Today it is the object key, which names the sending user, device, conversation and message. Same key as the L_stg blob row; one repair closes both (R4)."
     },
     {
       "surface": "append_request",
@@ -146,7 +204,8 @@
       "bits": "inhabited",
       "carries": [],
       "signed": false,
-      "table": "attachment_refs"
+      "parameter": "L_ibx",
+      "fate": "ideal"
     },
     {
       "surface": "append_request",
@@ -157,7 +216,8 @@
         "recipient_user"
       ],
       "signed": false,
-      "table": "transport_addressing"
+      "parameter": "L_ibx",
+      "fate": "routing"
     },
     {
       "surface": "append_request",
@@ -168,7 +228,8 @@
         "recipient_user"
       ],
       "signed": false,
-      "table": "transport_addressing"
+      "parameter": "L_ibx",
+      "fate": "routing"
     },
     {
       "surface": "append_request",
@@ -177,7 +238,8 @@
       "value": "0.1",
       "carries": [],
       "signed": false,
-      "table": "envelope_metadata"
+      "parameter": "L_ibx",
+      "fate": "accepted"
     },
     {
       "surface": "ack_request",
@@ -185,7 +247,8 @@
       "bits": "inhabited",
       "carries": [],
       "signed": false,
-      "table": "transport_addressing"
+      "parameter": "L_ibx",
+      "fate": "ideal"
     },
     {
       "surface": "ack_request",
@@ -193,7 +256,8 @@
       "bits": "inhabited",
       "carries": [],
       "signed": false,
-      "table": "transport_addressing"
+      "parameter": "L_ibx",
+      "fate": "accepted"
     },
     {
       "surface": "ack_request",
@@ -204,7 +268,8 @@
         "recipient_user"
       ],
       "signed": false,
-      "table": "transport_addressing"
+      "parameter": "L_ibx",
+      "fate": "routing"
     },
     {
       "surface": "fetch_messages_request",
@@ -215,7 +280,8 @@
         "recipient_user"
       ],
       "signed": false,
-      "table": "transport_addressing"
+      "parameter": "L_ibx",
+      "fate": "routing"
     },
     {
       "surface": "fetch_messages_request",
@@ -223,7 +289,8 @@
       "bits": "inhabited",
       "carries": [],
       "signed": false,
-      "table": "transport_addressing"
+      "parameter": "L_ibx",
+      "fate": "ideal"
     },
     {
       "surface": "fetch_messages_request",
@@ -231,7 +298,8 @@
       "bits": "inhabited",
       "carries": [],
       "signed": false,
-      "table": "transport_addressing"
+      "parameter": "L_ibx",
+      "fate": "accepted"
     },
     {
       "surface": "register_accepted_lane_request",
@@ -242,7 +310,8 @@
         "recipient_user"
       ],
       "signed": false,
-      "table": "transport_addressing"
+      "parameter": "L_ibx",
+      "fate": "routing"
     },
     {
       "surface": "register_accepted_lane_request",
@@ -250,7 +319,8 @@
       "bits": "inhabited",
       "carries": [],
       "signed": false,
-      "table": "transport_addressing"
+      "parameter": "L_ibx",
+      "fate": "accepted"
     },
     {
       "surface": "register_accepted_lane_request",
@@ -259,7 +329,8 @@
       "value": "device_runtime",
       "carries": [],
       "signed": false,
-      "table": "transport_addressing"
+      "parameter": "L_ibx",
+      "fate": "accepted"
     },
     {
       "surface": "register_accepted_lane_request",
@@ -270,7 +341,8 @@
         "recipient_user"
       ],
       "signed": false,
-      "table": "transport_addressing"
+      "parameter": "L_ibx",
+      "fate": "routing"
     },
     {
       "surface": "register_accepted_lane_request",
@@ -281,7 +353,8 @@
         "recipient_user"
       ],
       "signed": false,
-      "table": "transport_addressing"
+      "parameter": "L_net",
+      "fate": "accepted"
     },
     {
       "surface": "register_accepted_lane_request",
@@ -289,7 +362,8 @@
       "bits": "inhabited",
       "carries": [],
       "signed": false,
-      "table": "inbox_state_keys"
+      "parameter": "L_ibx",
+      "fate": "routing"
     },
     {
       "surface": "message_request_action_request",
@@ -297,7 +371,8 @@
       "bits": "inhabited",
       "carries": [],
       "signed": false,
-      "table": "envelope_metadata"
+      "parameter": "L_ibx",
+      "fate": "accepted"
     },
     {
       "surface": "message_request_action_request",
@@ -308,7 +383,8 @@
         "recipient_user"
       ],
       "signed": false,
-      "table": "transport_addressing"
+      "parameter": "L_ibx",
+      "fate": "routing"
     },
     {
       "surface": "message_request_action_request",
@@ -316,7 +392,8 @@
       "bits": "inhabited",
       "carries": [],
       "signed": false,
-      "table": "transport_addressing"
+      "parameter": "L_ibx",
+      "fate": "accepted"
     },
     {
       "surface": "message_request_action_request",
@@ -325,7 +402,8 @@
       "value": "device_runtime",
       "carries": [],
       "signed": false,
-      "table": "transport_addressing"
+      "parameter": "L_ibx",
+      "fate": "accepted"
     },
     {
       "surface": "message_request_action_request",
@@ -336,7 +414,8 @@
         "recipient_user"
       ],
       "signed": false,
-      "table": "transport_addressing"
+      "parameter": "L_ibx",
+      "fate": "routing"
     },
     {
       "surface": "message_request_action_request",
@@ -344,17 +423,18 @@
       "bits": "inhabited",
       "carries": [],
       "signed": false,
-      "table": "transport_addressing"
+      "parameter": "L_net",
+      "fate": "accepted"
     },
     {
       "surface": "message_request_action_request",
       "path": "requestId",
       "bits": "inhabited",
-      "carries": [
-        "sender_user"
-      ],
+      "carries": [],
       "signed": false,
-      "table": "sender_identity"
+      "parameter": "L_ibx",
+      "fate": "accepted",
+      "note": "Random opaque id minted by the inbox (`request:{randomOpaqueId()}`), the host's own handle for a queued first contact. It carries nothing about the sender."
     },
     {
       "surface": "prepare_blob_upload_request",
@@ -365,7 +445,8 @@
         "recipient_user"
       ],
       "signed": false,
-      "table": "transport_addressing"
+      "parameter": "L_stg",
+      "fate": "routing"
     },
     {
       "surface": "prepare_blob_upload_request",
@@ -373,7 +454,8 @@
       "bits": "inhabited",
       "carries": [],
       "signed": false,
-      "table": "transport_addressing"
+      "parameter": "L_stg",
+      "fate": "accepted"
     },
     {
       "surface": "prepare_blob_upload_request",
@@ -382,15 +464,19 @@
       "value": "device_runtime",
       "carries": [],
       "signed": false,
-      "table": "transport_addressing"
+      "parameter": "L_stg",
+      "fate": "accepted"
     },
     {
       "surface": "prepare_blob_upload_request",
       "path": "conversationId",
       "bits": "inhabited",
-      "carries": [],
+      "carries": [
+        "conversation"
+      ],
       "signed": false,
-      "table": "message_index"
+      "parameter": "L_stg",
+      "fate": "to_repair"
     },
     {
       "surface": "prepare_blob_upload_request",
@@ -398,19 +484,22 @@
       "bits": "inhabited",
       "carries": [],
       "signed": false,
-      "table": "storage_namespaces"
+      "parameter": "L_stg",
+      "fate": "to_repair"
     },
     {
       "surface": "prepare_blob_upload_request",
       "path": "messageId",
       "bits": "inhabited",
       "carries": [
+        "conversation",
         "message_nonce",
         "recipient_device",
         "recipient_user"
       ],
       "signed": false,
-      "table": "message_index"
+      "parameter": "L_stg",
+      "fate": "to_repair"
     },
     {
       "surface": "prepare_blob_upload_request",
@@ -418,7 +507,8 @@
       "bits": "inhabited",
       "carries": [],
       "signed": false,
-      "table": "storage_namespaces"
+      "parameter": "L_stg",
+      "fate": "ideal"
     },
     {
       "surface": "prepare_blob_upload_request",
@@ -426,7 +516,8 @@
       "bits": "inhabited",
       "carries": [],
       "signed": false,
-      "table": "storage_namespaces"
+      "parameter": "L_stg",
+      "fate": "accepted"
     },
     {
       "surface": "prepare_blob_upload_request",
@@ -434,7 +525,8 @@
       "bits": "inhabited",
       "carries": [],
       "signed": false,
-      "table": "storage_namespaces"
+      "parameter": "L_stg",
+      "fate": "accepted"
     },
     {
       "surface": "prepare_blob_upload_request",
@@ -442,7 +534,8 @@
       "bits": "inhabited",
       "carries": [],
       "signed": false,
-      "table": "storage_namespaces"
+      "parameter": "L_stg",
+      "fate": "accepted"
     },
     {
       "surface": "inbox_do_key",
@@ -450,7 +543,8 @@
       "bits": "inhabited",
       "carries": [],
       "signed": false,
-      "table": "inbox_state_keys"
+      "parameter": "L_ibx",
+      "fate": "accepted"
     },
     {
       "surface": "inbox_do_key",
@@ -458,7 +552,8 @@
       "bits": "inhabited",
       "carries": [],
       "signed": false,
-      "table": "inbox_state_keys"
+      "parameter": "L_ibx",
+      "fate": "routing"
     },
     {
       "surface": "inbox_do_key",
@@ -466,7 +561,9 @@
       "bits": "inhabited",
       "carries": [],
       "signed": false,
-      "table": "inbox_state_keys"
+      "parameter": "L_ibx",
+      "fate": "to_repair",
+      "note": "A per-lane counter starting at 1, returned as the append `seq` while a lane is still queued, where an admitted lane returns the device-global head. The write-up's Send says the inbox answers with a sequence number and nothing else; that is false while the two counters differ, so the sender reads its own admission state off the first reply."
     },
     {
       "surface": "inbox_do_key",
@@ -474,7 +571,8 @@
       "bits": "inhabited",
       "carries": [],
       "signed": false,
-      "table": "message_index"
+      "parameter": "L_ibx",
+      "fate": "routing"
     },
     {
       "surface": "inbox_do_key",
@@ -482,7 +580,8 @@
       "bits": "inhabited",
       "carries": [],
       "signed": false,
-      "table": "message_index"
+      "parameter": "L_ibx",
+      "fate": "routing"
     },
     {
       "surface": "inbox_do_key",
@@ -490,7 +589,8 @@
       "bits": "inhabited",
       "carries": [],
       "signed": false,
-      "table": "inbox_state_keys"
+      "parameter": "L_ibx",
+      "fate": "routing"
     },
     {
       "surface": "inbox_do_key",
@@ -498,7 +598,8 @@
       "bits": "inhabited",
       "carries": [],
       "signed": false,
-      "table": "inbox_state_keys",
+      "parameter": "L_ibx",
+      "fate": "routing",
       "note": "Accepted-lane buckets. Unknown lanes share rate-limit:first-contact."
     },
     {
@@ -507,7 +608,8 @@
       "bits": "inhabited",
       "carries": [],
       "signed": false,
-      "table": "inbox_state_keys"
+      "parameter": "L_ibx",
+      "fate": "accepted"
     },
     {
       "surface": "inbox_do_key",
@@ -515,7 +617,8 @@
       "bits": "inhabited",
       "carries": [],
       "signed": false,
-      "table": "inbox_state_keys"
+      "parameter": "L_ibx",
+      "fate": "ideal"
     },
     {
       "surface": "inbox_do_key",
@@ -523,7 +626,8 @@
       "bits": "inhabited",
       "carries": [],
       "signed": false,
-      "table": "inbox_state_keys",
+      "parameter": "L_ibx",
+      "fate": "accepted",
       "note": "Holds the list of first-contact lanes that have attempted contact."
     },
     {
@@ -532,7 +636,8 @@
       "bits": "inhabited",
       "carries": [],
       "signed": false,
-      "table": "inbox_state_keys"
+      "parameter": "L_ibx",
+      "fate": "accepted"
     },
     {
       "surface": "inbox_do_key",
@@ -540,7 +645,8 @@
       "bits": "inhabited",
       "carries": [],
       "signed": false,
-      "table": "inbox_state_keys"
+      "parameter": "L_ibx",
+      "fate": "accepted"
     },
     {
       "surface": "r2_key",
@@ -554,7 +660,8 @@
         "sender_user"
       ],
       "signed": false,
-      "table": "storage_namespaces",
+      "parameter": "L_stg",
+      "fate": "to_repair",
       "note": "Read access is already gated on an independent 256-bit capability, so these identifiers buy nothing. R4 makes the key opaque."
     },
     {
@@ -566,7 +673,8 @@
         "recipient_user"
       ],
       "signed": false,
-      "table": "storage_namespaces",
+      "parameter": "L_stg",
+      "fate": "to_repair",
       "note": "Stores only ciphertext bytes for spilled records. The path still names the recipient device (C3 / R4)."
     },
     {
@@ -577,7 +685,8 @@
         "sender_user"
       ],
       "signed": false,
-      "table": "storage_namespaces",
+      "parameter": "L_stg",
+      "fate": "accepted",
       "note": "Served unauthenticated, so anyone who has ever seen a share link can re-fetch the current append capability indefinitely."
     },
     {
@@ -588,7 +697,8 @@
         "sender_user"
       ],
       "signed": false,
-      "table": "storage_namespaces"
+      "parameter": "L_stg",
+      "fate": "accepted"
     },
     {
       "surface": "r2_key",
@@ -598,7 +708,8 @@
         "sender_user"
       ],
       "signed": false,
-      "table": "storage_namespaces"
+      "parameter": "L_stg",
+      "fate": "accepted"
     },
     {
       "surface": "r2_key",
@@ -609,7 +720,8 @@
         "recipient_user"
       ],
       "signed": false,
-      "table": "storage_namespaces",
+      "parameter": "L_stg",
+      "fate": "to_repair",
       "note": "Group-scope, but it shares the single storage bucket, so one operator sees it alongside everything else."
     },
     {
@@ -618,7 +730,8 @@
       "bits": "inhabited",
       "carries": [],
       "signed": false,
-      "table": "realtime_push"
+      "parameter": "L_ibx",
+      "fate": "accepted"
     },
     {
       "surface": "realtime_event",
@@ -629,7 +742,8 @@
         "recipient_user"
       ],
       "signed": false,
-      "table": "realtime_push"
+      "parameter": "L_ibx",
+      "fate": "routing"
     },
     {
       "surface": "realtime_event",
@@ -637,7 +751,8 @@
       "bits": "inhabited",
       "carries": [],
       "signed": false,
-      "table": "realtime_push"
+      "parameter": "L_ibx",
+      "fate": "ideal"
     },
     {
       "surface": "realtime_event",
@@ -648,7 +763,8 @@
         "recipient_user"
       ],
       "signed": false,
-      "table": "realtime_push",
+      "parameter": "L_ibx",
+      "fate": "routing",
       "note": "InboxRecord with the four-field envelope; sender identifiers are no longer in the header."
     },
     {
@@ -657,7 +773,8 @@
       "bits": "inhabited",
       "carries": [],
       "signed": false,
-      "table": "sender_identity",
+      "parameter": "L_ibx",
+      "fate": "accepted",
       "note": "Random request id; no longer request:{senderUserId}."
     },
     {
@@ -666,7 +783,8 @@
       "bits": "inhabited",
       "carries": [],
       "signed": false,
-      "table": "realtime_push"
+      "parameter": "L_ibx",
+      "fate": "accepted"
     }
   ],
   "protectedFields": [
@@ -855,19 +973,27 @@
     "localOnly": {
       "reason": "Never serialized to a host. ProtectedAppMessage is covered separately by protectedFields.",
       "types": [
+        "AuthenticatedDirectCommit",
+        "ContactAcceptedBody",
         "Conversation",
         "ConversationKind",
         "ConversationMember",
         "ConversationState",
+        "GroupWelcomePickupBody",
+        "LaneRotationBody",
         "MlsStateStatus",
         "MlsStateSummary",
         "ModelModule",
-        "ContactAcceptedBody",
-        "GroupWelcomePickupBody",
-        "LaneRotationBody",
         "ProtectedAppMessage",
         "ProtectedPayloadKind",
         "SyncCheckpoint"
+      ]
+    },
+    "insideTheWrap": {
+      "reason": "The plaintext of a wrapped direct frame. These are serialized, but into the AEAD that Envelope.bytes carries, so a host sees only ciphertext — the evidence is that append_request.envelope.bytes measures an empty carries set while the fixture frame embeds the conversation sentinel. Worth naming rather than folding into localOnly: DirectCommitProof puts sender_user_id and sender_device_id back inside the frame, under a second signature domain, which is a partial reversal of the decision that removed sender_proof. It is safe where it sits and it is not in the write-up; whether it can be removed is an open question, not an oversight.",
+      "types": [
+        "DirectCommitProof",
+        "DirectWrappedFrame"
       ]
     }
   }

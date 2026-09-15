@@ -19,6 +19,12 @@ import type { RealtimeEvent } from "../src/types/contracts";
  * ledger the Rust side reads.
  */
 
+/**
+ * Only the fields this file actually reads. The cast below is a plain `as`, so
+ * a field declared here but absent from the data would go unnoticed rather
+ * than fail to compile — declaring more than is used buys a silent staleness
+ * risk and nothing else. `parameter` and `fate` are deliberately omitted.
+ */
 interface LedgerEntry {
   surface: string;
   path: string;
@@ -26,7 +32,6 @@ interface LedgerEntry {
   value?: string;
   carries: string[];
   signed: boolean;
-  table: string;
   note?: string;
 }
 

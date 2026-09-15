@@ -649,15 +649,7 @@ impl CoreEngine {
         })
     }
 
-    pub(super) fn add_allowlist_user(&mut self, _user_id: String) -> CoreResult<CoreOutput> {
-        Ok(CoreOutput::default())
-    }
-
-    pub(super) fn remove_allowlist_user(&mut self, user_id: String) -> CoreResult<CoreOutput> {
-        self.revoke_contact_lanes(user_id)
-    }
-
-    pub(super) fn remove_allowlist_users(
+    pub(super) fn revoke_contact_lanes_bulk(
         &mut self,
         user_ids: Vec<String>,
     ) -> CoreResult<CoreOutput> {

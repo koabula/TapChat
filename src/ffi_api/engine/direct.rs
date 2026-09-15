@@ -1608,7 +1608,7 @@ impl CoreEngine {
         if self.state.deployment_bundle.is_some() && !legacy_peer_user_ids.is_empty() {
             output = merge_outputs(
                 output,
-                self.remove_allowlist_users(legacy_peer_user_ids.into_iter().collect())?,
+                self.revoke_contact_lanes_bulk(legacy_peer_user_ids.into_iter().collect())?,
             );
         }
         Ok(output)
@@ -2905,7 +2905,7 @@ impl CoreEngine {
         let local_device_id = self.local_identity_device_id()?;
         let peer_label = self.contact_label(peer_user_id);
         let revoke = if self.state.deployment_bundle.is_some() {
-            self.remove_allowlist_user(peer_user_id.to_string())?
+            self.revoke_contact_lanes(peer_user_id.to_string())?
         } else {
             CoreOutput::default()
         };
@@ -3071,7 +3071,7 @@ impl CoreEngine {
             }),
         };
         if self.state.deployment_bundle.is_some() {
-            output = merge_outputs(output, self.remove_allowlist_user(user_id)?);
+            output = merge_outputs(output, self.revoke_contact_lanes(user_id)?);
         }
         Ok(merge_outputs(output, transport_output))
     }

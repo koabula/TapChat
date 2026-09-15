@@ -1294,13 +1294,6 @@ pub(crate) struct GroupRealtimeSessionState {
     pub(crate) reconnect_failures: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum PendingAllowlistMutation {
-    Add { user_id: String },
-    Remove { user_id: String },
-    RemoveMany { user_ids: Vec<String> },
-}
-
 #[derive(Debug)]
 pub(crate) struct CoreState {
     pub(crate) local_identity: Option<LocalIdentityState>,
@@ -1359,7 +1352,6 @@ pub(crate) struct CoreState {
     pub(crate) request_nonce: u64,
     pub(crate) message_nonce: u64,
     pub(crate) recovery_contexts: BTreeMap<String, RecoveryContext>,
-    pub(crate) pending_allowlist_mutation: Option<PendingAllowlistMutation>,
     pub(crate) local_display_name: Option<String>,
     /// Set of group_ids that are waiting for a head response to trigger a sync fetch.
     /// When the head response arrives, handle_group_outbox_head_fetched checks this set
@@ -1613,7 +1605,6 @@ impl Default for CoreState {
             request_nonce: 0,
             message_nonce: 0,
             recovery_contexts: BTreeMap::new(),
-            pending_allowlist_mutation: None,
             local_display_name: None,
             pending_sync_group_head: BTreeSet::new(),
             group_sync_target_head: BTreeMap::new(),

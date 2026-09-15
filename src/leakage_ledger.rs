@@ -1,13 +1,15 @@
 //! Mechanical enumeration of the surface an untrusted host observes.
 //!
-//! The leakage tables in the write-up (`tab:inbox` for `L_ibx`, the storage
-//! section for `L_stg`) are claims about what a host can see. Twice those
+//! The write-up's leakage parameters (`L_ibx`, `L_stg`, `L_net`) are claims
+//! about what a host can see. Twice those
 //! claims were wrong in the same way: a field existed in the wire format,
 //! nobody counted it, and it was recovered only on retrospective review — a
 //! plaintext certificate base64'd into `inline_ciphertext`, and the four
 //! identifiers baked into the storage object key. A third manual pass found
-//! three more, including that `conversation_id` is a plaintext concatenation
-//! of both parties' user ids.
+//! three more, including that `conversation_id` was then a plaintext
+//! concatenation of both parties' user ids. R3 made it random, which silenced
+//! this check on every field carrying it until the value was captured as a
+//! sentinel of its own.
 //!
 //! Re-reading the types by eye a fourth time has no reason to work better, so
 //! this module derives the surface from the code and compares it against
@@ -28,6 +30,15 @@
 //! 2. **Exhaustive matches.** `payload_class` matches every `MessageType`, so
 //!    a new variant fails to compile until its payload confidentiality is
 //!    declared.
+//!
+//! Each entry records two things about itself: the `parameter` — which
+//! observation point of the ideal functionality sees it — and the `fate` —
+//! why the write-up tolerates that. Both vocabularies are the ideal's own and
+//! do not move when the write-up reorganises its prose. An earlier version
+//! recorded instead *which row of which table* the datum belonged to; the
+//! tables were then restructured, five of the nine row names came to name
+//! nothing, and CI never noticed, because nothing here could check a claim
+//! about a document outside this repository.
 //!
 //! The limits are real and recorded in the ledger header. Chief among them:
 //! this checks *substring containment*, so a leak that is a hash or a size
@@ -73,6 +84,56 @@ pub(crate) enum Bits {
     Absent,
 }
 
+/// Which observation point of the ideal functionality sees this datum.
+///
+/// These are the ideal's own parameter names, mirrored by `scope.modeled`.
+/// The previous version of this field named a *row of a table in the
+/// write-up*; rows are prose and get restructured, and when they were, five
+/// of nine names here came to point at rows that no longer existed while CI
+/// stayed green. A parameter of Definition 1 does not move.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub(crate) enum Parameter {
+    #[serde(rename = "L_ibx")]
+    Ibx,
+    #[serde(rename = "L_stg")]
+    Stg,
+    #[serde(rename = "L_net")]
+    Net,
+}
+
+impl Parameter {
+    pub(crate) fn wire_name(self) -> &'static str {
+        match self {
+            Parameter::Ibx => "L_ibx",
+            Parameter::Stg => "L_stg",
+            Parameter::Net => "L_net",
+        }
+    }
+}
+
+/// Why this datum being host-visible is acceptable — the vocabulary of the
+/// write-up's Fate column, which is stable for the same reason `Parameter` is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Fate {
+    /// The component needs it to route or to admit the record: a row of
+    /// `tab:inbox`, or the identity the storage runtime authorizes an upload
+    /// against.
+    Routing,
+    /// The ideal functionality leaks it anyway — `|m|` and arrival order.
+    Ideal,
+    /// A stated limitation: `tab:inbox`'s ceiling, or the background the
+    /// write-up concedes to `L_net` and to a bundle that is public by design.
+    Accepted,
+    /// The deployment falls short of what the write-up claims for it. Either
+    /// `tab:gaps` marks the row *to repair*, or the protocol section states
+    /// something the code does not yet do.
+    ToRepair,
+    /// No decision recorded. This value fails CI; see
+    /// `every_entry_has_a_recorded_placement`.
+    Unmapped,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub(crate) struct Entry {
@@ -84,7 +145,8 @@ pub(crate) struct Entry {
     #[serde(default)]
     pub(crate) carries: Vec<String>,
     pub(crate) signed: bool,
-    pub(crate) table: String,
+    pub(crate) parameter: Parameter,
+    pub(crate) fate: Fate,
     /// Prose for a human reading the ledger. Declared so `deny_unknown_fields`
     /// accepts it; nothing machine-checks prose.
     #[serde(default)]
@@ -161,6 +223,22 @@ pub(crate) struct Scope {
     pub(crate) excluded_route_prefixes: Vec<String>,
     #[allow(dead_code)]
     pub(crate) internal_path_matchers: Vec<String>,
+    /// The source files whose exported types form the wire surface. Scanned
+    /// for `every_wire_type_is_classified`.
+    ///
+    /// Data rather than a constant in this file, because the constant used to
+    /// be written out at two call sites and was therefore two things that
+    /// could drift. That is the smaller half of why it moved; the larger half
+    /// is `non_wire_modules`, which makes the *list itself* checkable.
+    pub(crate) wire_modules: Vec<String>,
+    /// Every other source file, bucketed by the reason it declares no wire
+    /// type. Together with `wire_modules` these must cover `src/` exactly —
+    /// see `every_source_file_is_on_one_side_of_the_wire_boundary`.
+    ///
+    /// Without this, the type partition guards types but not *modules*: a new
+    /// file could start producing host-bound bytes and nothing would say so,
+    /// which is the same silence the guard exists to break, one level up.
+    pub(crate) non_wire_modules: BTreeMap<String, NonWireModules>,
     pub(crate) non_syntactic_leakage: Vec<NonSyntactic>,
     pub(crate) limits: Vec<String>,
 }
@@ -170,7 +248,6 @@ pub(crate) struct Scope {
 pub(crate) struct Ledger {
     pub(crate) version: u32,
     pub(crate) scope: Scope,
-    pub(crate) tables: BTreeMap<String, String>,
     pub(crate) sentinels: Sentinels,
     pub(crate) inline_ciphertext: BTreeMap<String, PayloadClass>,
     pub(crate) entries: Vec<Entry>,
@@ -192,6 +269,15 @@ pub(crate) struct Ledger {
 pub(crate) struct NotEnumerated {
     pub(crate) reason: String,
     pub(crate) types: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(crate) struct NonWireModules {
+    pub(crate) reason: String,
+    /// Paths relative to the crate root, forward-slashed. A trailing `/` makes
+    /// it a directory prefix; anything else must match a file exactly.
+    pub(crate) prefixes: Vec<String>,
 }
 
 impl Ledger {
@@ -337,8 +423,12 @@ pub(crate) fn maximal_protected_message() -> crate::model::ProtectedAppMessage {
 
     ProtectedAppMessage {
         version: CURRENT_MODEL_VERSION.to_string(),
-        app_message_id: format!("app:conv:x:{}:device:y", sentinel::MESSAGE_NONCE),
-        conversation_id: "conv:x".to_string(),
+        app_message_id: format!(
+            "app:{}:{}:device:y",
+            fixture_conversation_id(),
+            sentinel::MESSAGE_NONCE
+        ),
+        conversation_id: fixture_conversation_id().to_string(),
         sender_user_id: format!("user:{}", sentinel::SENDER_USER_FP),
         sender_device_id: format!(
             "device:{}:{}",
@@ -403,17 +493,66 @@ pub(crate) fn mutate_at(value: &mut Value, path: &str) -> bool {
     touched
 }
 
-/// Every `pub struct` / `pub enum` declared in a Rust source file.
+/// Every exported `struct` / `enum` declared in a Rust source file, at either
+/// `pub` or `pub(crate)` visibility.
 ///
 /// A deliberately dumb textual scan, matching existing practice in this repo
 /// (`scripts/check-tauri-command-errors.mjs` hand-scans Rust with `indexOf`).
 /// It only needs to be complete, not clever: over-reporting a type forces an
 /// explicit classification, which is the desired direction of failure.
+///
+/// `pub(crate)` counts. Leaving it out is what let `src/direct_frame.rs` — the
+/// inner structure of every wrapped frame — sit outside the partition even
+/// after its file was named: all three of its types are crate-visible, so a
+/// scan for `pub struct` alone returned nothing and reported success.
+/// Every exported type declared by the files `scope.wireModules` names.
+///
+/// Read at run time rather than `include_str!`ed, so the list can live in the
+/// ledger next to the reasons the other files are excluded. `include_str!`
+/// would pin the set at compile time to whatever was typed at the call site,
+/// which is exactly how two of these calls came to name two files while the
+/// wire surface had grown to four.
+pub(crate) fn wire_module_types(ledger: &Ledger) -> BTreeSet<String> {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut out = BTreeSet::new();
+    for module in &ledger.scope.wire_modules {
+        let source = std::fs::read_to_string(root.join(module)).unwrap_or_else(|error| {
+            panic!("scope.wireModules names {module}, which cannot be read: {error}")
+        });
+        out.extend(declared_wire_types(&source));
+    }
+    out
+}
+
+/// Every `.rs` file under `src/`, as crate-relative forward-slashed paths.
+pub(crate) fn source_files() -> BTreeSet<String> {
+    fn walk(dir: &std::path::Path, root: &std::path::Path, out: &mut BTreeSet<String>) {
+        for entry in std::fs::read_dir(dir).expect("src/ is readable") {
+            let path = entry.expect("readable directory entry").path();
+            if path.is_dir() {
+                walk(&path, root, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                let relative = path.strip_prefix(root).expect("path under the crate root");
+                out.insert(relative.to_string_lossy().replace('\\', "/"));
+            }
+        }
+    }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut out = BTreeSet::new();
+    walk(&root.join("src"), root, &mut out);
+    out
+}
+
 pub(crate) fn declared_wire_types(source: &str) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     for line in source.lines() {
         let line = line.trim();
-        for keyword in ["pub struct ", "pub enum "] {
+        for keyword in [
+            "pub struct ",
+            "pub enum ",
+            "pub(crate) struct ",
+            "pub(crate) enum ",
+        ] {
             if let Some(rest) = line.strip_prefix(keyword) {
                 let name: String = rest
                     .chars()
@@ -453,6 +592,24 @@ pub(crate) mod sentinel {
     pub(crate) const MESSAGE_NONCE: u64 = 8_675_309;
 }
 
+/// The one conversation id every fixture shares, captured from the production
+/// generator rather than written out here.
+///
+/// `conversation_id` used to be `conv:{userA}:{userB}`, so any field carrying
+/// it reported both parties and the sentinel check saw it for free. R3 made it
+/// `random_opaque_id()`, and with that the check went silent on every field
+/// that carries it — the ledger's own first recorded limit predicted this,
+/// naming "hashed" as the trigger when the actual trigger was "made random".
+///
+/// Captured, not chosen: the value's shape is whatever the production
+/// generator emits, so it cannot drift from it. One value across all fixtures
+/// is the point — a per-call random would be a different secret at each site
+/// and would again report clean everywhere.
+pub(crate) fn fixture_conversation_id() -> &'static str {
+    static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ID.get_or_init(crate::model::random_opaque_id)
+}
+
 /// Bind sentinel names to the bare tokens to search for.
 ///
 /// Bind the **token**, never the scaffolded id. `device:A:B` is percent-encoded
@@ -475,6 +632,7 @@ pub(crate) fn fixture_bindings() -> BTreeMap<String, String> {
         ("plaintext_body", sentinel::PLAINTEXT_BODY),
         ("group_title", sentinel::GROUP_TITLE),
         ("display_name", sentinel::DISPLAY_NAME),
+        ("conversation", fixture_conversation_id()),
     ]
     .into_iter()
     .map(|(name, value)| (name.to_string(), value.to_string()))
@@ -504,10 +662,10 @@ pub(crate) fn maximal_append_request() -> crate::transport_contract::AppendEnvel
         sentinel::RECIPIENT_USER_FP,
         sentinel::RECIPIENT_DEVICE_FP
     );
-    let conversation_id = crate::model::random_opaque_id();
+    let conversation_id = fixture_conversation_id();
     let lane = crate::model::random_opaque_id();
     let mid = crate::model::random_opaque_id();
-    let frame = representative_mls_frame(&conversation_id);
+    let frame = representative_mls_frame(conversation_id);
     let frame_bytes = base64::engine::general_purpose::STANDARD
         .decode(frame)
         .expect("representative frame");
@@ -518,11 +676,21 @@ pub(crate) fn maximal_append_request() -> crate::transport_contract::AppendEnvel
         mid,
         bytes: Some(base64::engine::general_purpose::STANDARD.encode(wrapped)),
         storage_ref: Some(EnvelopeStorageRef {
+            // The production key template, not an abbreviation of it:
+            // `blobs/{variant}/{ownerUserId}/{ownerDeviceId}/{storageScope}/
+            //  {groupSegment}/{conversationId}/{messageId}-{taskId}`.
+            // Shortening the last three segments to `conv/msg-task` is what
+            // kept this ref from ever reporting the conversation it names.
             object_ref: format!(
-                "blobs/original/user:{}/device:{}:{}/direct/direct/conv/msg-task",
+                "blobs/original/user:{}/device:{}:{}/direct/direct/{}/msg:{}:{}:device:{}:{}-task-1",
                 sentinel::SENDER_USER_FP,
                 sentinel::SENDER_USER_FP,
-                sentinel::SENDER_DEVICE_FP
+                sentinel::SENDER_DEVICE_FP,
+                conversation_id,
+                conversation_id,
+                sentinel::MESSAGE_NONCE,
+                sentinel::RECIPIENT_USER_FP,
+                sentinel::RECIPIENT_DEVICE_FP,
             ),
             size: 4096,
         }),
@@ -579,8 +747,7 @@ pub(crate) fn inbox_path_surfaces() -> Vec<(&'static str, Value)> {
     );
     let sender_user_id = format!("user:{}", sentinel::SENDER_USER_FP);
     let recipient_user_id = format!("user:{}", sentinel::RECIPIENT_USER_FP);
-    let conversation_id =
-        crate::conversation::direct_conversation_id(&sender_user_id, &recipient_user_id);
+    let conversation_id = fixture_conversation_id();
 
     let auth = Some(TransportAuthRequirement::DeviceRuntime {
         runtime_id: "runtime:example".to_string(),
@@ -623,7 +790,7 @@ pub(crate) fn inbox_path_surfaces() -> Vec<(&'static str, Value)> {
             "message_request_action_request",
             host_view(&MessageRequestActionRequest {
                 device_id: recipient_device_id.clone(),
-                request_id: format!("request:{sender_user_id}"),
+                request_id: format!("request:{}", crate::model::random_opaque_id()),
                 action: MessageRequestAction::Accept,
                 endpoint: "https://runtime.example/v1/inbox/d/message-requests/r/accept"
                     .to_string(),
@@ -635,7 +802,7 @@ pub(crate) fn inbox_path_surfaces() -> Vec<(&'static str, Value)> {
             "prepare_blob_upload_request",
             host_view(&PrepareBlobUploadRequest {
                 task_id: "task-1".to_string(),
-                conversation_id: conversation_id.clone(),
+                conversation_id: conversation_id.to_string(),
                 message_id: format!(
                     "msg:{conversation_id}:{}:{recipient_device_id}",
                     sentinel::MESSAGE_NONCE
@@ -695,11 +862,16 @@ mod tests {
 
         for entry in &ledger.entries {
             assert!(
-                ledger.tables.contains_key(&entry.table),
-                "{}:{} names table {:?}, which is not declared in `tables`",
+                ledger
+                    .scope
+                    .modeled
+                    .iter()
+                    .any(|name| name == entry.parameter.wire_name()),
+                "{}:{} is placed at {:?}, which is not one of the observation \
+                 points `scope.modeled` declares",
                 entry.surface,
                 entry.path,
-                entry.table
+                entry.parameter.wire_name()
             );
             for sentinel in &entry.carries {
                 assert!(
@@ -734,26 +906,30 @@ mod tests {
         }
     }
 
-    /// No host-visible datum may exist without a recorded decision about where
-    /// it belongs in the write-up.
+    /// No host-visible datum may exist without a recorded decision about why
+    /// the write-up tolerates it.
     ///
     /// This is the gate the whole exercise is for. Both previous misses were
-    /// not "we did not know" but "we knew and never wrote it down".
+    /// not "we did not know" but "we knew and never wrote it down". `Unmapped`
+    /// is the honest "not decided yet" state, and it is red on purpose: the
+    /// alternative — no such value — would force a claim where none has been
+    /// made.
     #[test]
     fn every_entry_has_a_recorded_placement() {
         let ledger = Ledger::load();
         let unmapped: Vec<String> = ledger
             .entries
             .iter()
-            .filter(|entry| entry.table == "unmapped")
+            .filter(|entry| entry.fate == Fate::Unmapped)
             .map(|entry| format!("  {}:{}", entry.surface, entry.path))
             .collect();
         assert!(
             unmapped.is_empty(),
-            "{} host-visible datum(s) have no recorded placement in the write-up.\n{}\n\
-             Give each a `table` from the ledger's `tables` map, or record why it is \
-             acceptable. Do not invent a placement to silence this — widening the \
-             claim is a change to a published table.",
+            "{} host-visible datum(s) have no recorded fate.\n{}\n\
+             Give each the `fate` that is true of it. Do not invent one to \
+             silence this — `to_repair` is always available and says something \
+             real, whereas a false `routing` or `accepted` is the appeasement \
+             this mechanism exists to prevent.",
             unmapped.len(),
             unmapped.join("\n")
         );
@@ -779,9 +955,7 @@ mod tests {
             }
         }
         println!("---- wire types ----");
-        for name in declared_wire_types(include_str!("model/mod.rs")).union(&declared_wire_types(
-            include_str!("transport_contract/mod.rs"),
-        )) {
+        for name in wire_module_types(&Ledger::load()) {
             println!("{name}");
         }
     }
@@ -810,7 +984,7 @@ mod tests {
                 undeclared.is_empty(),
                 "surface {surface}: {} path(s) are visible to the host but absent from \
                  contracts/leakage-ledger.json: {undeclared:?}\n\
-                 Add an entry for each, with a `table` placement.",
+                 Add an entry for each, with a `parameter` and a `fate`.",
                 undeclared.len()
             );
             assert!(
@@ -943,7 +1117,21 @@ mod tests {
             "if nothing is confidential the check is vacuous"
         );
 
+        // A confidential value may surface only where the ledger already
+        // records that the deployment falls short — `fate: to_repair`. That
+        // exception is not a second hand-maintained list: it is the same
+        // decision `every_entry_has_a_recorded_placement` reads, and the
+        // sentinel set at such a path is still pinned exactly by Check X. So
+        // silencing this by marking a path `to_repair` costs a public
+        // admission that the deployment is broken there, which is the
+        // opposite of the appeasement this file worries about.
         for (surface, view) in surfaces() {
+            let tolerated: BTreeSet<&str> = ledger
+                .entries
+                .iter()
+                .filter(|entry| entry.surface == surface && entry.fate == Fate::ToRepair)
+                .map(|entry| entry.path.as_str())
+                .collect();
             for name in &confidential {
                 let value = serialized
                     .get(*name)
@@ -952,10 +1140,16 @@ mod tests {
                         other => Some(other.to_string()),
                     })
                     .expect("confidential field present in the fixture");
+                let escaped: Vec<String> = occurrences(&view, &value)
+                    .into_iter()
+                    .filter(|path| !tolerated.contains(path.as_str()))
+                    .collect();
                 assert!(
-                    occurrences(&view, &value).is_empty(),
+                    escaped.is_empty(),
                     "confidential field {name:?} escaped into host-visible surface \
-                     {surface}"
+                     {surface} at {escaped:?}.\nEither stop putting it there, or — if \
+                     this is a known shortfall — record the path as `to_repair` in \
+                     contracts/leakage-ledger.json and say so in its `note`."
                 );
             }
         }
@@ -1057,12 +1251,7 @@ mod tests {
             }
         }
 
-        let declared = declared_wire_types(include_str!("model/mod.rs"))
-            .union(&declared_wire_types(include_str!(
-                "transport_contract/mod.rs"
-            )))
-            .cloned()
-            .collect::<BTreeSet<String>>();
+        let declared = wire_module_types(&ledger);
 
         let unclassified: Vec<&String> = declared.difference(&classified).collect();
         assert!(
@@ -1079,14 +1268,113 @@ mod tests {
         );
     }
 
+    /// **The module partition.** Every `.rs` file under `src/` is either a wire
+    /// module, whose types the check above classifies one by one, or is named
+    /// in a `nonWireModules` bucket with the reason it declares none.
+    ///
+    /// `every_wire_type_is_classified` guards *types* inside the files it is
+    /// told to read. It cannot guard the list of files, and so it was silent
+    /// when `src/direct_frame.rs` and `src/lane_wrap.rs` — both of them wire
+    /// format — grew outside it. That is the guard's own stated failure mode
+    /// ("a new type, no fixture, and the mechanism stays green") recurring one
+    /// level up, at module granularity.
+    ///
+    /// The partition is over files rather than over types on purpose. Scanning
+    /// all of `src/` for types would take the classified set from 150 names to
+    /// over 400, nearly all of them engine internals that never reach a host:
+    /// a list that large is not maintained, it is rubber-stamped.
     #[test]
-    fn declared_wire_types_scans_both_keywords() {
+    fn every_source_file_is_on_one_side_of_the_wire_boundary() {
+        let ledger = Ledger::load();
+        let files = source_files();
+        assert!(
+            files.len() > 20,
+            "the walk found only {} file(s); it is not reaching src/",
+            files.len()
+        );
+
+        let missing: Vec<&String> = ledger
+            .scope
+            .wire_modules
+            .iter()
+            .filter(|module| !files.contains(*module))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "scope.wireModules names {missing:?}, which do not exist"
+        );
+
+        let matches = |prefix: &str, file: &str| {
+            if let Some(dir) = prefix.strip_suffix('/') {
+                file.starts_with(dir) && file[dir.len()..].starts_with('/')
+            } else {
+                file == prefix
+            }
+        };
+
+        let mut unclassified = Vec::new();
+        for file in &files {
+            let wire = ledger.scope.wire_modules.contains(file);
+            let non_wire = ledger
+                .scope
+                .non_wire_modules
+                .values()
+                .flat_map(|bucket| &bucket.prefixes)
+                .any(|prefix| matches(prefix, file));
+            assert!(
+                !(wire && non_wire),
+                "{file} is both a wire module and excluded as a non-wire one"
+            );
+            if !wire && !non_wire {
+                unclassified.push(file.clone());
+            }
+        }
+        assert!(
+            unclassified.is_empty(),
+            "{} source file(s) are on neither side of the wire boundary:\n  {}\n\
+             Add each to `scope.wireModules` if its exported types reach a host, \
+             or to the `scope.nonWireModules` bucket whose reason applies. Do not \
+             widen a prefix to swallow it without reading it.",
+            unclassified.len(),
+            unclassified.join("\n  ")
+        );
+
+        for (name, bucket) in &ledger.scope.non_wire_modules {
+            assert!(
+                !bucket.reason.trim().is_empty(),
+                "scope.nonWireModules bucket {name:?} carries no reason"
+            );
+            for prefix in &bucket.prefixes {
+                assert!(
+                    files.iter().any(|file| matches(prefix, file)),
+                    "scope.nonWireModules bucket {name:?} excludes {prefix:?}, which \
+                     matches no source file; a dead exclusion silently widens next \
+                     time something is added under it"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn declared_wire_types_scans_every_exported_form() {
         let source = "pub struct Alpha {\n  pub enum_like: u8,\n}\npub enum Beta { X }\n\
-                      struct Private;\n    pub struct Indented<T>(T);\n";
+                      struct Private;\n    pub struct Indented<T>(T);\n\
+                      pub(crate) struct Crated;\npub(crate) enum CratedEnum { Y }\n\
+                      pub(super) struct Supered;\n";
         let found = declared_wire_types(source);
         assert!(found.contains("Alpha"));
         assert!(found.contains("Beta"));
         assert!(found.contains("Indented"));
+        assert!(
+            found.contains("Crated") && found.contains("CratedEnum"),
+            "crate-visible types are wire format too: every type in \
+             src/direct_frame.rs is `pub(crate)`, and missing them is what kept \
+             that module outside the partition"
+        );
+        assert!(
+            !found.contains("Supered"),
+            "`pub(super)` cannot escape its parent module, so it is not a wire type"
+        );
         assert!(
             !found.contains("Private"),
             "a private type is not part of the wire surface"
