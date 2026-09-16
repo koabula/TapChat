@@ -5376,10 +5376,15 @@ var ManagedSession = class {
 function segment(value) {
   return value.replace(/[^A-Za-z0-9:_-]/g, "_");
 }
+function opaqueName() {
+  const bytes = crypto.getRandomValues(new Uint8Array(32));
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
 var INBOX_DO_KEYS = {
   meta: "meta",
   acceptedLane: (lane) => `accepted-lane:${lane}`,
-  laneSeq: (lane) => `lane-seq:${lane}`,
   record: (seq) => `record:${seq}`,
   idempotency: (mid) => `idempotency:${mid}`,
   appendResult: (mid) => `append-result:${mid}`,
@@ -5391,21 +5396,25 @@ var INBOX_DO_KEYS = {
   rateLimitFirstContact: "rate-limit:first-contact"
 };
 var R2_KEYS = {
-  blob: (input) => [
-    "blobs",
-    input.variant,
-    segment(input.ownerUserId),
-    segment(input.ownerDeviceId),
-    input.storageScope,
-    segment(input.groupSegment),
-    segment(input.conversationId),
-    `${segment(input.messageId)}-${segment(input.taskId)}`
-  ].join("/"),
-  inboxPayload: (deviceId, seq) => `inbox-payload/${deviceId}/${seq}.json`,
+  blob: () => `blobs/${opaqueName()}`,
+  inboxPayload: () => `inbox-payload/${opaqueName()}`,
+  /**
+   * Named by the SHA-256 of the pickup capability rather than by a fresh
+   * random, because this is the one object with nowhere to record a fresh
+   * one: it is pure R2 with no Durable Object beside it, and the fetcher
+   * arrives holding only the descriptor. Hashing the credential it already
+   * presents gives an opaque name that both sides recompute, which is also
+   * why the expiry path can no longer delete a different key than the one it
+   * stored.
+   *
+   * The caller passes the digest, so unlike the two above, this builder is
+   * not itself the guarantee that the name carries nothing — see
+   * `scope.limits` in contracts/leakage-ledger.json.
+   */
+  welcomePickup: (capabilityDigest) => `welcome-pickup/${capabilityDigest}`,
   sharedStateIdentityBundle: (userId) => `shared-state/${segment(userId)}/identity_bundle.json`,
   sharedStateDeviceList: (userId) => `shared-state/${segment(userId)}/device_list.json`,
-  sharedStateDeviceStatus: (userId) => `shared-state/${segment(userId)}/device_status.json`,
-  welcomePickup: (groupId, deviceId, requestId) => `welcome-pickup/${groupId}/${deviceId}/${requestId ?? "unbound"}.json`
+  sharedStateDeviceStatus: (userId) => `shared-state/${segment(userId)}/device_status.json`
 };
 
 // src/inbox/service.ts
@@ -5501,6 +5510,36 @@ var InboxService = class {
   async getHead() {
     const meta = await this.getMeta();
     return { headSeq: meta.headSeq };
+  }
+  /**
+   * Authorize a sender to place one payload in this runtime's storage.
+   *
+   * The credential is the lane and nothing else. A lane is admitted only
+   * because the owner of this inbox accepted the contact, and revoking it is
+   * a single key deletion, so the same act that stops a sender appending also
+   * stops it uploading. Issuing a second, storage-specific credential was the
+   * alternative, and it has nowhere to be delivered from: at first contact the
+   * only channel to the recipient runs through this host.
+   *
+   * A sender with no admitted lane cannot upload at all. That is the intent
+   * rather than a gap — an unaccepted stranger can consume a bounded message
+   * request queue, but not storage.
+   *
+   * The quota is charged on the lane because the lane is already the rate
+   * limit partition for appends; a payload and the envelope that references
+   * it are one act, and counting them once each against the same bucket is
+   * what keeps that true.
+   */
+  async authorizeBlobUpload(lane, sizeBytes, now) {
+    this.assertOpaqueId(lane, "lane");
+    if (!Number.isSafeInteger(sizeBytes) || sizeBytes <= 0) {
+      throw new HttpError(400, "invalid_input", "sizeBytes is required");
+    }
+    if (!await this.isAcceptedLane(lane)) {
+      throw new HttpError(403, "invalid_capability", "lane is not admitted by this inbox");
+    }
+    await this.enforceRateLimit(INBOX_DO_KEYS.rateLimit(lane), now);
+    return { accepted: true };
   }
   async registerAcceptedLane(lane, now) {
     this.assertOpaqueId(lane, "lane");
@@ -5646,8 +5685,9 @@ var InboxService = class {
     const meta = await this.getMeta();
     const existingSeq = await this.state.get(INBOX_DO_KEYS.idempotency(input.envelope.mid));
     if (existingSeq !== void 0) {
-      return { accepted: true, seq: existingSeq };
+      return { seq: existingSeq };
     }
+    const appendSeq = meta.appendSeq + 1;
     const seq = meta.headSeq + 1;
     const expiresAt = now + meta.retentionDays * 24 * 60 * 60 * 1e3;
     const bytes = input.envelope.bytes;
@@ -5676,7 +5716,7 @@ var InboxService = class {
         inlineBytes: bytes
       };
     } else if (decoded) {
-      const payloadRef = R2_KEYS.inboxPayload(this.deviceId, seq);
+      const payloadRef = R2_KEYS.inboxPayload();
       await this.spillStore.putBytes(payloadRef, decoded);
       index = {
         seq,
@@ -5701,12 +5741,12 @@ var InboxService = class {
         storageRef: input.envelope.storageRef
       };
     }
-    const result = { accepted: true, seq };
+    const result = { seq: appendSeq };
     await this.state.putEntries({
       [INBOX_DO_KEYS.record(seq)]: index,
-      [INBOX_DO_KEYS.idempotency(record.messageId)]: seq,
+      [INBOX_DO_KEYS.idempotency(record.messageId)]: appendSeq,
       ...persistAppendResult ? { [INBOX_DO_KEYS.appendResult(record.messageId)]: result } : {},
-      [INBOX_DO_KEYS.meta]: { ...meta, headSeq: seq }
+      [INBOX_DO_KEYS.meta]: { ...meta, appendSeq, headSeq: seq }
     });
     this.publish({
       event: "head_updated",
@@ -5761,14 +5801,14 @@ var InboxService = class {
       totalBytes: queueMeta.totalBytes + requestBytes,
       senderCount: nextIndex.length
     };
-    const laneSeqKey = INBOX_DO_KEYS.laneSeq(lane);
-    const laneSeq = (await this.state.get(laneSeqKey) ?? 0) + 1;
-    const result = { accepted: true, seq: laneSeq };
+    const meta = await this.getMeta();
+    const appendSeq = meta.appendSeq + 1;
+    const result = { seq: appendSeq };
     await this.state.putEntries({
       [key]: entry,
       [INBOX_DO_KEYS.messageRequestIndex]: nextIndex,
       [INBOX_DO_KEYS.messageRequestMeta]: nextQueueMeta,
-      [laneSeqKey]: laneSeq,
+      [INBOX_DO_KEYS.meta]: { ...meta, appendSeq },
       [INBOX_DO_KEYS.appendResult(input.envelope.mid)]: result
     });
     await this.scheduleNextAlarm(now);
@@ -6144,6 +6184,7 @@ async function handleInboxDurableRequest(request, deps) {
   const now = deps.now ?? Date.now();
   const url = new URL(request.url);
   const service = new InboxService(deps.deviceId, deps.state, deps.spillStore, deps.sessions, {
+    appendSeq: 0,
     headSeq: 0,
     ackedSeq: 0,
     retentionDays: deps.retentionDays,
@@ -6175,6 +6216,15 @@ async function handleInboxDurableRequest(request, deps) {
       const action = requestActionMatch[2];
       const result = action === "accept" ? await service.acceptMessageRequest(requestId, now) : await service.rejectMessageRequest(requestId, now);
       return jsonResponse3(result);
+    }
+    if (url.pathname.endsWith("/blob-upload") && request.method === "POST") {
+      const body = await readJsonLimited(
+        request,
+        deps.messageRequestMaxBodyBytes ?? DEFAULT_MESSAGE_REQUEST_MAX_BODY_BYTES
+      );
+      return jsonResponse3(
+        await service.authorizeBlobUpload(body.lane ?? "", body.sizeBytes ?? 0, now)
+      );
     }
     const acceptedLaneMatch = url.pathname.match(/\/accepted-lanes\/([^/]+)$/);
     if (acceptedLaneMatch && request.method === "PUT") {
@@ -6306,6 +6356,7 @@ var InboxDurableObject = class extends DurableObjectBase3 {
         new R2JsonBlobStore2(this.envRef.TAPCHAT_STORAGE),
         [],
         {
+          appendSeq: 0,
           headSeq: 0,
           ackedSeq: 0,
           retentionDays: Number(this.envRef.RETENTION_DAYS ?? "30"),
@@ -6451,11 +6502,12 @@ var SHORT_BLOB_TOKEN_TTL_MS = 15 * 60 * 1e3;
 var CAPABILITY_METADATA_KEY = "read-capability-sha256";
 var DELETE_CAPABILITY_METADATA_KEY = "delete-capability-sha256";
 var BLOB_EXPIRY_METADATA_KEY = "blob-expires-at";
-function requireNonEmpty(value, field) {
-  if (!value || value.trim().length === 0) {
-    throw new HttpError(400, "invalid_input", `${field} is required`);
+var BLOB_NAMESPACE = "blobs/";
+function requireBlobNamespace(blobKey) {
+  if (!blobKey.startsWith(BLOB_NAMESPACE)) {
+    throw new HttpError(404, "blob_not_found", "blob does not exist");
   }
-  return value;
+  return blobKey;
 }
 function randomCapability() {
   const bytes = crypto.getRandomValues(new Uint8Array(32));
@@ -6486,33 +6538,22 @@ var StorageService = class {
     this.secret = secret;
     this.retentionMs = Math.max(1, Math.floor(retentionDays)) * 24 * 60 * 60 * 1e3;
   }
-  async prepareUpload(input, owner, now) {
-    const taskId = requireNonEmpty(input.taskId, "taskId");
-    const conversationId = requireNonEmpty(input.conversationId, "conversationId");
-    const messageId = requireNonEmpty(input.messageId, "messageId");
-    if (input.variant !== "original" && input.variant !== "preview") {
-      throw new HttpError(400, "invalid_input", "variant must be original or preview");
-    }
+  /**
+   * Mint a name and a one-shot upload token.
+   *
+   * The only thing this runtime needs to know is how many bytes are coming.
+   * The request used to also carry the conversation, the message, the group
+   * and the variant, all of it solely to assemble a structured key — and that
+   * key then travelled to the recipient's inbox as `envelope.storageRef.ref`,
+   * where its conversation segment was identical at both ends and undid what
+   * the per-direction lanes were for. Removing the identifiers from the key
+   * was not enough on its own: the honest form is not to send them.
+   */
+  async prepareUpload(input, now) {
     if (!Number.isSafeInteger(input.sizeBytes) || input.sizeBytes <= 0 || input.sizeBytes > MAX_BLOB_BYTES) {
       throw new HttpError(400, "invalid_input", "sizeBytes is outside supported limits");
     }
-    const storageScope = input.storageScope ?? (input.groupId ? "group" : "direct");
-    if (storageScope !== "direct" && storageScope !== "group") {
-      throw new HttpError(400, "invalid_input", "storageScope is invalid");
-    }
-    if (storageScope === "group" && (!input.groupId || input.groupId.trim().length === 0)) {
-      throw new HttpError(400, "invalid_input", "groupId is required for group storage");
-    }
-    const blobKey = R2_KEYS.blob({
-      variant: input.variant,
-      ownerUserId: owner.userId,
-      ownerDeviceId: owner.deviceId,
-      storageScope,
-      groupSegment: storageScope === "group" ? input.groupId : "direct",
-      conversationId,
-      messageId,
-      taskId
-    });
+    const blobKey = R2_KEYS.blob();
     const uploadExpiresAt = now + SHORT_BLOB_TOKEN_TTL_MS;
     const blobExpiresAt = now + this.retentionMs;
     const readCapability = randomCapability();
@@ -6568,19 +6609,19 @@ var StorageService = class {
     if (!capability) {
       throw new HttpError(403, "invalid_capability", "blob capability cannot be verified");
     }
-    const metadata = await this.store.headBytes(blobKey);
+    const metadata = await this.store.headBytes(requireBlobNamespace(blobKey));
     if (!metadata) {
       throw new HttpError(404, "blob_not_found", "blob does not exist");
-    }
-    const blobExpiresAt = Number(metadata.customMetadata[BLOB_EXPIRY_METADATA_KEY]);
-    if (!Number.isSafeInteger(blobExpiresAt) || blobExpiresAt <= now) {
-      await this.store.delete(blobKey);
-      throw new HttpError(410, "capability_expired", "blob retention period has expired");
     }
     const expectedHash = metadata.customMetadata[CAPABILITY_METADATA_KEY];
     const actualHash = await capabilityHash(capability);
     if (!expectedHash || !constantTimeEqual(expectedHash, actualHash)) {
       throw new HttpError(403, "invalid_capability", "blob capability is not valid for this object");
+    }
+    const blobExpiresAt = Number(metadata.customMetadata[BLOB_EXPIRY_METADATA_KEY]);
+    if (!Number.isSafeInteger(blobExpiresAt) || blobExpiresAt <= now) {
+      await this.store.delete(blobKey);
+      throw new HttpError(410, "capability_expired", "blob retention period has expired");
     }
     const range = rangeHeader ? parseRange(rangeHeader, metadata.size) : void 0;
     if (!includeBody) {
@@ -6608,7 +6649,7 @@ var StorageService = class {
     if (!capability) {
       throw new HttpError(403, "invalid_capability", "delete capability cannot be verified");
     }
-    const metadata = await this.store.headBytes(blobKey);
+    const metadata = await this.store.headBytes(requireBlobNamespace(blobKey));
     if (!metadata) return;
     const expectedHash = metadata.customMetadata[DELETE_CAPABILITY_METADATA_KEY];
     const actualHash = await capabilityHash(capability);
@@ -6661,8 +6702,13 @@ function rangeError(size) {
 }
 
 // src/welcome-pickup/service.ts
-function pickupKey(groupId, deviceId, requestId) {
-  return R2_KEYS.welcomePickup(groupId, deviceId, requestId);
+async function pickupKey(capability) {
+  const digest = new Uint8Array(
+    await crypto.subtle.digest("SHA-256", new TextEncoder().encode(capability))
+  );
+  return R2_KEYS.welcomePickup(
+    Array.from(digest, (byte) => byte.toString(16).padStart(2, "0")).join("")
+  );
 }
 var WelcomePickupService = class {
   store;
@@ -6674,7 +6720,7 @@ var WelcomePickupService = class {
     if (!request.welcomeB64?.trim()) {
       throw new HttpError(400, "invalid_input", "welcome_b64 must not be empty");
     }
-    await this.store.putJson(pickupKey(request.descriptor.groupId, request.descriptor.deviceId, request.descriptor.requestId), {
+    await this.store.putJson(await pickupKey(request.descriptor.capability), {
       descriptor: request.descriptor,
       welcomeB64: request.welcomeB64,
       manifest: request.manifest,
@@ -6684,7 +6730,7 @@ var WelcomePickupService = class {
   }
   async fetch(descriptor, now) {
     this.validateDescriptor(descriptor, now);
-    const stored = await this.store.getJson(pickupKey(descriptor.groupId, descriptor.deviceId, descriptor.requestId));
+    const stored = await this.store.getJson(await pickupKey(descriptor.capability));
     if (!stored) {
       throw new HttpError(404, "not_found", "welcome pickup not found");
     }
@@ -6692,7 +6738,7 @@ var WelcomePickupService = class {
       throw new HttpError(403, "invalid_capability", "welcome pickup capability does not match stored descriptor");
     }
     if (stored.descriptor.expiresAt <= now) {
-      await this.store.delete(pickupKey(descriptor.groupId, descriptor.deviceId));
+      await this.store.delete(await pickupKey(descriptor.capability));
       throw new HttpError(403, "capability_expired", "welcome pickup capability is expired");
     }
     return { welcomeB64: stored.welcomeB64, manifest: stored.manifest };
@@ -7077,7 +7123,7 @@ async function handleRequest(request, env) {
       const result = await verified.json();
       return jsonResponse4({ runtimeCredential: await issueDeviceRuntimeAuth(env, userId, deviceId, result.registrationVersion, now) });
     }
-    const inboxMatch = url.pathname.match(/^\/v1\/inbox\/([^/]+)\/(messages|ack|head|subscribe|accepted-lanes(?:\/[^/]+)?|message-requests(?:\/[^/]+\/(?:accept|reject))?)$/);
+    const inboxMatch = url.pathname.match(/^\/v1\/inbox\/([^/]+)\/(messages|ack|head|subscribe|blob-upload|accepted-lanes(?:\/[^/]+)?|message-requests(?:\/[^/]+\/(?:accept|reject))?)$/);
     if (inboxMatch) {
       const deviceId = decodeURIComponent(inboxMatch[1]);
       const operation = inboxMatch[2];
@@ -7104,6 +7150,13 @@ async function handleRequest(request, env) {
         await validateRegisteredRuntimeAuthorizationForDevice(request, env, deviceId, "inbox_subscribe", now);
       } else if (operation === "accepted-lanes" || operation.startsWith("accepted-lanes/") || operation === "message-requests" || operation.startsWith("message-requests/")) {
         await validateRegisteredRuntimeAuthorizationForDevice(request, env, deviceId, "inbox_manage", now);
+      }
+      if (request.method === "POST" && operation === "blob-upload") {
+        const bodyText = await readRequestTextLimited(request, CONTROL_JSON_MAX_BYTES);
+        const grant = await stub.fetch(forwardRequestWithBody(request, bodyText));
+        if (!grant.ok) return grant;
+        const { sizeBytes } = JSON.parse(bodyText);
+        return jsonResponse4(await store.prepareUpload({ sizeBytes: sizeBytes ?? 0 }, now));
       }
       if (request.method !== "GET" && request.method !== "HEAD") {
         const bodyText = await readRequestTextLimited(request, CONTROL_JSON_MAX_BYTES);
@@ -7388,10 +7441,9 @@ async function handleRequest(request, env) {
       }
     }
     if (request.method === "POST" && url.pathname === "/v1/storage/prepare-upload") {
-      const auth = await validateRegisteredRuntimeAuthorization(request, env, "storage_prepare_upload", now);
+      await validateRegisteredRuntimeAuthorization(request, env, "storage_prepare_upload", now);
       const body = await readJsonLimited(request, CONTROL_JSON_MAX_BYTES);
-      const result = await store.prepareUpload(body, { userId: auth.userId, deviceId: auth.deviceId }, now);
-      return jsonResponse4(result);
+      return jsonResponse4(await store.prepareUpload(body, now));
     }
     const uploadMatch = url.pathname.match(/^\/v1\/storage\/upload\/(.+)$/);
     if (request.method === "PUT" && uploadMatch) {

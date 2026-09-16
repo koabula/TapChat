@@ -1,10 +1,10 @@
 use std::path::PathBuf;
 
-use anyhow::{bail, Context, Result};
-use base64::{engine::general_purpose::STANDARD, Engine as _};
+use anyhow::{Context, Result, bail};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use tapchat_core::conversation::RecoveryStatus;
 use tapchat_core::ffi_api::{
-    AttachmentDescriptor, CoreCommand, CoreEvent, RecoveryReason, MAX_TRANSPORT_RETRIES,
+    AttachmentDescriptor, CoreCommand, CoreEvent, MAX_TRANSPORT_RETRIES, RecoveryReason,
 };
 use tapchat_core::identity::IdentityManager;
 use tapchat_core::model::{
@@ -64,10 +64,12 @@ async fn text_happy_path_and_reconnect_recovery_work() -> Result<()> {
         .engine()
         .conversation_state(&ctx.conversation_id)
         .context("bob conversation missing after first text")?;
-    assert!(conversation
-        .messages
-        .iter()
-        .any(|message| message.plaintext.as_deref() == Some("hello bob")));
+    assert!(
+        conversation
+            .messages
+            .iter()
+            .any(|message| message.plaintext.as_deref() == Some("hello bob"))
+    );
 
     let sync_state = ctx
         .bob
@@ -96,10 +98,12 @@ async fn text_happy_path_and_reconnect_recovery_work() -> Result<()> {
         .engine()
         .conversation_state(&ctx.conversation_id)
         .context("bob conversation missing after reconnect")?;
-    assert!(recovered
-        .messages
-        .iter()
-        .any(|message| message.plaintext.as_deref() == Some("after reconnect")));
+    assert!(
+        recovered
+            .messages
+            .iter()
+            .any(|message| message.plaintext.as_deref() == Some("after reconnect"))
+    );
 
     Ok(())
 }
@@ -135,11 +139,13 @@ async fn attachment_happy_path_uploads_and_downloads_blob() -> Result<()> {
         .iter()
         .find(|message| !message.storage_refs.is_empty())
         .context("attachment message not found")?;
-    assert!(attachment_message
-        .plaintext
-        .as_deref()
-        .unwrap_or_default()
-        .contains("payload.bin"));
+    assert!(
+        attachment_message
+            .plaintext
+            .as_deref()
+            .unwrap_or_default()
+            .contains("payload.bin")
+    );
 
     let attachment_message_id = attachment_message.message_id.clone();
     let attachment_reference = attachment_message.storage_refs[0].object_ref.clone();
@@ -188,9 +194,11 @@ async fn identity_refresh_sees_new_device_in_runtime() -> Result<()> {
 
     let devices = ctx.alice.contact_devices(&ctx.bob_user_id);
     assert_eq!(devices.len(), 2);
-    assert!(devices
-        .iter()
-        .any(|device| device.device_id == ctx.bob_laptop_device_id));
+    assert!(
+        devices
+            .iter()
+            .any(|device| device.device_id == ctx.bob_laptop_device_id)
+    );
     assert!(devices.iter().any(|device| {
         device.device_id == ctx.bob_phone_device_id && device.status == DeviceStatusKind::Active
     }));
@@ -242,15 +250,19 @@ async fn new_device_ingests_welcome_and_joins_existing_conversation() -> Result<
         .engine()
         .conversation_state(&ctx.conversation_id)
         .context("bob laptop conversation missing after welcome ingest")?;
-    assert!(conversation
-        .messages
-        .iter()
-        .any(|message| message.plaintext.as_deref() == Some("hello laptop")));
+    assert!(
+        conversation
+            .messages
+            .iter()
+            .any(|message| message.plaintext.as_deref() == Some("hello laptop"))
+    );
 
     let members = ctx.alice.conversation_members(&ctx.conversation_id);
-    assert!(members
-        .iter()
-        .any(|member| member.device_id == ctx.bob_laptop_device_id));
+    assert!(
+        members
+            .iter()
+            .any(|member| member.device_id == ctx.bob_laptop_device_id)
+    );
     assert_eq!(
         ctx.alice.conversation_recovery_status(&ctx.conversation_id),
         Some(RecoveryStatus::Healthy)
@@ -331,20 +343,24 @@ async fn revoke_shrinks_membership_and_stops_delivery_to_old_device() -> Result<
         .engine()
         .conversation_state(&ctx.conversation_id)
         .context("bob laptop conversation missing after revoke send")?;
-    assert!(laptop_conversation
-        .messages
-        .iter()
-        .any(|message| message.plaintext.as_deref() == Some("post revoke")));
+    assert!(
+        laptop_conversation
+            .messages
+            .iter()
+            .any(|message| message.plaintext.as_deref() == Some("post revoke"))
+    );
 
     let phone_conversation = ctx
         .bob_phone
         .engine()
         .conversation_state(&ctx.conversation_id)
         .context("bob phone conversation missing after revoke")?;
-    assert!(!phone_conversation
-        .messages
-        .iter()
-        .any(|message| message.plaintext.as_deref() == Some("post revoke")));
+    assert!(
+        !phone_conversation
+            .messages
+            .iter()
+            .any(|message| message.plaintext.as_deref() == Some("post revoke"))
+    );
 
     let members = ctx.alice.conversation_members(&ctx.conversation_id);
     assert!(
@@ -373,11 +389,12 @@ async fn delayed_welcome_delivery_recovers_after_sync_and_reconcile() -> Result<
         ctx.alice.conversation_recovery_status(&ctx.conversation_id),
         Some(RecoveryStatus::NeedsRecovery)
     );
-    assert!(ctx
-        .bob_laptop
-        .engine()
-        .conversation_state(&ctx.conversation_id)
-        .is_none());
+    assert!(
+        ctx.bob_laptop
+            .engine()
+            .conversation_state(&ctx.conversation_id)
+            .is_none()
+    );
 
     sync_driver_until_stable(
         &mut ctx.bob_laptop,
@@ -393,11 +410,12 @@ async fn delayed_welcome_delivery_recovers_after_sync_and_reconcile() -> Result<
         })
         .await?;
 
-    assert!(ctx
-        .bob_laptop
-        .engine()
-        .conversation_state(&ctx.conversation_id)
-        .is_some());
+    assert!(
+        ctx.bob_laptop
+            .engine()
+            .conversation_state(&ctx.conversation_id)
+            .is_some()
+    );
     assert_eq!(
         ctx.alice.conversation_recovery_status(&ctx.conversation_id),
         Some(RecoveryStatus::Healthy)
@@ -442,11 +460,12 @@ async fn restart_from_snapshot_during_recovery_resumes_and_converges() -> Result
         })
         .await?;
 
-    assert!(ctx
-        .bob_laptop
-        .engine()
-        .conversation_state(&ctx.conversation_id)
-        .is_some());
+    assert!(
+        ctx.bob_laptop
+            .engine()
+            .conversation_state(&ctx.conversation_id)
+            .is_some()
+    );
     assert_eq!(
         ctx.alice.conversation_recovery_status(&ctx.conversation_id),
         Some(RecoveryStatus::Healthy)
@@ -503,8 +522,8 @@ async fn repeated_refresh_identity_and_reconcile_are_idempotent_during_recovery(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn refresh_identity_retry_timer_retries_once_per_failure_and_stops_after_success(
-) -> Result<()> {
+async fn refresh_identity_retry_timer_retries_once_per_failure_and_stops_after_success()
+-> Result<()> {
     let mut ctx = setup_trio().await?;
 
     publish_bob_bundle(&ctx, DeviceStatusKind::Active, DeviceStatusKind::Active).await?;
@@ -1251,10 +1270,12 @@ async fn missing_commit_recovers_to_healthy_after_sync_and_reconcile() -> Result
         .engine()
         .conversation_state(&ctx.conversation_id)
         .context("bob phone conversation missing after missing commit recovery")?;
-    assert!(phone_conversation
-        .messages
-        .iter()
-        .any(|message| message.message_type == MessageType::MlsApplication));
+    assert!(
+        phone_conversation
+            .messages
+            .iter()
+            .any(|message| message.message_type == MessageType::MlsApplication)
+    );
     assert_eq!(
         ctx.bob_phone
             .conversation_recovery_status(&ctx.conversation_id),
@@ -1284,10 +1305,12 @@ async fn missing_commit_recovers_to_healthy_after_sync_and_reconcile() -> Result
         .engine()
         .conversation_state(&ctx.conversation_id)
         .context("bob phone conversation missing after recovered message")?;
-    assert!(recovered_phone_conversation
-        .messages
-        .iter()
-        .any(|message| message.plaintext.as_deref() == Some("after missing commit recovered")));
+    assert!(
+        recovered_phone_conversation
+            .messages
+            .iter()
+            .any(|message| message.plaintext.as_deref() == Some("after missing commit recovered"))
+    );
     let phone_head = ctx
         .runtime
         .get_head(&ctx.bob_phone_auth, &ctx.bob_phone_device_id)
@@ -1308,9 +1331,10 @@ async fn unrecoverable_gap_escalates_to_needs_rebuild() -> Result<()> {
         ctx.alice.conversation_recovery_status(&ctx.conversation_id),
         Some(RecoveryStatus::NeedsRecovery)
     );
-    assert!(ctx
-        .alice
-        .snapshot_has_recovery_context(&ctx.conversation_id));
+    assert!(
+        ctx.alice
+            .snapshot_has_recovery_context(&ctx.conversation_id)
+    );
 
     let mut snapshot = ctx
         .alice
@@ -1445,20 +1469,24 @@ async fn revoke_during_recovery_keeps_revoked_device_isolated() -> Result<()> {
         .engine()
         .conversation_state(&ctx.conversation_id)
         .context("bob laptop conversation missing after revoke during recovery")?;
-    assert!(laptop_conversation
-        .messages
-        .iter()
-        .any(|message| message.plaintext.as_deref() == Some("post revoke during recovery")));
+    assert!(
+        laptop_conversation
+            .messages
+            .iter()
+            .any(|message| message.plaintext.as_deref() == Some("post revoke during recovery"))
+    );
 
     let phone_conversation = ctx
         .bob_phone
         .engine()
         .conversation_state(&ctx.conversation_id)
         .context("bob phone conversation missing after revoke during recovery")?;
-    assert!(!phone_conversation
-        .messages
-        .iter()
-        .any(|message| message.plaintext.as_deref() == Some("post revoke during recovery")));
+    assert!(
+        !phone_conversation
+            .messages
+            .iter()
+            .any(|message| message.plaintext.as_deref() == Some("post revoke during recovery"))
+    );
     assert_eq!(
         ctx.alice.conversation_recovery_status(&ctx.conversation_id),
         Some(RecoveryStatus::Healthy)
@@ -1557,20 +1585,24 @@ async fn revoke_during_recovery_then_restart_keeps_revoked_device_isolated() -> 
         .engine()
         .conversation_state(&ctx.conversation_id)
         .context("bob laptop conversation missing after revoke restart")?;
-    assert!(laptop_conversation
-        .messages
-        .iter()
-        .any(|message| message.plaintext.as_deref() == Some("post revoke restart")));
+    assert!(
+        laptop_conversation
+            .messages
+            .iter()
+            .any(|message| message.plaintext.as_deref() == Some("post revoke restart"))
+    );
 
     let phone_conversation = ctx
         .bob_phone
         .engine()
         .conversation_state(&ctx.conversation_id)
         .context("bob phone conversation missing after revoke restart")?;
-    assert!(!phone_conversation
-        .messages
-        .iter()
-        .any(|message| message.plaintext.as_deref() == Some("post revoke restart")));
+    assert!(
+        !phone_conversation
+            .messages
+            .iter()
+            .any(|message| message.plaintext.as_deref() == Some("post revoke restart"))
+    );
     assert_eq!(
         ctx.alice.conversation_recovery_status(&ctx.conversation_id),
         Some(RecoveryStatus::Healthy)
@@ -1598,21 +1630,24 @@ async fn restart_during_recovery_preserves_context_and_converges() -> Result<()>
         "restart-mid-recovery-laptop",
     )
     .await?;
-    assert!(ctx
-        .bob_laptop
-        .engine()
-        .conversation_state(&ctx.conversation_id)
-        .is_some());
+    assert!(
+        ctx.bob_laptop
+            .engine()
+            .conversation_state(&ctx.conversation_id)
+            .is_some()
+    );
 
     let snapshot = ctx
         .alice
         .latest_snapshot()
         .cloned()
         .context("alice recovery snapshot missing for mid-stage restart")?;
-    assert!(snapshot
-        .recovery_contexts
-        .iter()
-        .any(|context| context.conversation_id == ctx.conversation_id));
+    assert!(
+        snapshot
+            .recovery_contexts
+            .iter()
+            .any(|context| context.conversation_id == ctx.conversation_id)
+    );
 
     let mut restored = CoreDriver::from_snapshot(snapshot)?;
     restored
@@ -1651,10 +1686,12 @@ async fn restart_during_recovery_preserves_context_and_converges() -> Result<()>
         .engine()
         .conversation_state(&ctx.conversation_id)
         .context("bob laptop conversation missing after mid-stage restart recovery")?;
-    assert!(laptop_conversation
-        .messages
-        .iter()
-        .any(|message| message.plaintext.as_deref() == Some("after mid recovery restart")));
+    assert!(
+        laptop_conversation
+            .messages
+            .iter()
+            .any(|message| message.plaintext.as_deref() == Some("after mid recovery restart"))
+    );
 
     Ok(())
 }
@@ -1779,10 +1816,12 @@ async fn rebuild_command_recreates_direct_conversation_and_recovers() -> Result<
         .engine()
         .conversation_state(&ctx.conversation_id)
         .context("bob conversation missing after rebuild recovery")?;
-    assert!(conversation
-        .messages
-        .iter()
-        .any(|message| message.plaintext.as_deref() == Some("after rebuild")));
+    assert!(
+        conversation
+            .messages
+            .iter()
+            .any(|message| message.plaintext.as_deref() == Some("after rebuild"))
+    );
 
     Ok(())
 }

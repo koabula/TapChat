@@ -1,11 +1,11 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use futures_util::StreamExt;
 use reqwest::Client;
 use tapchat_core::conversation::RecoveryStatus;
-use tapchat_core::external_fetch::{fetch_external_json, ExternalResourceKind};
+use tapchat_core::external_fetch::{ExternalResourceKind, fetch_external_json};
 use tapchat_core::ffi_api::{
     CoreCommand, CoreEffect, CoreEngine, CoreEvent, CoreOutput, HttpMethod, PersistStateEffect,
     RealtimeEvent, RealtimeSessionSnapshot, RecoveryContextSnapshot, SyncCheckpointSnapshot,
@@ -15,8 +15,8 @@ use tapchat_core::model::{
 };
 use tapchat_core::persistence::CorePersistenceSnapshot;
 use tapchat_core::platform_ports::{
-    execute_platform_effect, BlobIoPort, NotificationPort, PersistencePort, RealtimePort,
-    SecureStoragePort, TimerPort, TransportPort,
+    BlobIoPort, NotificationPort, PersistencePort, RealtimePort, SecureStoragePort, TimerPort,
+    TransportPort, execute_platform_effect,
 };
 use tapchat_core::transport_contract::{
     AppendEnvelopeRequest, BlobDownloadRequest, BlobUploadRequest, FetchIdentityBundleRequest,
@@ -26,9 +26,9 @@ use tapchat_core::transport_contract::{
 };
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
-use tokio::time::{timeout, Duration, Instant};
+use tokio::time::{Duration, Instant, timeout};
 use tokio_tungstenite::connect_async;
-use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
+use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest};
 
 use tapchat_core::transport_contract::json_case::{
     to_camel_case_json_string, to_snake_case_json_string,
@@ -1315,7 +1315,7 @@ fn merge_outputs(mut left: CoreOutput, right: CoreOutput) -> CoreOutput {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_realtime_event, CoreDriver};
+    use super::{CoreDriver, parse_realtime_event};
 
     #[test]
     fn driver_restore_failure_does_not_create_empty_engine() {
