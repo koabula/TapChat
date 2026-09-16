@@ -659,16 +659,6 @@ impl CoreDriver {
                         .and_then(|field| field.as_str())
                         .unwrap_or(&action.request_id)
                         .to_string(),
-                    promoted_conversation_ids: value
-                        .get("promoted_conversation_ids")
-                        .and_then(|field| field.as_array())
-                        .map(|items| {
-                            items
-                                .iter()
-                                .filter_map(|item| item.as_str().map(ToOwned::to_owned))
-                                .collect()
-                        })
-                        .unwrap_or_default(),
                     promoted_count: value
                         .get("promoted_count")
                         .and_then(|field| field.as_u64())

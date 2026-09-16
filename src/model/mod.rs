@@ -321,6 +321,7 @@ pub enum DeliveryClass {
 #[serde(rename_all = "snake_case")]
 pub enum ProtectedPayloadKind {
     Text,
+    Attachment,
     LaneRotation,
     ContactAccepted,
     ContactRemoved,
@@ -347,11 +348,6 @@ pub struct ProtectedAppMessage {
 pub struct LaneRotationBody {
     pub bundle: IdentityBundle,
     pub inbound_lane: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ContactAcceptedBody {
-    pub request_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -514,7 +510,25 @@ impl Validate for ProtectedAppMessage {
         }
         validate_required("body", &self.body)?;
         match self.payload_kind {
-            ProtectedPayloadKind::Text | ProtectedPayloadKind::ContactRemoved => Ok(()),
+            ProtectedPayloadKind::Text
+            | ProtectedPayloadKind::ContactAccepted
+            | ProtectedPayloadKind::ContactRemoved => Ok(()),
+            ProtectedPayloadKind::Attachment => {
+                let body: crate::attachment_crypto::AttachmentManifestV2 =
+                    serde_json::from_str(&self.body).map_err(|error| {
+                        CoreError::invalid_input(format!(
+                            "attachment manifest body is malformed: {error}"
+                        ))
+                    })?;
+                // The download path refuses any other version anyway; refusing
+                // it here means an unsupported manifest never reaches a store.
+                if body.version != 2 {
+                    return Err(CoreError::invalid_input(
+                        "unsupported attachment manifest version",
+                    ));
+                }
+                Ok(())
+            }
             ProtectedPayloadKind::LaneRotation => {
                 let body: LaneRotationBody = serde_json::from_str(&self.body).map_err(|error| {
                     CoreError::invalid_input(format!("lane rotation body is malformed: {error}"))
@@ -525,12 +539,6 @@ impl Validate for ProtectedAppMessage {
                         "inbound_lane must be a 128-bit hex id",
                     ));
                 }
-                Ok(())
-            }
-            ProtectedPayloadKind::ContactAccepted => {
-                let _: ContactAcceptedBody = serde_json::from_str(&self.body).map_err(|error| {
-                    CoreError::invalid_input(format!("contact accepted body is malformed: {error}"))
-                })?;
                 Ok(())
             }
             ProtectedPayloadKind::GroupWelcomePickup => {

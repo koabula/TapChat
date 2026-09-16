@@ -566,7 +566,6 @@ impl Recorder {
                             request_id: action.request_id,
                             promoted_count: promoted,
                             action: crate::transport_contract::MessageRequestAction::Accept,
-                            promoted_conversation_ids: Vec::new(),
                         },
                     },
                 )
@@ -959,6 +958,26 @@ pub(crate) fn record_run(inputs: &RunInputs) -> Vec<Record> {
         },
     );
     recorder.step("b_fetch_spill", Party::Bob, sync(&bob_device));
+    // The corpus has always run this step, but it only ever measured what the
+    // host saw -- so a spill that Bob refused outright still recorded a
+    // perfectly normal host view, and the refusal went unnoticed for as long as
+    // it existed. Measuring a delivery is not the same as witnessing one.
+    assert!(
+        recorder
+            .bob
+            .state
+            .conversations
+            .get(&conversation_id)
+            .expect("bob conversation")
+            .messages
+            .iter()
+            .filter_map(|message| message.plaintext.as_deref())
+            .any(|plaintext| {
+                serde_json::from_str::<crate::attachment_crypto::AttachmentManifestV2>(plaintext)
+                    .is_ok()
+            }),
+        "the spilled attachment must reach Bob, not just the host"
+    );
 
     harness::set_direct_pcs_debt(
         &mut recorder.alice,

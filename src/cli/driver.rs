@@ -760,16 +760,6 @@ impl CoreDriver {
                         .and_then(|field| field.as_u64())
                         .unwrap_or_default(),
                     action: action.action,
-                    promoted_conversation_ids: value
-                        .get("promoted_conversation_ids")
-                        .and_then(|field| field.as_array())
-                        .map(|items| {
-                            items
-                                .iter()
-                                .filter_map(|item| item.as_str().map(ToOwned::to_owned))
-                                .collect()
-                        })
-                        .unwrap_or_default(),
                 };
                 Ok(vec![CoreEvent::MessageRequestActionCompleted { result }])
             }

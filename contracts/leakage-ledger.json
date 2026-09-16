@@ -963,7 +963,6 @@
       "reason": "Never serialized to a host. ProtectedAppMessage is covered separately by protectedFields, and AuthenticatedDirectCommit is what survives verifying a rival commit's detached signature — an epoch and a hash, with no name left in it.",
       "types": [
         "AuthenticatedDirectCommit",
-        "ContactAcceptedBody",
         "Conversation",
         "ConversationKind",
         "ConversationMember",

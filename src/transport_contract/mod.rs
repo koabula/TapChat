@@ -672,8 +672,6 @@ pub struct MessageRequestActionResult {
     pub request_id: String,
     pub promoted_count: u64,
     pub action: MessageRequestAction,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub promoted_conversation_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

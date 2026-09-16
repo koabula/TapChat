@@ -1058,9 +1058,25 @@ pub async fn open_media(
     message_id: String,
     variant: String,
 ) -> crate::errors::DesktopResult<OpenMediaResult> {
-    ensure_attachment_metadata(&app, &conversation_id, &message_id).await?;
-    let descriptor =
+    // Resolve before demanding a manifest. An attachment still uploading has
+    // none yet -- that is the whole reason the pending staging source below
+    // exists, and hoisting `ensure_attachment_metadata` to a hard precondition
+    // is what made that fallback unreachable: the guard rejected precisely the
+    // case it was there to serve, and the caller cached the failure.
+    let mut descriptor =
         attachment_variant_from_snapshot(&app, &conversation_id, &message_id, &variant).await;
+    if descriptor.is_err() {
+        // A published attachment whose manifest has not been hydrated into the
+        // snapshot yet: load it from the store and try once more.
+        if ensure_attachment_metadata(&app, &conversation_id, &message_id)
+            .await
+            .is_ok()
+        {
+            descriptor =
+                attachment_variant_from_snapshot(&app, &conversation_id, &message_id, &variant)
+                    .await;
+        }
+    }
     let pending_source = if descriptor.is_err() {
         pending_attachment_variant_source(&app, &conversation_id, &message_id, &variant).await?
     } else {

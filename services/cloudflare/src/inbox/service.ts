@@ -286,8 +286,7 @@ export class InboxService {
     return {
       accepted: true,
       requestId: entry.requestId,
-      promotedCount,
-      promotedConversationIds: []
+      promotedCount
     };
   }
 
@@ -301,8 +300,7 @@ export class InboxService {
     return {
       accepted: true,
       requestId: entry.requestId,
-      promotedCount: 0,
-      promotedConversationIds: []
+      promotedCount: 0
     };
   }
 

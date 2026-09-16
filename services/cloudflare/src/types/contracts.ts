@@ -936,7 +936,6 @@ export interface MessageRequestActionResult {
   accepted: boolean;
   requestId: string;
   promotedCount?: number;
-  promotedConversationIds?: string[];
 }
 
 

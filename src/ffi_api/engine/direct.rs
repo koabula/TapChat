@@ -1755,11 +1755,17 @@ impl CoreEngine {
             .is_some_and(|adapter| adapter.has_conversation(conversation_id))
     }
 
+    /// Build one protected application frame per recipient device.
+    ///
+    /// `storage_refs` must be supplied here rather than assigned to the
+    /// returned envelopes: the sender proof covers them, so anything attached
+    /// after this function returns is unsigned.
     pub(super) fn build_protected_app_envelopes(
         &mut self,
         conversation_id: &str,
         kind: ProtectedPayloadKind,
         body: String,
+        storage_refs: Vec<StorageRef>,
     ) -> CoreResult<(Vec<Envelope>, String)> {
         let peer_user_id = self.peer_user_for_conversation(conversation_id)?;
         let known_devices = self
@@ -1815,11 +1821,12 @@ impl CoreEngine {
             .encrypt_application(conversation_id, &bytes)?;
         let mut envelopes = Vec::new();
         for device_id in &recipient_device_ids {
-            envelopes.push(self.build_envelope(
+            envelopes.push(self.build_envelope_with_storage_refs(
                 conversation_id,
                 device_id,
                 MessageType::MlsApplication,
                 payload.payload_b64.clone(),
+                storage_refs.clone(),
             )?);
         }
         Ok((envelopes, app_message_id))
@@ -1833,7 +1840,7 @@ impl CoreEngine {
     ) -> CoreResult<String> {
         let peer_user_id = self.peer_user_for_conversation(conversation_id)?;
         let (envelopes, app_message_id) =
-            self.build_protected_app_envelopes(conversation_id, kind, body)?;
+            self.build_protected_app_envelopes(conversation_id, kind, body, Vec::new())?;
         self.enqueue_envelopes_with_plaintext(
             peer_user_id,
             envelopes,
@@ -2049,22 +2056,17 @@ impl CoreEngine {
                             app_message_id: protected.app_message_id,
                         }
                     }
-                    ProtectedPayloadKind::Text => ApplicationPlaintextDecision::Accepted {
-                        plaintext: protected.body,
-                        app_message_id: Some(protected.app_message_id),
-                    },
+                    // An attachment rides the session as its manifest: the same
+                    // string the sender cached, so both sides resolve the blob
+                    // descriptors from one authenticated copy.
+                    ProtectedPayloadKind::Text | ProtectedPayloadKind::Attachment => {
+                        ApplicationPlaintextDecision::Accepted {
+                            plaintext: protected.body,
+                            app_message_id: Some(protected.app_message_id),
+                        }
+                    }
                     ProtectedPayloadKind::ContactAccepted => {
-                        let body: ContactAcceptedBody = match serde_json::from_str(&protected.body)
-                        {
-                            Ok(body) => body,
-                            Err(_) => {
-                                return ApplicationPlaintextDecision::RejectedProtocol {
-                                    reason: "contact accepted body is malformed".into(),
-                                };
-                            }
-                        };
                         ApplicationPlaintextDecision::ContactAccepted {
-                            request_id: body.request_id,
                             app_message_id: protected.app_message_id,
                         }
                     }
@@ -3039,6 +3041,7 @@ impl CoreEngine {
                 conversation_id,
                 ProtectedPayloadKind::ContactRemoved,
                 "{}".into(),
+                Vec::new(),
             ) {
                 Ok((envelopes, _)) => control_envelopes.extend(envelopes),
                 Err(error) => log::warn!(

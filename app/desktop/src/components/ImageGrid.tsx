@@ -49,10 +49,15 @@ function ImageCell({ item, large, onClick }: { item: ImageGridItem; large: boole
     observer.observe(target);
     return () => observer.disconnect();
   }, []);
+  // `attachmentState` is a dependency, not decoration: an attachment that is
+  // still uploading has no manifest to open, and once the upload publishes one
+  // the same cell becomes loadable. Without re-running here, that first
+  // unavoidable failure would stick for the lifetime of the bubble.
   useEffect(() => {
     if (!visible || !item.previewAvailable) return;
     let cancelled = false;
     let handle: string | null = null;
+    setFailed(false);
     void invoke<OpenMediaResult>("open_media", { conversationId: item.conversationId, messageId: item.messageId, variant: "preview" })
       .then((opened) => {
         handle = opened.handle;
@@ -61,7 +66,7 @@ function ImageCell({ item, large, onClick }: { item: ImageGridItem; large: boole
       })
       .catch(() => !cancelled && setFailed(true));
     return () => { cancelled = true; if (handle) void invoke("release_media", { handle }); };
-  }, [item.conversationId, item.messageId, item.previewAvailable, visible]);
+  }, [item.attachmentState, item.conversationId, item.messageId, item.previewAvailable, visible]);
   const sourceRatio = item.width && item.height ? item.width / item.height : 4 / 3;
   const aspectRatio = Math.min(1.8, Math.max(0.65, sourceRatio));
   return <button

@@ -38,14 +38,13 @@ use crate::mls_adapter::{
 };
 use crate::model::signing::{group_envelope_sender_proof_payload, SignatureDomain, SigningPayload};
 use crate::model::{
-    Ack, CapabilityService, ContactAcceptedBody, Conversation, ConversationKind,
-    ConversationMember, ConversationState, DeliveryClass, DeviceStatusKind, Envelope,
-    GroupCapability, GroupCursor, GroupEnvelope, GroupEnvelopeVisibility, GroupInviteDocument,
-    GroupJoinPolicy, GroupJoinRequest, GroupJoinRequestStatus, GroupLeaveRequest,
-    GroupLeaveRequestStatus, GroupManifest, GroupMember, GroupMemberDevice,
-    GroupMemberInvitePolicy, GroupMemberStatus, GroupMembershipProof, GroupMessageType,
-    GroupOutboxDescriptor, GroupOutboxRecord, GroupOutboxRecordState, GroupRole, GroupStateEvent,
-    GroupStateEventKind, GroupTransitionOperation, GroupTransitionRequestBinding,
+    Ack, CapabilityService, Conversation, ConversationKind, ConversationMember, ConversationState,
+    DeliveryClass, DeviceStatusKind, Envelope, GroupCapability, GroupCursor, GroupEnvelope,
+    GroupEnvelopeVisibility, GroupInviteDocument, GroupJoinPolicy, GroupJoinRequest,
+    GroupJoinRequestStatus, GroupLeaveRequest, GroupLeaveRequestStatus, GroupManifest, GroupMember,
+    GroupMemberDevice, GroupMemberInvitePolicy, GroupMemberStatus, GroupMembershipProof,
+    GroupMessageType, GroupOutboxDescriptor, GroupOutboxRecord, GroupOutboxRecordState, GroupRole,
+    GroupStateEvent, GroupStateEventKind, GroupTransitionOperation, GroupTransitionRequestBinding,
     GroupWelcomePickupBody, IdentityBundle, InboxRecord, MessageType, MlsStateStatus,
     MlsStateSummary, ProtectedAppMessage, ProtectedPayloadKind, SenderProof, StorageRef, Validate,
     WelcomePickupDescriptor,
@@ -199,7 +198,6 @@ enum ApplicationPlaintextDecision {
         app_message_id: String,
     },
     ContactAccepted {
-        request_id: String,
         app_message_id: String,
     },
     ContactRemoved {

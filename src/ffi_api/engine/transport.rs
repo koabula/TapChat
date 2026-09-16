@@ -2339,13 +2339,6 @@ impl CoreEngine {
         let manifest_json = serde_json::to_string(&manifest).map_err(|error| {
             CoreError::invalid_input(format!("failed to encode attachment manifest: {error}"))
         })?;
-        let metadata_ciphertext = self
-            .state
-            .mls_adapter
-            .as_mut()
-            .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
-            .encrypt_application(&task.conversation_id, manifest_json.as_bytes())?
-            .payload_b64;
         let storage_refs = attachment_tasks
             .iter()
             .map(|task| {
@@ -2415,6 +2408,17 @@ impl CoreEngine {
             let conversation_id = task.conversation_id.clone();
             self.ensure_group_ready_for_send(&conversation_id)?;
             let capability = self.group_capability(&group_id, self.local_group_role(&group_id)?)?;
+            // Encrypted here and not before the branch: the 1:1 path wraps the
+            // manifest in a protected frame and does its own encryption, so
+            // encrypting up front would burn an application key the sender
+            // never sends, leaving a hole in its generation sequence.
+            let metadata_ciphertext = self
+                .state
+                .mls_adapter
+                .as_mut()
+                .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
+                .encrypt_application(&conversation_id, manifest_json.as_bytes())?
+                .payload_b64;
             let mut envelope = self.build_group_envelope(
                 &group_id,
                 &conversation_id,
@@ -2451,24 +2455,38 @@ impl CoreEngine {
             ))
         } else {
             let peer_user_id = self.peer_user_for_conversation(&task.conversation_id)?;
-            let recipients = self.recipient_device_ids(&task.conversation_id)?;
-            let mut envelopes = Vec::new();
-            for recipient in recipients {
-                // storage_refs must go in before signing: the sender proof
-                // covers them, so anything assigned afterwards is unsigned.
-                envelopes.push(self.build_envelope_with_storage_refs(
-                    &task.conversation_id,
-                    &recipient,
-                    MessageType::MlsApplication,
-                    metadata_ciphertext.clone(),
-                    storage_refs.clone(),
-                )?);
+            // A 1:1 application frame carries a protected app message and
+            // nothing else; the receiver's protocol gate refuses anything it
+            // cannot parse as one. The manifest is this frame's body.
+            let (envelopes, app_message_id) = self.build_protected_app_envelopes(
+                &task.conversation_id,
+                ProtectedPayloadKind::Attachment,
+                manifest_json.clone(),
+                storage_refs.clone(),
+            )?;
+            // The upload placeholder and the published frame are one logical
+            // message. Delivery reconciliation can only recognise the
+            // placeholder through `app_message_id` — the envelope mid is freshly
+            // minted — so the placeholder has to take the id the protocol frame
+            // was built with, or the send grows a second bubble.
+            if let Some(stored) = self
+                .state
+                .conversations
+                .get_mut(&task.conversation_id)
+                .and_then(|conversation| {
+                    conversation
+                        .messages
+                        .iter_mut()
+                        .find(|message| message.message_id == message_id)
+                })
+            {
+                stored.app_message_id = Some(app_message_id.clone());
             }
             self.enqueue_envelopes_with_plaintext(
                 peer_user_id.clone(),
                 envelopes,
                 manifest_json,
-                Some(message_id),
+                Some(app_message_id),
             );
             self.observe_direct_application(&task.conversation_id);
             self.maybe_rotate_direct_pcs(&task.conversation_id)?;
@@ -3821,6 +3839,24 @@ impl CoreEngine {
                                                 "verified_inbound_mls_welcome",
                                             )?,
                                         );
+                                        // Joining the session is what the
+                                        // inviter is waiting to learn, and this
+                                        // is the only moment at which we can
+                                        // tell them without asking anyone:
+                                        // the peer is MLS-authenticated, the
+                                        // group is applied, and the outbound
+                                        // lane was just adopted from the
+                                        // Welcome. Nothing here comes from a
+                                        // host, which is the point — an inbox
+                                        // cannot name a conversation, so it can
+                                        // never be the one to say who joined.
+                                        // Harmless on a rebuild: a peer that is
+                                        // not pending promotes to nothing.
+                                        self.enqueue_protected_app(
+                                            &conversation_id,
+                                            ProtectedPayloadKind::ContactAccepted,
+                                            "{}".to_string(),
+                                        )?;
                                     }
                                 }
                                 unapplied @ (IngestResult::Rejected(_)
@@ -4447,90 +4483,6 @@ impl CoreEngine {
         }
     }
 
-    fn accepted_request_peers(&self, result: &MessageRequestActionResult) -> Vec<String> {
-        let mut peers = Vec::new();
-        for conversation_id in &result.promoted_conversation_ids {
-            let Some(peer_user_id) = self
-                .state
-                .conversations
-                .get(conversation_id)
-                .map(|state| state.peer_user_id.clone())
-                .filter(|peer| !peer.trim().is_empty())
-            else {
-                continue;
-            };
-            if !peers.contains(&peer_user_id) {
-                peers.push(peer_user_id);
-            }
-        }
-        peers
-    }
-
-    pub(super) fn contact_accepted_notification_output(
-        &mut self,
-        result: &MessageRequestActionResult,
-        peer_user_id: &str,
-    ) -> CoreResult<CoreOutput> {
-        if !result.accepted || result.action != MessageRequestAction::Accept {
-            return Ok(CoreOutput::default());
-        }
-        if peer_user_id.trim().is_empty() {
-            return Ok(CoreOutput::default());
-        }
-        let Some(contact) = self.state.contacts.get(peer_user_id) else {
-            log::warn!(
-                "message request accept completed for {} but sender contact is missing; skipping contact accepted control",
-                redact_id("user", peer_user_id)
-            );
-            return Ok(CoreOutput::default());
-        };
-        if Self::relationship_is_removed(&contact.relationship_status) {
-            log::info!(
-                "message request accept completed for {} but sender contact is removed; skipping contact accepted control",
-                redact_id("user", peer_user_id)
-            );
-            return Ok(CoreOutput::default());
-        }
-
-        let Some((conversation_id, _)) = self.active_direct_conversation_for_peer(peer_user_id)
-        else {
-            log::warn!(
-                "message request accept completed for {} but no active direct conversation exists; skipping contact accepted",
-                redact_id("user", peer_user_id)
-            );
-            return Ok(CoreOutput::default());
-        };
-        if !self.conversation_has_direct_mls(&conversation_id) {
-            log::warn!(
-                "message request accept completed for {} but the direct session is not ready; skipping contact accepted",
-                redact_id("user", peer_user_id)
-            );
-            return Ok(CoreOutput::default());
-        }
-        let body = serde_json::to_string(&ContactAcceptedBody {
-            request_id: result.request_id.clone(),
-        })
-        .map_err(|error| {
-            CoreError::invalid_input(format!("contact accepted encode failed: {error}"))
-        })?;
-        self.enqueue_protected_app(
-            &conversation_id,
-            ProtectedPayloadKind::ContactAccepted,
-            body,
-        )?;
-        self.merge_with_transport_flush(CoreOutput {
-            state_update: CoreStateUpdate {
-                messages_changed: true,
-                ..CoreStateUpdate::default()
-            },
-            effects: vec![persist_effect(
-                &self.state,
-                self.direct_send_persist_ops(&conversation_id),
-            )],
-            view_model: None,
-        })
-    }
-
     pub(super) fn message_request_action_output(
         &mut self,
         result: MessageRequestActionResult,
@@ -4543,8 +4495,11 @@ impl CoreEngine {
                 format!("rejected message request {}", result.request_id)
             }
         };
-        let peers = self.accepted_request_peers(&result);
-        let sender_user_id = peers.first().cloned().unwrap_or_default();
+        // Always empty. The core has no local request -> peer mapping at this
+        // point, and the host must not supply one: naming a conversation is
+        // exactly what an inbox is not allowed to do. Every caller resolves the
+        // sender from the Welcome it previewed before accepting.
+        let sender_user_id = String::new();
         let status_output = CoreOutput {
             state_update: CoreStateUpdate::default(),
             effects: vec![CoreEffect::EmitUserNotification {
@@ -4569,14 +4524,11 @@ impl CoreEngine {
             }),
         };
         if result.accepted && result.action == MessageRequestAction::Accept {
+            // Fetch what the accept just released into the record stream. The
+            // Welcome is in there, and applying it is what tells the sender we
+            // joined -- see the AppliedWelcome arm of `handle_inbox_records`.
             let device_id = self.local_device_id_required()?;
-            let mut output = self.sync_inbox(device_id, None)?;
-            for peer_user_id in &peers {
-                output = merge_outputs(
-                    output,
-                    self.contact_accepted_notification_output(&result, peer_user_id)?,
-                );
-            }
+            let output = self.sync_inbox(device_id, None)?;
             return Ok(merge_outputs(output, status_output));
         }
         Ok(status_output)

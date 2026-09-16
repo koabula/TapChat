@@ -4352,7 +4352,16 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn contact_accepted_rides_the_direct_session() {
+    /// Accepting a request is what makes the *requester* usable again.
+    ///
+    /// The requester sits in `PendingOutbound` until something authenticated
+    /// arrives from the peer, and the only party that can produce that is the
+    /// peer, at the moment it applies the Welcome and joins. Nothing here may
+    /// come from the host: an inbox cannot name a conversation, so it can never
+    /// report who was promoted. That is why this test never raises a
+    /// `MessageRequestActionCompleted` — feeding the engine a fabricated host
+    /// response is what let this path stay broken while the suite was green.
+    fn accepting_a_request_makes_the_requester_available() {
         let mut alice = local_engine(ALICE_MNEMONIC, "phone");
         let alice_bundle = alice.local_bundle().expect("alice bundle").clone();
         let mut bob = local_engine(BOB_MNEMONIC, "phone");
@@ -4370,19 +4379,15 @@ pub(crate) mod tests {
         let conversation_id = create_direct_conversation(&mut bob, alice_bundle.user_id.clone());
         let alice_device_id = alice.local_device_id().expect("alice device").to_string();
         let bob_device_id = bob.local_device_id().expect("bob device").to_string();
+        // Alice applies Bob's Welcome. Joining is the whole event.
         deliver_pending_outbox_to_device(&mut alice, &bob, &alice_device_id);
-        alice
-            .handle_event(CoreEvent::MessageRequestActionCompleted {
-                result: accepted_request_result(&bob_bundle.user_id, &conversation_id),
-            })
-            .expect("alice accepts");
         assert!(
             alice
                 .state
                 .pending_outbox
                 .iter()
                 .any(|item| envelope_is_wrapped_app(&alice, &item.envelope)),
-            "accept must send a wrapped MLS application frame"
+            "applying the Welcome must enqueue a wrapped MLS application frame"
         );
         deliver_pending_outbox_to_device(&mut bob, &alice, &bob_device_id);
         assert_eq!(
@@ -4507,58 +4512,6 @@ pub(crate) mod tests {
             .expect_err("pending outbound blocks normal messages");
         assert_eq!(send_err.code(), "relationship_closed");
         assert_eq!(alice.state.pending_outbox.len(), pending_count);
-    }
-
-    #[test]
-    fn accept_without_promoted_conversation_ids_does_not_send_base_id_control() {
-        let mut alice = local_engine(ALICE_MNEMONIC, "phone");
-        let bob = local_engine(BOB_MNEMONIC, "phone");
-        let bob_bundle = bob.local_bundle().expect("bob bundle").clone();
-        alice
-            .handle_command(CoreCommand::ImportIdentityBundle {
-                bundle: bob_bundle.clone(),
-            })
-            .expect("alice imports bob");
-        let mut result = accepted_request_result(&bob_bundle.user_id, "unused");
-        result.promoted_conversation_ids.clear();
-
-        alice
-            .handle_event(CoreEvent::MessageRequestActionCompleted { result })
-            .expect("accept without promoted ids");
-
-        assert!(
-            alice.state.pending_outbox.is_empty(),
-            "accept without a local MLS session must not enqueue a contact-accepted frame"
-        );
-        assert!(bob.state.pending_outbox.is_empty());
-    }
-
-    #[test]
-    fn accept_with_multiple_promoted_direct_conversations_sends_compatibility_controls() {
-        let mut alice = local_engine(ALICE_MNEMONIC, "phone");
-        let bob = local_engine(BOB_MNEMONIC, "phone");
-        let bob_bundle = bob.local_bundle().expect("bob bundle").clone();
-        alice
-            .handle_command(CoreCommand::ImportIdentityBundle {
-                bundle: bob_bundle.clone(),
-            })
-            .expect("alice imports bob");
-
-        let mut result =
-            accepted_request_result(&bob_bundle.user_id, "conv:user:alice:user:bob:rel:1");
-        result.promoted_count = 2;
-        result.promoted_conversation_ids = vec![
-            "conv:user:alice:user:bob:rel:1".into(),
-            "conv:user:alice:user:bob:rel:2".into(),
-        ];
-        alice
-            .handle_event(CoreEvent::MessageRequestActionCompleted { result })
-            .expect("accept with multiple promoted ids");
-
-        assert!(
-            alice.state.pending_outbox.is_empty(),
-            "accept without those conversations locally must not enqueue a contact-accepted frame"
-        );
     }
 
     #[test]
@@ -5707,7 +5660,13 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn contact_accepted_control_promotes_pending_outbound_to_available() {
+    /// The mirror of `accepting_a_request_makes_the_requester_available`.
+    ///
+    /// Named for what it proves. The old name claimed a promotion this test
+    /// never performs: it asserts the negative, that an acceptor with no
+    /// applied Welcome has no session to speak on, sends nothing, and leaves
+    /// the requester pending.
+    fn an_unapplied_welcome_leaves_the_requester_pending() {
         let mut alice = local_engine(ALICE_MNEMONIC, "phone");
         let alice_bundle = alice.local_bundle().expect("alice bundle").clone();
         let mut bob = local_engine(BOB_MNEMONIC, "phone");
@@ -5722,16 +5681,12 @@ pub(crate) mod tests {
             relationship_status: ContactRelationshipStatus::PendingOutbound,
         })
         .expect("bob imports alice as pending outbound");
-        let conversation_id = create_direct_conversation(&mut bob, alice_bundle.user_id.clone());
+        // Bob's Welcome is minted but never delivered to Alice.
+        create_direct_conversation(&mut bob, alice_bundle.user_id.clone());
 
-        alice
-            .handle_event(CoreEvent::MessageRequestActionCompleted {
-                result: accepted_request_result(&bob_bundle.user_id, &conversation_id),
-            })
-            .expect("alice accepts bob request");
         assert!(
             alice.state.pending_outbox.is_empty(),
-            "accept without a local MLS session must not enqueue a contact-accepted frame"
+            "without an applied Welcome there is no session to send a contact-accepted frame on"
         );
         assert_eq!(
             bob.state
@@ -5760,12 +5715,6 @@ pub(crate) mod tests {
         })
         .expect("bob imports alice as pending outbound");
         let conversation_id = create_direct_conversation(&mut bob, alice_bundle.user_id.clone());
-        alice
-            .handle_event(CoreEvent::MessageRequestActionCompleted {
-                result: accepted_request_result(&bob_bundle.user_id, &conversation_id),
-            })
-            .expect("alice accepts bob request");
-        assert!(alice.state.pending_outbox.is_empty());
 
         let bob_device_id = bob.local_device_id().expect("bob device").to_string();
         let accepted_envelope = Envelope::with_bytes(
@@ -5828,12 +5777,6 @@ pub(crate) mod tests {
         })
         .expect("bob imports alice as pending outbound");
         let conversation_id = create_direct_conversation(&mut bob, alice_bundle.user_id.clone());
-        alice
-            .handle_event(CoreEvent::MessageRequestActionCompleted {
-                result: accepted_request_result(&bob_bundle.user_id, &conversation_id),
-            })
-            .expect("alice accepts bob request");
-        assert!(alice.state.pending_outbox.is_empty());
         let bob_device_id_for_late = bob.local_device_id().expect("bob device").to_string();
         let accepted_envelope = Envelope::with_bytes(
             &bob_device_id_for_late,
@@ -6448,11 +6391,35 @@ pub(crate) mod tests {
             .expect("complete preview");
         assert_eq!(alice.state.pending_blob_uploads.len(), 0);
         assert_eq!(alice.state.pending_outbox.len(), bob_bundle.devices.len());
+        // Both variants publish as one logical message. A 1:1 attachment rides
+        // a protected app frame, so that identity is the frame's `app:` id --
+        // and the placeholder bubble must have been rewritten to it, because
+        // delivery reconciliation has nothing else to recognise it by.
+        let published_app_id = alice
+            .state
+            .pending_outbox
+            .first()
+            .and_then(|item| item.app_message_id.clone())
+            .expect("published attachment app message id");
+        assert!(
+            published_app_id.starts_with("app:"),
+            "expected a protected app message id, got {published_app_id}"
+        );
         assert!(alice
             .state
             .pending_outbox
             .iter()
-            .all(|item| { item.app_message_id.as_deref() == Some(logical_message_id.as_str()) }));
+            .all(|item| { item.app_message_id.as_deref() == Some(published_app_id.as_str()) }));
+        assert!(
+            alice
+                .state
+                .conversations
+                .values()
+                .flat_map(|conversation| conversation.messages.iter())
+                .any(|message| message.message_id == logical_message_id
+                    && message.app_message_id.as_deref() == Some(published_app_id.as_str())),
+            "the upload placeholder must carry the published frame's app message id"
+        );
         assert_eq!(
             completed
                 .effects
@@ -6466,6 +6433,56 @@ pub(crate) mod tests {
             effect,
             CoreEffect::ExecuteHttpRequest { request } if request.url.contains("/messages")
         )));
+    }
+
+    /// The 1:1 attachment delivery witness.
+    ///
+    /// `group_attachment_e2e_uses_storage_refs_and_downloads_plaintext` has
+    /// always been green because a group message is not wrapped in a protected
+    /// app message. The 1:1 path is, and its manifest was going out bare, so
+    /// every attachment between two people was refused at the receiver's
+    /// protocol gate and dropped with a warning. Nothing stood on this edge:
+    /// `complete_direct_attachment_send` only ever exercised the sender, and
+    /// `AttachmentManifestV2` appeared nowhere in this file.
+    #[test]
+    fn a_direct_attachment_is_delivered_to_the_peer() {
+        let mut chat = paired_direct_chat();
+        complete_direct_attachment_send(&mut chat.alice, &chat.conversation_id);
+        let envelope = last_pending_application_envelope(&chat.alice, &chat.bob_device_id);
+        deliver_inbox_envelope(&mut chat.bob, &chat.bob_device_id, envelope, 100);
+
+        let (message_id, manifest) =
+            chat.bob
+                .state
+                .conversations
+                .get(&chat.conversation_id)
+                .expect("bob conversation")
+                .messages
+                .iter()
+                .find_map(|message| {
+                    let plaintext = message.plaintext.as_deref()?;
+                    let manifest = serde_json::from_str::<
+                        crate::attachment_crypto::AttachmentManifestV2,
+                    >(plaintext)
+                    .ok()?;
+                    Some((message.message_id.clone(), manifest))
+                })
+                .expect("bob must store the attachment manifest");
+        assert_eq!(manifest.version, 2);
+        assert_eq!(manifest.original.plaintext_size, 4);
+
+        // R4: a 1:1 payload is hosted by its recipient. Bob re-derives the
+        // origin he expects from local state and refuses a manifest that
+        // disagrees, so resolving at all is the assertion.
+        let descriptor = chat
+            .bob
+            .resolve_attachment_descriptor(
+                &chat.conversation_id,
+                &message_id,
+                &manifest.original.object_ref,
+            )
+            .expect("bob resolves the original descriptor against his own runtime");
+        assert_eq!(descriptor.object_ref, manifest.original.object_ref);
     }
 
     #[test]
@@ -13703,19 +13720,6 @@ pub(crate) mod tests {
             .handle_command(CoreCommand::ImportIdentityBundle { bundle })
             .expect("import");
         engine
-    }
-
-    fn accepted_request_result(
-        _sender_user_id: &str,
-        conversation_id: &str,
-    ) -> MessageRequestActionResult {
-        MessageRequestActionResult {
-            accepted: true,
-            request_id: "request:pending".into(),
-            promoted_count: 1,
-            action: MessageRequestAction::Accept,
-            promoted_conversation_ids: vec![conversation_id.to_string()],
-        }
     }
 
     /// Give `receiver` the sender's real identity bundle.

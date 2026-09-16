@@ -5585,8 +5585,7 @@ var InboxService = class {
     return {
       accepted: true,
       requestId: entry.requestId,
-      promotedCount,
-      promotedConversationIds: []
+      promotedCount
     };
   }
   async rejectMessageRequest(requestId, now) {
@@ -5599,8 +5598,7 @@ var InboxService = class {
     return {
       accepted: true,
       requestId: entry.requestId,
-      promotedCount: 0,
-      promotedConversationIds: []
+      promotedCount: 0
     };
   }
   async cleanExpiredRecords(now) {
