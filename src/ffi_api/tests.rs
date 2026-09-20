@@ -4049,6 +4049,7 @@ pub(crate) mod tests {
             })
             .expect("queue pending message");
         assert!(!alice.state.pending_outbox.is_empty());
+        let wrap_key = outbound_wrap_key(&alice, &conversation_id);
 
         let delete_output = alice
             .handle_command(CoreCommand::DeleteContact {
@@ -4089,7 +4090,7 @@ pub(crate) mod tests {
                 .state
                 .pending_outbox
                 .iter()
-                .all(|item| envelope_is_host_opaque_direct(&item.envelope)),
+                .all(|item| envelope_rode_the_wrap(&wrap_key, &item.envelope)),
             "contact removed must leave only wrapped MLS application frames"
         );
         let pending_after_delete = alice.state.pending_outbox.len();
@@ -4131,7 +4132,7 @@ pub(crate) mod tests {
             snapshot
                 .pending_outbox
                 .iter()
-                .all(|item| envelope_is_host_opaque_direct(&item.envelope)),
+                .all(|item| envelope_rode_the_wrap(&wrap_key, &item.envelope)),
             "the leftover outbox must stay typeless wrapped MLS, not a parseable control"
         );
 
@@ -4274,6 +4275,7 @@ pub(crate) mod tests {
             .expect("alice contact")
             .display_name = Some("Alice".into());
         let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
+        let wrap_key = outbound_wrap_key(&alice, &conversation_id);
 
         alice
             .handle_command(CoreCommand::DeleteContact {
@@ -4285,7 +4287,7 @@ pub(crate) mod tests {
                 .state
                 .pending_outbox
                 .iter()
-                .all(|item| envelope_is_host_opaque_direct(&item.envelope)),
+                .all(|item| envelope_rode_the_wrap(&wrap_key, &item.envelope)),
             "contact removed rides MLS; the 1:1 header stays typeless"
         );
         assert!(!alice.state.pending_outbox.is_empty());
@@ -4315,6 +4317,7 @@ pub(crate) mod tests {
             .user_identity
             .user_id
             .clone();
+        let wrap_key = outbound_wrap_key(&chat.alice, &chat.conversation_id);
         chat.alice
             .handle_command(CoreCommand::DeleteContact {
                 user_id: bob_user_id.clone(),
@@ -4322,7 +4325,7 @@ pub(crate) mod tests {
             .expect("alice deletes bob");
         assert!(!chat.alice.state.pending_outbox.is_empty());
         for item in &chat.alice.state.pending_outbox {
-            assert!(envelope_is_host_opaque_direct(&item.envelope));
+            assert!(envelope_rode_the_wrap(&wrap_key, &item.envelope));
             let visible = host_visible_envelope_json(&item.envelope);
             assert!(
                 !visible.contains("control_contact_removed"),
@@ -4442,7 +4445,8 @@ pub(crate) mod tests {
             bundle: alice_bundle.clone(),
         })
         .expect("bob imports alice");
-        let _conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
+        let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
+        let wrap_key = outbound_wrap_key(&alice, &conversation_id);
 
         alice
             .handle_command(CoreCommand::DeleteContact {
@@ -4453,7 +4457,7 @@ pub(crate) mod tests {
             .state
             .pending_outbox
             .iter()
-            .all(|item| envelope_is_host_opaque_direct(&item.envelope)));
+            .all(|item| envelope_rode_the_wrap(&wrap_key, &item.envelope)));
 
         let bob_device_id = bob.local_device_id().expect("bob device").to_string();
         let late = InboxRecord {
@@ -13894,16 +13898,54 @@ pub(crate) mod tests {
             .clone()
     }
 
+    /// The key `lane_wrap` uses on a conversation's outbound lane. Taken while the session
+    /// is still alive, so a witness can prove the wrap path over an outbox that outlives
+    /// the teardown which filled it.
+    fn outbound_wrap_key(
+        sender: &CoreEngine,
+        conversation_id: &str,
+    ) -> [u8; crate::lane_wrap::WRAP_KEY_LEN] {
+        let lanes = sender
+            .state
+            .conversations
+            .get(conversation_id)
+            .and_then(|state| state.lanes.as_ref())
+            .expect("conversation lanes");
+        sender
+            .state
+            .mls_adapter
+            .as_ref()
+            .expect("mls adapter")
+            .export_lane_wrap_key(conversation_id, lanes.outbound_dir)
+            .expect("outbound wrap key")
+    }
+
+    fn unwrap_envelope_payload(
+        key: &[u8; crate::lane_wrap::WRAP_KEY_LEN],
+        envelope: &Envelope,
+    ) -> Option<Vec<u8>> {
+        let payload = envelope.payload_b64()?;
+        let raw = STANDARD.decode(payload.as_bytes()).ok()?;
+        crate::lane_wrap::unwrap_with_cached_keys(key, None, &raw)
+    }
+
+    /// The record went through `lane_wrap`: its payload opens under the session's own wrap
+    /// key, and nothing a host holds does that. A Welcome, a bare MLS frame and a plaintext
+    /// control all fail here, which is the whole of what the opaque-to-the-host claim needs.
+    ///
+    /// This replaces a predicate that asked whether the ciphertext *happened* not to parse
+    /// as a `direct_frame`. That parser decides on the leading byte alone, so uniform
+    /// ciphertext satisfied it by chance for one record in 128 and the witness reported a
+    /// wrapped frame as unwrapped at that rate. Opacity is not a property of one sample of
+    /// bytes; the sending path is.
+    fn envelope_rode_the_wrap(
+        key: &[u8; crate::lane_wrap::WRAP_KEY_LEN],
+        envelope: &Envelope,
+    ) -> bool {
+        unwrap_envelope_payload(key, envelope).is_some()
+    }
+
     fn envelope_is_wrapped_app(sender: &CoreEngine, envelope: &Envelope) -> bool {
-        if !envelope_is_host_opaque_direct(envelope) {
-            return false;
-        }
-        let Some(payload) = envelope.payload_b64() else {
-            return false;
-        };
-        let Ok(raw) = STANDARD.decode(payload.as_bytes()) else {
-            return false;
-        };
         let Some(conversation_id) = sender.state.lane_index.get(&envelope.lane) else {
             return false;
         };
@@ -13921,28 +13963,13 @@ pub(crate) mod tests {
         let Ok(key) = adapter.export_lane_wrap_key(conversation_id, lanes.outbound_dir) else {
             return false;
         };
-        let Some(plaintext) = crate::lane_wrap::unwrap_with_cached_keys(&key, None, &raw) else {
+        let Some(plaintext) = unwrap_envelope_payload(&key, envelope) else {
             return false;
         };
         let Ok((mls_b64, _)) = crate::direct_frame::decode(&plaintext) else {
             return false;
         };
         MlsAdapter::classify_mls_payload(&mls_b64) == Some(MessageType::MlsApplication)
-    }
-
-    fn envelope_is_host_opaque_direct(envelope: &Envelope) -> bool {
-        let Some(payload) = envelope.payload_b64() else {
-            return false;
-        };
-        if MlsAdapter::payload_is_welcome(payload)
-            || MlsAdapter::classify_mls_payload(payload).is_some()
-        {
-            return false;
-        }
-        STANDARD
-            .decode(payload.as_bytes())
-            .ok()
-            .is_some_and(|raw| crate::direct_frame::decode(&raw).is_err())
     }
 
     fn host_visible_envelope_json(envelope: &Envelope) -> String {
