@@ -17,6 +17,11 @@ interface ChatHeaderActionsProps {
   onRefreshContact: () => Promise<void>;
   onOpenMembers: () => void;
   onSyncGroup: () => Promise<boolean>;
+  /** Offered for a direct session this side can rebuild; asks before acting. */
+  resetSession?: {
+    confirmText: string;
+    run: () => Promise<void>;
+  };
 }
 
 export default function ChatHeaderActions({
@@ -28,6 +33,7 @@ export default function ChatHeaderActions({
   onRefreshContact,
   onOpenMembers,
   onSyncGroup,
+  resetSession,
 }: ChatHeaderActionsProps) {
   const [menuOpen, setMenuOpen] = useState(false);
   const [actionBusy, setActionBusy] = useState<ChatHeaderActionId | null>(null);
@@ -81,9 +87,16 @@ export default function ChatHeaderActions({
       return;
     }
 
+    if (action === "reset_session" && !window.confirm(resetSession?.confirmText ?? "")) {
+      return;
+    }
+
     setActionBusy(action);
     try {
-      if (action === "refresh_contact") {
+      if (action === "reset_session") {
+        await resetSession?.run();
+        setStatus({ kind: "success", text: "Session reset" });
+      } else if (action === "refresh_contact") {
         await onRefreshContact();
         setStatus({ kind: "success", text: "Contact refreshed" });
       } else {
@@ -131,7 +144,7 @@ export default function ChatHeaderActions({
           role="menu"
           aria-label="Conversation options"
         >
-          {chatHeaderActions(isGroup).map((action) => (
+          {chatHeaderActions(isGroup, { canResetSession: Boolean(resetSession) }).map((action) => (
             <button
               key={action.id}
               type="button"

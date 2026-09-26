@@ -283,6 +283,7 @@ pub fn run() {
             commands::conversation::list_conversations,
             commands::conversation::create_conversation,
             commands::conversation::recover_conversation,
+            commands::conversation::reset_direct_session,
             commands::conversation::get_messages,
             commands::read_state::mark_conversation_read,
             // Groups (Phase 6 / PLAN_GROUP)

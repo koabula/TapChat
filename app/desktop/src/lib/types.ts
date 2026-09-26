@@ -77,8 +77,13 @@ export interface ConversationSummary {
   message_count?: number;
   unread_count?: number;
   recovery?: RecoveryDiagnostics;
-  /** Set when `state` is "compromised": when the contradicted commit merged. */
+  /**
+   * Set when `state` is "compromised": the host's receipt time of the commit
+   * the double sign contradicts, the same clock inbound `created_at` uses.
+   */
   forked_since_ms?: number | null;
+  /** This side lost its group and waits for the peer to reset the session. */
+  awaits_peer_reset?: boolean;
 }
 
 export interface MessageSummary {

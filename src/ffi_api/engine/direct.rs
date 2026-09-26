@@ -968,6 +968,7 @@ impl CoreEngine {
                         message_count: None,
                         recovery,
                         forked_since_ms: None,
+                        awaits_peer_reset: false,
                     }],
                     ..CoreViewModel::default()
                 }),
@@ -1100,6 +1101,7 @@ impl CoreEngine {
                         message_count: None,
                         recovery: None,
                         forked_since_ms: None,
+                        awaits_peer_reset: false,
                     }],
                     messages: generated
                         .iter()
@@ -2384,6 +2386,7 @@ impl CoreEngine {
                 message_count: Some(conversation.messages.len()),
                 recovery: self.recovery_snapshot_for_conversation(conversation_id),
                 forked_since_ms: None,
+                awaits_peer_reset: false,
             });
         }
         Ok(ConversationSummary {
@@ -2417,6 +2420,7 @@ impl CoreEngine {
             message_count: None,
             recovery: self.recovery_snapshot_for_conversation(conversation_id),
             forked_since_ms: conversation.fork.forked_since_ms,
+            awaits_peer_reset: conversation.rebuild.awaits_peer_welcome,
         })
     }
 
@@ -3638,6 +3642,7 @@ impl CoreEngine {
         conversation_id: &str,
         commit: &crate::direct_frame::AuthenticatedDirectCommit,
         wrap_key: [u8; crate::lane_wrap::WRAP_KEY_LEN],
+        received_at_ms: u64,
     ) {
         let now_ms = current_unix_millis(self.state.message_nonce);
         if let Some(state) = self.state.conversations.get_mut(conversation_id) {
@@ -3648,6 +3653,7 @@ impl CoreEngine {
                     commit_hash: commit.commit_hash.clone(),
                     wrap_key,
                     merged_at_ms: now_ms,
+                    received_at_ms,
                 },
                 now_ms,
             );

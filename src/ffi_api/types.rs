@@ -1059,6 +1059,10 @@ pub struct ConversationSummary {
     /// counterparty's double sign contradicts was merged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forked_since_ms: Option<u64>,
+    /// This device lost its group and waits for its peer to rebuild the
+    /// session (`direct_rebuild`); only the peer's user can start that.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub awaits_peer_reset: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

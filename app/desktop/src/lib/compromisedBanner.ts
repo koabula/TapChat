@@ -1,5 +1,35 @@
 export const COMPROMISED_COMPOSER_TEXT = "Sending is disabled: this session is compromised.";
 
+export const UNCONFIRMED_SENDER_LABEL = "Unconfirmed sender";
+
+/**
+ * Whether an inbound message in a compromised conversation arrived after the
+ * commit the double sign contradicts. Both times are the host's receipt
+ * stamps, so they compare; an untrusted host can move either, which only
+ * moves this marker, never what was delivered.
+ */
+export function isUnconfirmedSender(
+  direction: string,
+  createdAt: number,
+  forkedSinceMs: number | null | undefined,
+): boolean {
+  return direction === "received" && forkedSinceMs != null && createdAt >= forkedSinceMs;
+}
+
+/** What the side that lost its group is told: only its peer can fix this. */
+export function awaitingResetDetail(peerName: string): string {
+  return `This side lost its secure session. Ask ${peerName} to reset it from their side.`;
+}
+
+/** The confirmation the reset action asks for. */
+export function resetSessionConfirmText(peerName: string): string {
+  return (
+    `Reset the secure session with ${peerName}?\n\n` +
+    `Only do this if ${peerName}'s app says the chat needs a reset. ` +
+    `If it doesn't, their app refuses the reset and the chat stops working for both of you.`
+  );
+}
+
 export interface CompromisedNotice {
   headline: string;
   detail: string;

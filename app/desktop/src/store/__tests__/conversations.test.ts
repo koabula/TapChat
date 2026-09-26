@@ -21,6 +21,7 @@ const baseConversation = (id: string): Conversation => ({
   group_cursor: null,
   recovery: null,
   forked_since_ms: null,
+  awaits_peer_reset: false,
   dissolved_at: null,
 });
 

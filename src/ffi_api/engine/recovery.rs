@@ -540,6 +540,7 @@ impl CoreEngine {
                     message_count: None,
                     recovery: self.recovery_snapshot_for_conversation(&conversation_id),
                     forked_since_ms: None,
+                    awaits_peer_reset: false,
                 }],
                 ..CoreViewModel::default()
             }),

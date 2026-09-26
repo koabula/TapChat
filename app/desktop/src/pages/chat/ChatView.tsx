@@ -43,7 +43,14 @@ import {
 } from "@/lib/tauri";
 import type { Message, MessagePage, CoreUpdateEvent, CloudflareStatus, StorageRef } from "@/lib/types";
 import { buildGroupNameResolver } from "@/lib/groupDisplayNames";
-import { COMPROMISED_COMPOSER_TEXT, compromisedNotice } from "@/lib/compromisedBanner";
+import {
+  COMPROMISED_COMPOSER_TEXT,
+  UNCONFIRMED_SENDER_LABEL,
+  awaitingResetDetail,
+  compromisedNotice,
+  isUnconfirmedSender,
+  resetSessionConfirmText,
+} from "@/lib/compromisedBanner";
 import { findMessageMatches, moveSearchIndex } from "@/lib/messageSearch";
 import { mergeMessagePage, reconcileLatestMessagePage } from "@/lib/messageMerge";
 
@@ -120,6 +127,7 @@ export default function ChatView() {
     !isGroup && activeDirectContact?.relationship_status === "pending_outbound";
   // Terminal and beyond repair: it takes precedence over every other state.
   const directCompromised = !isGroup && activeConversation?.state === "compromised";
+  const awaitsPeerReset = !isGroup && Boolean(activeConversation?.awaits_peer_reset);
   const conversationRecovery = activeConversation?.recovery ?? null;
   const conversationRecovering =
     Boolean(activeConversation) &&
@@ -429,6 +437,17 @@ export default function ChatView() {
     } finally {
       setRecoveryBusy(false);
     }
+  };
+
+  const handleResetSession = async () => {
+    if (!conversationId) return;
+    await invoke("reset_direct_session", { conversationId });
+    const refreshedConversations = await listConversations();
+    mergeConversationSnapshot(refreshedConversations, contacts, {
+      markUnread: false,
+      replace: true,
+    });
+    await refreshMessages();
   };
 
   const syncCurrentGroup = async (reason: string, showBusy = false) => {
@@ -870,6 +889,11 @@ export default function ChatView() {
 
   const renderMessageBubble = (msg: Message) => {
     const isSent = isMyMessage(msg);
+    const unconfirmed =
+      directCompromised &&
+      isUnconfirmedSender(msg.message_type, msg.created_at, activeConversation?.forked_since_ms)
+        ? ` · ${UNCONFIRMED_SENDER_LABEL}`
+        : "";
     const bubbleCls = `bubble ${isSent ? "bubble-sent" : "bubble-received"}`;
     const refs = msg.storage_refs ?? [];
     const hasAttachment = msg.has_attachment || refs.length > 0;
@@ -882,7 +906,7 @@ export default function ChatView() {
           ? " · Waiting for approval"
         : msg.delivery_state === "failed"
           ? " · Upload failed"
-          : "";
+          : unconfirmed;
       return <div className="max-w-[min(72vw,32rem)]">
         {item.type === "image" ? <div className="relative overflow-hidden rounded-xl">
           <ImageGrid items={[item]} onImageClick={() => openMedia(item)} />
@@ -923,6 +947,7 @@ export default function ChatView() {
             />
             <span className="mt-1 block px-1 text-right text-xs opacity-60">
               {formatTime(msg.created_at)}
+              {unconfirmed}
             </span>
           </div>
         );
@@ -937,6 +962,7 @@ export default function ChatView() {
             {isSent && msg.delivery_state === "sending" ? " · Sending…" : ""}
             {isSent && msg.delivery_state === "pending_approval" ? " · Waiting for approval" : ""}
             {isSent && msg.delivery_state === "failed" ? " · Failed" : ""}
+            {unconfirmed}
           </span>
         </div>
       );
@@ -953,6 +979,7 @@ export default function ChatView() {
           {isSent && msg.delivery_state === "sending" ? " · Sending…" : ""}
           {isSent && msg.delivery_state === "pending_approval" ? " · Waiting for approval" : ""}
           {isSent && msg.delivery_state === "failed" ? " · Failed" : ""}
+          {unconfirmed}
         </span>
       </div>
     );
@@ -1139,6 +1166,14 @@ export default function ChatView() {
           onRefreshContact={handleRefreshDirectContact}
           onOpenMembers={() => setMemberDrawerOpen(true)}
           onSyncGroup={() => syncCurrentGroup("manual", true)}
+          resetSession={
+            !isGroup && activeConversation && !directCompromised
+              ? {
+                  confirmText: resetSessionConfirmText(peerName),
+                  run: handleResetSession,
+                }
+              : undefined
+          }
         />
       </header>
 
@@ -1176,20 +1211,24 @@ export default function ChatView() {
                 {recoveryHeadline(conversationRecovery.reason)}
               </div>
               <div className="break-words text-muted-color">
-                {formatRecoveryMessage(
-                  conversationRecovery.restore_failure_reason,
-                  conversationRecovery.restore_failure_detail,
-                  conversationRecovery.last_error,
-                )}
+                {awaitsPeerReset
+                  ? awaitingResetDetail(peerName)
+                  : formatRecoveryMessage(
+                      conversationRecovery.restore_failure_reason,
+                      conversationRecovery.restore_failure_detail,
+                      conversationRecovery.last_error,
+                    )}
               </div>
             </div>
-            <button
-              className="btn btn-secondary text-xs"
-              onClick={handleRecoverConversation}
-              disabled={recoveryBusy || conversationRecovery.recoverable === false}
-            >
-              {recoveryBusy ? "Recovering..." : "Recover"}
-            </button>
+            {!awaitsPeerReset && (
+              <button
+                className="btn btn-secondary text-xs"
+                onClick={handleRecoverConversation}
+                disabled={recoveryBusy || conversationRecovery.recoverable === false}
+              >
+                {recoveryBusy ? "Recovering..." : "Recover"}
+              </button>
+            )}
             {recoveryError && (
               <span className="basis-full text-error break-words">{recoveryError}</span>
             )}
@@ -1299,7 +1338,7 @@ export default function ChatView() {
               )}
             </>
           )}
-          {conversationRecovering && !pendingGroupSetup && (
+          {conversationRecovering && !pendingGroupSetup && !awaitsPeerReset && (
             <>
               <button
                 className="btn btn-secondary text-xs"

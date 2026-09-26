@@ -12996,10 +12996,14 @@ pub(crate) mod tests {
             "two commits signed by one device key on one base epoch must be detected \
              (counterparty_moved_on={counterparty_moved_on})"
         );
-        assert!(peer.state.conversations[&conversation_id]
-            .fork
-            .forked_since_ms
-            .is_some());
+        assert_eq!(
+            peer.state.conversations[&conversation_id]
+                .fork
+                .forked_since_ms,
+            Some(100),
+            "dated by the host's receipt of the contradicted commit, the clock \
+             inbound messages carry"
+        );
         assert!(output.effects.iter().any(|effect| matches!(
             effect,
             CoreEffect::EmitUserNotification { notification }
@@ -13949,7 +13953,8 @@ pub(crate) mod tests {
                         crate::mls_adapter::MlsAdapter::payload_is_welcome(&mls_b64)
                     })
             }),
-            "the rebuild must invite the winner into the fresh group, under the              key the losing commit travelled under"
+            "the rebuild must invite the winner into the fresh group, under the \
+             key the losing commit travelled under"
         );
     }
 

@@ -3722,6 +3722,7 @@ impl CoreEngine {
                                             &conversation_id,
                                             commit,
                                             wrap_key,
+                                            record.received_at,
                                         );
                                     }
                                     self.record_authenticated_inbound(

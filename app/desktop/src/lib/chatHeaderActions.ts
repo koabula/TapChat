@@ -2,6 +2,7 @@ import { presentError } from "@/lib/errors";
 export type ChatHeaderActionId =
   | "contact_details"
   | "refresh_contact"
+  | "reset_session"
   | "group_members"
   | "sync_group";
 
@@ -33,6 +34,20 @@ const GROUP_ACTIONS: ChatHeaderActionDefinition[] = [
   { id: "sync_group", label: "Sync now", busyLabel: "Syncing" },
 ];
 
-export function chatHeaderActions(isGroup: boolean): ChatHeaderActionDefinition[] {
-  return isGroup ? GROUP_ACTIONS : DIRECT_ACTIONS;
+const RESET_SESSION: ChatHeaderActionDefinition = {
+  id: "reset_session",
+  label: "Reset secure session",
+  busyLabel: "Resetting",
+};
+
+/**
+ * `canResetSession` adds the one destructive direct action: rebuilding the
+ * session from this side, for when the peer has lost its own.
+ */
+export function chatHeaderActions(
+  isGroup: boolean,
+  options: { canResetSession?: boolean } = {},
+): ChatHeaderActionDefinition[] {
+  if (isGroup) return GROUP_ACTIONS;
+  return options.canResetSession ? [...DIRECT_ACTIONS, RESET_SESSION] : DIRECT_ACTIONS;
 }

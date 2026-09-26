@@ -166,6 +166,7 @@ pub async fn list_conversations(
                 .get(&persisted.conversation_id)
                 .cloned(),
             forked_since_ms: persisted.state.fork.forked_since_ms,
+            awaits_peer_reset: persisted.state.rebuild.awaits_peer_welcome,
         })
         .collect();
 
@@ -263,6 +264,31 @@ pub async fn recover_conversation(
     app: tauri::AppHandle,
     conversation_id: String,
 ) -> crate::errors::DesktopResult<tapchat_core::CoreOutput> {
+    Ok(drive_core_with_handle(
+        &app,
+        CoreInput::Command(CoreCommand::ReconcileConversationMembership { conversation_id }),
+    )
+    .await
+    .map_err(crate::errors::DesktopError::from)?)
+}
+
+/// The user's reset of a direct session: tear this side's group down and
+/// Welcome the peer into a new one. The peer accepts that Welcome only if it
+/// has lost its own group (`direct_rebuild`), so this is for when the peer's
+/// app says the chat needs a reset.
+#[tauri::command]
+pub async fn reset_direct_session(
+    app: tauri::AppHandle,
+    conversation_id: String,
+) -> crate::errors::DesktopResult<tapchat_core::CoreOutput> {
+    drive_core_with_handle(
+        &app,
+        CoreInput::Command(CoreCommand::RebuildConversation {
+            conversation_id: conversation_id.clone(),
+        }),
+    )
+    .await
+    .map_err(crate::errors::DesktopError::from)?;
     Ok(drive_core_with_handle(
         &app,
         CoreInput::Command(CoreCommand::ReconcileConversationMembership { conversation_id }),

@@ -10,6 +10,18 @@ describe("chat header actions", () => {
     ]);
   });
 
+  it("offers the session reset only when asked to, and last", () => {
+    expect(chatHeaderActions(false, { canResetSession: true }).map((action) => action.id)).toEqual([
+      "contact_details",
+      "refresh_contact",
+      "reset_session",
+    ]);
+    expect(chatHeaderActions(true, { canResetSession: true }).map((action) => action.id)).toEqual([
+      "group_members",
+      "sync_group",
+    ]);
+  });
+
   it("maps group actions to members and sync", () => {
     expect(chatHeaderActions(true).map((action) => action.id)).toEqual([
       "group_members",

@@ -55,7 +55,12 @@ pub struct PeerCommitWitness {
     pub commit_hash: String,
     /// `K(base_epoch, inbound)`.
     pub wrap_key: [u8; WRAP_KEY_LEN],
+    /// Local clock; what the TTL runs on.
     pub merged_at_ms: u64,
+    /// The host's `received_at` for the record that carried the commit: the
+    /// clock inbound messages are stamped with, so the two can be compared.
+    #[serde(default)]
+    pub received_at_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -66,9 +71,10 @@ pub struct ForkGuard {
     /// transcript grows with its messages.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub witnesses: Vec<PeerCommitWitness>,
-    /// When the commit that the double sign contradicts was merged: from
-    /// then on, messages attributed to the peer may not be from the peer.
-    /// Set once the fork is detected.
+    /// When the record carrying the commit that the double sign contradicts
+    /// was received, by the host's clock: messages attributed to the peer and
+    /// stamped from then on may not be from the peer. Set once the fork is
+    /// detected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forked_since_ms: Option<u64>,
 }
@@ -120,6 +126,7 @@ mod tests {
             commit_hash: format!("sha256:{base_epoch}"),
             wrap_key: [key; WRAP_KEY_LEN],
             merged_at_ms,
+            received_at_ms: merged_at_ms,
         }
     }
 

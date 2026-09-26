@@ -535,7 +535,11 @@ impl CoreEngine {
             &crate::identity::encode_hex(&signature),
         )
         .ok()?;
-        Some(witness.merged_at_ms)
+        Some(if witness.received_at_ms > 0 {
+            witness.received_at_ms
+        } else {
+            witness.merged_at_ms
+        })
     }
 
     /// Establish that a rival commit really came from the counterparty.
