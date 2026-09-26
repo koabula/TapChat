@@ -14107,6 +14107,30 @@ pub(crate) mod tests {
             &conversation_id,
             "relabelled"
         ));
+
+        // A history floor the host advances past unread records moves the
+        // sync cursor and asks for recovery; the group itself stays.
+        let epoch = conversation_epoch(&chat.bob, &conversation_id);
+        chat.bob
+            .handle_event(CoreEvent::InboxHistoryFloorAdvanced {
+                device_id: bob_device.clone(),
+                history_floor_seq: 10_000,
+            })
+            .expect("a history floor is not an error");
+        assert!(chat
+            .bob
+            .state
+            .mls_adapter
+            .as_ref()
+            .expect("adapter")
+            .has_conversation(&conversation_id));
+        assert_eq!(conversation_epoch(&chat.bob, &conversation_id), epoch);
+        let conversation = &chat.bob.state.conversations[&conversation_id];
+        assert_ne!(
+            conversation.conversation.state,
+            ConversationState::NeedsRebuild
+        );
+        assert!(!conversation.rebuild.awaits_peer_welcome);
     }
 
     /// The designated side waits one interval, everyone else waits two. This

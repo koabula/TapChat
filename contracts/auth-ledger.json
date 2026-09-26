@@ -1,0 +1,345 @@
+{
+  "version": 1,
+  "invariant": "Every input from outside the device that can change a direct session's state is authenticated by a secret the peer's rotation replaces. An input that is not is listed as an exception or as outside the model, with the reason it cannot inject.",
+  "scope": "Direct (1:1) sessions at the receiving device. Inputs are what arrives from outside: inbox records, host responses, fetched bundles. Commands are the user's own and are not inputs here. Group conversations have their own authorization and sit under group-path. The completeness check maps every variant of the enums that carry these inputs to an entry, so a new variant does not compile until it is entered.",
+  "entries": [
+    {
+      "id": "inbox-record",
+      "input": "An inbox record addressed to this device",
+      "entry": "resolve_inbound_frame",
+      "scope": "dispatch",
+      "routes": ["mls-frame", "quarantine", "rejected-record", "fork-evidence"]
+    },
+    {
+      "id": "mls-frame",
+      "input": "A record that opened under one of the conversation's keys",
+      "entry": "resolve_inbound_frame",
+      "scope": "dispatch",
+      "routes": ["application-frame", "commit", "proposal", "welcome"]
+    },
+    {
+      "id": "application-frame",
+      "input": "An MLS application message and the protected payload inside it",
+      "entry": "evaluate_direct_application_plaintext",
+      "scope": "model",
+      "authenticatedBy": "K(e), then the MLS epoch secrets and the sender's leaf",
+      "rotatesWithP": true,
+      "witness": ["injection_is_confined_to_the_exposure_window"]
+    },
+    {
+      "id": "commit",
+      "input": "An MLS commit from the peer",
+      "entry": "authenticate_direct_commit",
+      "scope": "model",
+      "authenticatedBy": "K_c(e), MLS, and a detached signature under the committer's device key; it may refresh keys but not change the members",
+      "rotatesWithP": true,
+      "witness": [
+        "injection_is_confined_to_the_exposure_window",
+        "commits_travel_under_their_own_wrap_key",
+        "a_commit_cannot_add_a_leaf_to_a_two_party_session"
+      ]
+    },
+    {
+      "id": "proposal",
+      "input": "An MLS proposal from the peer",
+      "entry": "ingest_direct_message",
+      "scope": "model",
+      "authenticatedBy": "K(e) and MLS; only a member's self-update is kept, and only a commit applies it",
+      "rotatesWithP": true,
+      "witness": ["group_pcs_retains_distinct_updates_per_epoch"]
+    },
+    {
+      "id": "welcome",
+      "input": "An MLS Welcome",
+      "entry": "resolve_welcome_frame",
+      "scope": "dispatch",
+      "routes": ["welcome-race-rebuild", "welcome-local-fault", "welcome-first-contact"]
+    },
+    {
+      "id": "welcome-race-rebuild",
+      "input": "A race loser's rebuild Welcome for a conversation this device holds",
+      "entry": "resolve_welcome_frame",
+      "scope": "model",
+      "authenticatedBy": "K_c of the losing commit's base epoch, kept by the winner as the expected rebuild; exactly two leaves; the replaced session's commit keys are retained as fork witnesses",
+      "rotatesWithP": true,
+      "witness": [
+        "a_stolen_device_key_cannot_replace_a_healed_session",
+        "honest_rotations_never_look_like_a_fork",
+        "a_welcome_with_a_third_leaf_is_refused",
+        "a_race_rebuild_by_a_thief_is_detected_when_the_victim_commits"
+      ]
+    },
+    {
+      "id": "welcome-local-fault",
+      "input": "The peer's Welcome while this device waits after losing its group",
+      "entry": "resolve_welcome_frame",
+      "scope": "exception",
+      "authenticatedBy": "the peer's device key",
+      "rotatesWithP": false,
+      "reason": "No session is left to authenticate the rebuild. The waiting state is entered only by a local MLS fault or a failed restore, and nothing remote can cause either; the recovery is trust on first use again.",
+      "witness": ["a_lost_group_is_rebuilt_by_the_peer", "remote_input_cannot_tear_down_a_session"]
+    },
+    {
+      "id": "welcome-first-contact",
+      "input": "A Welcome that establishes a conversation",
+      "entry": "resolve_welcome_frame",
+      "scope": "excluded",
+      "authenticatedBy": "the device key named by a root-pinned contact share",
+      "rotatesWithP": false,
+      "reason": "Establishment is not an interface of the ideal; it is trust on first use, checked against the key package the contact share names.",
+      "witness": ["session_establishment_rejects_substituted_key_package"]
+    },
+    {
+      "id": "fork-evidence",
+      "input": "A commit that contradicts a retained witness",
+      "entry": "double_sign_evidence",
+      "scope": "model",
+      "authenticatedBy": "a retained K_c and a signature under the peer's device key; only a holder of that epoch's secrets can produce the frame",
+      "rotatesWithP": true,
+      "witness": [
+        "fork_is_detected_by_the_counterparty",
+        "a_race_rebuild_by_a_thief_is_detected_when_the_victim_commits"
+      ]
+    },
+    {
+      "id": "lane-announcement",
+      "input": "A lane rotation carried in an application frame, with the peer's signed bundle",
+      "entry": "apply_announced_peer_bundle",
+      "scope": "model",
+      "authenticatedBy": "the application frame's keys; the bundle it carries cannot add a device to the session",
+      "rotatesWithP": true,
+      "witness": [
+        "relocation_to_empty_runtime_keeps_the_conversation",
+        "a_new_peer_device_does_not_join_an_established_conversation"
+      ]
+    },
+    {
+      "id": "contact-accepted",
+      "input": "A contact-accepted notice carried in an application frame",
+      "entry": "evaluate_direct_application_plaintext",
+      "scope": "model",
+      "authenticatedBy": "the application frame's keys and the protected sender proof",
+      "rotatesWithP": true,
+      "witness": ["contact_accepted_control_with_invalid_signature_does_not_promote"]
+    },
+    {
+      "id": "contact-removed",
+      "input": "A contact-removed notice carried in an application frame",
+      "entry": "apply_peer_contact_removed",
+      "scope": "model",
+      "authenticatedBy": "the application frame's keys and the protected sender proof",
+      "rotatesWithP": true,
+      "witness": ["contact_removed_rides_the_direct_session"]
+    },
+    {
+      "id": "group-welcome-pickup",
+      "input": "A group invitation carried in an application frame",
+      "entry": "stage_welcome_pickup",
+      "scope": "model",
+      "authenticatedBy": "the application frame's keys",
+      "rotatesWithP": true,
+      "witness": ["group_invite_rides_the_direct_session"]
+    },
+    {
+      "id": "attachment-bytes",
+      "input": "Attachment ciphertext fetched from storage",
+      "entry": "handle_blob_downloaded",
+      "scope": "model",
+      "authenticatedBy": "the attachment key and digest carried in an authenticated application frame",
+      "rotatesWithP": true,
+      "witness": ["direct_attachment_download_after_snapshot_restore_refreshes_short_target"]
+    },
+    {
+      "id": "quarantine",
+      "input": "A record none of the conversation's keys opens yet",
+      "entry": "quarantine_record",
+      "scope": "excluded",
+      "authenticatedBy": "nothing",
+      "rotatesWithP": false,
+      "reason": "A bounded buffer the host can fill; nothing in it applies until it opens under a session key.",
+      "witness": ["invalid_ciphertext_leaves_no_trace"]
+    },
+    {
+      "id": "rejected-record",
+      "input": "A record that fails authentication or arrives off the inbound address",
+      "entry": "resolve_inbound_frame",
+      "scope": "excluded",
+      "authenticatedBy": "nothing",
+      "rotatesWithP": false,
+      "reason": "Acked and dropped without a trace.",
+      "witness": ["invalid_ciphertext_leaves_no_trace", "remote_input_cannot_tear_down_a_session"]
+    },
+    {
+      "id": "not-on-direct-path",
+      "input": "A control message type",
+      "entry": "classify_mls_payload",
+      "scope": "excluded",
+      "authenticatedBy": "nothing",
+      "rotatesWithP": false,
+      "reason": "A direct frame's type is read from its MLS bytes, which yield only the four MLS types, so control types never arrive on the direct path.",
+      "witness": ["injected_rebuild_control_leaves_no_trace"]
+    },
+    {
+      "id": "identity-bundle",
+      "input": "A fetched version of the peer's identity bundle",
+      "entry": "apply_identity_bundle_update",
+      "scope": "excluded",
+      "authenticatedBy": "the peer's root key, which a snapshot also holds",
+      "rotatesWithP": false,
+      "reason": "A change at the identity layer, confirmed out of band and outside the model. It cannot change an established session's members: one device per party.",
+      "witness": [
+        "a_bundle_update_adding_a_device_leaves_the_group_as_it_was",
+        "a_device_swap_in_the_peers_bundle_leaves_the_conversation_as_it_was",
+        "peer_bundle_cannot_be_rolled_back"
+      ]
+    },
+    {
+      "id": "identity-fetch-failure",
+      "input": "A failed identity fetch",
+      "entry": "handle_identity_refresh_failure",
+      "scope": "excluded",
+      "authenticatedBy": "nothing",
+      "rotatesWithP": false,
+      "reason": "Reported to the user; every session is kept.",
+      "witness": [
+        "remote_input_cannot_tear_down_a_session",
+        "identity_refresh_retries_then_leaves_the_session_intact"
+      ]
+    },
+    {
+      "id": "history-floor",
+      "input": "The host's history floor advancing past unread records",
+      "entry": "handle_inbox_history_floor",
+      "scope": "excluded",
+      "authenticatedBy": "nothing",
+      "rotatesWithP": false,
+      "reason": "Moves the sync cursor and asks for recovery; no group is touched.",
+      "witness": ["remote_input_cannot_tear_down_a_session"]
+    },
+    {
+      "id": "host-response",
+      "input": "A response to a request this device made",
+      "entry": "handle_http_response",
+      "scope": "dispatch",
+      "routes": [
+        "inbox-head",
+        "inbox-record",
+        "append-result",
+        "inbox-ack",
+        "key-package-claim",
+        "own-key-packages",
+        "group-path"
+      ]
+    },
+    {
+      "id": "host-failure",
+      "input": "A failed request",
+      "entry": "handle_append_request_failure",
+      "scope": "excluded",
+      "authenticatedBy": "nothing",
+      "rotatesWithP": false,
+      "reason": "Retry bookkeeping. An append failure may start an identity refresh, whose failure keeps the session.",
+      "witness": ["non_retryable_append_failure_marks_outbox_delivery_failed"]
+    },
+    {
+      "id": "inbox-head",
+      "input": "The inbox head",
+      "entry": "register_head",
+      "scope": "excluded",
+      "authenticatedBy": "nothing",
+      "rotatesWithP": false,
+      "reason": "Schedules a fetch; changes no session state.",
+      "witness": ["realtime_head_updated_triggers_fetch"]
+    },
+    {
+      "id": "append-result",
+      "input": "The answer to an append",
+      "entry": "handle_append_delivery_result",
+      "scope": "excluded",
+      "authenticatedBy": "nothing",
+      "rotatesWithP": false,
+      "reason": "A constant; marks this device's own message delivered.",
+      "witness": ["append_requires_a_decodable_reply"]
+    },
+    {
+      "id": "inbox-ack",
+      "input": "The answer to an ack",
+      "entry": "handle_http_response",
+      "scope": "excluded",
+      "authenticatedBy": "nothing",
+      "rotatesWithP": false,
+      "reason": "Clears this device's own pending ack.",
+      "witness": ["ack_success_deletes_persisted_pending_ack"]
+    },
+    {
+      "id": "key-package-claim",
+      "input": "A claimed KeyPackage of the peer",
+      "entry": "handle_key_package_claimed",
+      "scope": "excluded",
+      "authenticatedBy": "the leaf key checked against the device key in the peer's bundle",
+      "rotatesWithP": false,
+      "reason": "Consumed only by a rebuild this device authorised itself (a lost race or its user's reset), and only for the accepted device.",
+      "witness": ["reconcile_membership_rebootstrap_claims_key_package_before_recreating_group"]
+    },
+    {
+      "id": "own-key-packages",
+      "input": "The count and replenishment of this device's own KeyPackage pool",
+      "entry": "handle_key_package_pool_count",
+      "scope": "excluded",
+      "authenticatedBy": "nothing",
+      "rotatesWithP": false,
+      "reason": "Concerns this device's own published KeyPackages; no session state.",
+      "witness": ["manual_key_package_rotation_commits_only_after_publication_confirmation"]
+    },
+    {
+      "id": "message-requests",
+      "input": "First-contact requests listed or acted on by the host",
+      "entry": "message_requests_output",
+      "scope": "excluded",
+      "authenticatedBy": "nothing",
+      "rotatesWithP": false,
+      "reason": "Listing and triggering a sync; an accepted request's records go through inbox-record.",
+      "witness": ["list_message_requests_emits_fetch_management_effect"]
+    },
+    {
+      "id": "own-lane-registration",
+      "input": "The host's answer to this device registering or revoking its own lanes",
+      "entry": "handle_event",
+      "scope": "excluded",
+      "authenticatedBy": "nothing",
+      "rotatesWithP": false,
+      "reason": "Acknowledges this device's own act; no session state.",
+      "witness": ["delete_contact_then_reimport_same_peer_allows_direct_recreate"]
+    },
+    {
+      "id": "own-publication",
+      "input": "The host's answer to this device publishing its shared state",
+      "entry": "handle_event",
+      "scope": "excluded",
+      "authenticatedBy": "nothing",
+      "rotatesWithP": false,
+      "reason": "Acknowledges this device's own publication; no session state.",
+      "witness": ["reimported_deployment_publishes_local_shared_state_documents"]
+    },
+    {
+      "id": "local",
+      "input": "The app's lifecycle, timers, connections and the user's confirmations",
+      "entry": "handle_event",
+      "scope": "excluded",
+      "authenticatedBy": "not an input from outside the device",
+      "rotatesWithP": false,
+      "reason": "Local events; what they start goes through the entries above.",
+      "witness": ["app_started_migrates_legacy_removed_contact_to_archive"]
+    },
+    {
+      "id": "group-path",
+      "input": "Group conversations: outbox, transitions, invites, joins, leaves, pickups",
+      "entry": "handle_event",
+      "scope": "excluded",
+      "authenticatedBy": "group capabilities and the group's own MLS",
+      "rotatesWithP": false,
+      "reason": "Group conversations are outside the two-party model.",
+      "witness": ["group_pcs_member_proposal_then_owner_commit_decrypts"]
+    }
+  ]
+}

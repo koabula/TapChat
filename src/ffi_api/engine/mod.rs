@@ -7,6 +7,9 @@ mod lanes;
 mod recovery;
 mod transport;
 
+#[cfg(test)]
+mod auth_ledger;
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use super::attachments::{attachment_download_task_id, validate_attachment_descriptor};
