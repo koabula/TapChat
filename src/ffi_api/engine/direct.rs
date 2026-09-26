@@ -1723,6 +1723,7 @@ impl CoreEngine {
                 app_message_id: None,
                 plaintext_cache: None,
                 identity_refresh_attempted: false,
+                durable: false,
             });
         }
     }
@@ -1746,6 +1747,7 @@ impl CoreEngine {
                 app_message_id: app_message_id.clone(),
                 plaintext_cache: Some(plaintext.clone()),
                 identity_refresh_attempted: false,
+                durable: false,
             });
         }
     }

@@ -3,6 +3,7 @@ export const COMPROMISED_COMPOSER_TEXT = "Sending is disabled: this session is c
 export interface CompromisedNotice {
   headline: string;
   detail: string;
+  advice: string;
 }
 
 function formatSince(ms: number): string {
@@ -14,9 +15,11 @@ function formatSince(ms: number): string {
  * `compromised`: the contact's device key signed two conflicting updates, so
  * someone else holds it.
  *
- * There is deliberately no action. Nothing in the app can repair a session
- * keyed to a stolen device key, and the safety number cannot tell either: it
- * covers the same keys the thief now has, so comparing it would still match.
+ * The only way forward is on the contact's side and outside this session. The
+ * stolen snapshot holds their root key as well, so the current safety number
+ * still matches and proves nothing, and anything this session delivers about
+ * a replacement could come from the thief. They need a new identity from a
+ * new recovery phrase, and its safety number compared in person.
  */
 export function compromisedNotice(
   state: string | undefined,
@@ -32,8 +35,9 @@ export function compromisedNotice(
     : `Recent messages may not be from ${peerName}.`;
   return {
     headline: "Session compromised",
-    detail:
-      `${peerName}'s device key signed two conflicting updates, so someone else holds it. ` +
-      `${since} Reach ${peerName} another way; comparing safety numbers won't help, they still match.`,
+    detail: `${peerName}'s device key signed two conflicting updates, so someone else holds it. ${since}`,
+    advice:
+      `Tell ${peerName} outside TapChat. They need a new identity with a new recovery phrase; ` +
+      `verify its safety number in person. The current safety number still matches, so it can't help.`,
   };
 }

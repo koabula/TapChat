@@ -417,6 +417,7 @@ impl CoreEngine {
                 app_message_id: item.app_message_id,
                 plaintext_cache: item.plaintext_cache,
                 identity_refresh_attempted: item.identity_refresh_attempted,
+                durable: true,
             })
             .collect();
         let outbox = pending_outbox
@@ -867,12 +868,96 @@ impl CoreEngine {
         if let Some(group_id) = transition_group_id {
             self.ensure_group_state_operation_ready(group_id)?;
         }
-        if stage_group_transition {
+        let output = if stage_group_transition {
             self.run_staged_group_mutation(staged_join_request_id, |engine| {
                 engine.dispatch_command(command)
             })
         } else {
             self.dispatch_command(command)
+        }?;
+        Ok(self.persist_ahead_of_appends(output))
+    }
+
+    /// Put a persist in front of every append whose envelope the host has not
+    /// yet been told to write.
+    ///
+    /// A commit merges before it is sent. If it left while the merge existed
+    /// only in memory, a crash would put this device back on the old epoch to
+    /// sign a second, different commit there -- which the peer can only read
+    /// as a stolen key (`direct_fork`). An application frame has the same
+    /// shape of problem: a ratchet position used twice. Most send paths
+    /// persist before they flush, but not all do, and a command that fails
+    /// after merging leaves its envelope queued in memory with nothing behind
+    /// it for the next flush from anywhere to send.
+    ///
+    /// So the rule is enforced where an output leaves the core, since only the
+    /// order of its effects says what the host will have written first. An
+    /// append whose envelope neither an earlier output nor an earlier persist
+    /// in this one wrote gets a persist of its conversation -- state, MLS
+    /// state and queued envelopes -- inserted ahead of it. Every persist in the
+    /// output is then rebuilt from the final state, so none that runs later
+    /// can write back something older.
+    fn persist_ahead_of_appends(&mut self, mut output: CoreOutput) -> CoreOutput {
+        let mut persisted = BTreeSet::new();
+        let mut inserted = false;
+        let mut effects = Vec::with_capacity(output.effects.len());
+        for effect in std::mem::take(&mut output.effects) {
+            match &effect {
+                CoreEffect::PersistState { persist } => {
+                    persisted.extend(outbox_rows_written(persist));
+                }
+                CoreEffect::ExecuteHttpRequest { request } => {
+                    if let Some(PendingRequest::AppendEnvelope { message_id, .. }) =
+                        self.state.pending_requests.get(&request.request_id)
+                    {
+                        let durable = persisted.contains(message_id)
+                            || self
+                                .state
+                                .pending_outbox
+                                .iter()
+                                .any(|item| &item.envelope.mid == message_id && item.durable);
+                        if !durable {
+                            let persist = persist_effect(
+                                &self.state,
+                                self.persist_ops_for_append(message_id),
+                            );
+                            if let CoreEffect::PersistState { persist } = &persist {
+                                persisted.extend(outbox_rows_written(persist));
+                            }
+                            effects.push(persist);
+                            inserted = true;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            effects.push(effect);
+        }
+        output.effects = effects;
+        if inserted {
+            refresh_persist_effect_snapshots(&mut output, &self.state);
+        }
+        for item in &mut self.state.pending_outbox {
+            if persisted.contains(&item.envelope.mid) {
+                item.durable = true;
+            }
+        }
+        output
+    }
+
+    fn persist_ops_for_append(&self, message_id: &str) -> Vec<PersistOp> {
+        let conversation_id = self
+            .state
+            .pending_outbox
+            .iter()
+            .find(|item| item.envelope.mid == message_id)
+            .and_then(|item| self.conversation_id_for_lane(&item.envelope.lane))
+            .filter(|conversation_id| self.state.conversations.contains_key(conversation_id));
+        match conversation_id {
+            Some(conversation_id) => self.direct_send_persist_ops(&conversation_id),
+            None => vec![PersistOp::SaveOutgoingEnvelope {
+                message_id: message_id.to_string(),
+            }],
         }
     }
 
@@ -1301,6 +1386,11 @@ impl CoreEngine {
     }
 
     pub fn handle_event(&mut self, event: CoreEvent) -> CoreResult<CoreOutput> {
+        let output = self.dispatch_event(event)?;
+        Ok(self.persist_ahead_of_appends(output))
+    }
+
+    fn dispatch_event(&mut self, event: CoreEvent) -> CoreResult<CoreOutput> {
         match event {
             CoreEvent::AppStarted => self.start_foreground_sync("startup"),
             CoreEvent::AppForegrounded => self.start_foreground_sync("foreground"),
@@ -2621,6 +2711,52 @@ fn persist_effect(state: &CoreState, ops: Vec<PersistOp>) -> CoreEffect {
             snapshot: None,
         },
     }
+}
+
+/// The outbox rows a host writes for `persist`, read the way the local store
+/// reads a batch: typed mutations if there are any; otherwise the ops,
+/// resolved against the snapshot; otherwise the whole snapshot.
+fn outbox_rows_written(persist: &PersistStateEffect) -> Vec<String> {
+    if !persist.mutations.is_empty() {
+        return persist
+            .mutations
+            .iter()
+            .filter_map(|mutation| match mutation {
+                PersistenceMutation::Save {
+                    table: PersistenceTable::PendingOutbox,
+                    key,
+                    ..
+                } => Some(key.clone()),
+                _ => None,
+            })
+            .collect();
+    }
+    let Some(snapshot) = persist.snapshot.as_ref() else {
+        return Vec::new();
+    };
+    let queued = |message_id: &String| {
+        snapshot
+            .pending_outbox
+            .iter()
+            .any(|item| &item.message_id == message_id)
+    };
+    if persist.ops.is_empty() {
+        return snapshot
+            .pending_outbox
+            .iter()
+            .map(|item| item.message_id.clone())
+            .collect();
+    }
+    persist
+        .ops
+        .iter()
+        .filter_map(|op| match op {
+            PersistOp::SaveOutgoingEnvelope { message_id } if queued(message_id) => {
+                Some(message_id.clone())
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 fn refresh_persist_effect_snapshots(output: &mut CoreOutput, state: &CoreState) {

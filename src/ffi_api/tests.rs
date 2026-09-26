@@ -13110,6 +13110,65 @@ pub(crate) mod tests {
         output
     }
 
+    /// **N1 precondition: an envelope leaves only once it is on disk.** A
+    /// commit merges before it is sent. If it left while the merge existed
+    /// only in memory, a crash would put the sender back on the old epoch to
+    /// sign a second, different commit there, and the peer could only read
+    /// the pair as a stolen key. A command that fails after merging leaves
+    /// its envelope queued in memory with nothing behind it; this is that
+    /// envelope, and an unrelated flush is what would send it.
+    #[test]
+    fn an_envelope_leaves_only_after_it_is_persisted() {
+        let mut chat = paired_direct_chat();
+        let mut stray = chat
+            .alice
+            .state
+            .pending_outbox
+            .last()
+            .cloned()
+            .expect("a queued envelope to model the stray on");
+        stray.envelope.mid = crate::model::random_opaque_id();
+        stray.in_flight = false;
+        stray.retries = 0;
+        stray.durable = false;
+        let stray_mid = stray.envelope.mid.clone();
+        chat.alice.state.pending_outbox.push(stray);
+
+        let output = chat
+            .alice
+            .handle_event(CoreEvent::AppForegrounded)
+            .expect("foreground");
+        let append = append_effect_index(&chat.alice, &output, &stray_mid)
+            .expect("the envelope still goes out");
+        let persisted = output.effects[..append].iter().any(|effect| {
+            matches!(effect, CoreEffect::PersistState { persist }
+                if persist.mutations.iter().any(|mutation| matches!(
+                    mutation,
+                    PersistenceMutation::Save { table: crate::ffi_api::PersistenceTable::PendingOutbox, key, .. }
+                        if key == &stray_mid
+                ))
+                && persist.mutations.iter().any(|mutation| matches!(
+                    mutation,
+                    PersistenceMutation::Save { table: crate::ffi_api::PersistenceTable::MlsStates, .. }
+                )))
+        });
+        assert!(
+            persisted,
+            "an envelope no persist had covered goes out only behind one that writes it \
+             together with the MLS state it was built on"
+        );
+    }
+
+    fn append_effect_index(engine: &CoreEngine, output: &CoreOutput, mid: &str) -> Option<usize> {
+        output.effects.iter().position(|effect| match effect {
+            CoreEffect::ExecuteHttpRequest { request } => matches!(
+                engine.state.pending_requests.get(&request.request_id),
+                Some(crate::ffi_api::types::PendingRequest::AppendEnvelope { message_id, .. }) if message_id == mid
+            ),
+            _ => false,
+        })
+    }
+
     /// One rotation by the designated side, merged by the peer and then
     /// replayed to it under a fresh message id. Only the rotating side carries
     /// debt, so the peer does not answer with a rotation of its own.

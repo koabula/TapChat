@@ -1161,6 +1161,7 @@ export default function ChatView() {
             <div className="min-w-0 flex-1">
               <div className="font-medium status-error">{compromised.headline}</div>
               <div className="break-words text-muted-color">{compromised.detail}</div>
+              <div className="mt-1 break-words text-secondary-color">{compromised.advice}</div>
             </div>
           </div>
         </div>

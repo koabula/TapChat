@@ -1226,6 +1226,10 @@ pub(crate) struct PendingOutboxItem {
     pub(crate) plaintext_cache: Option<String>,
     #[serde(default)]
     pub(crate) identity_refresh_attempted: bool,
+    /// Whether a persist the host has been handed covers this envelope.
+    /// Runtime only: anything read back from disk is durable by definition.
+    #[serde(skip)]
+    pub(crate) durable: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

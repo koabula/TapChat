@@ -15,9 +15,12 @@ describe("compromisedNotice", () => {
     expect(notice?.detail).toContain("Messages received since t=1000 may not be from Bob.");
   });
 
-  it("does not send the user to the safety number", () => {
+  it("sends the contact to a new identity, not to the old safety number", () => {
     const notice = compromisedNotice("compromised", null, "Bob");
     expect(notice?.detail).toContain("Recent messages may not be from Bob.");
-    expect(notice?.detail).toContain("comparing safety numbers won't help");
+    expect(notice?.advice).toContain("Tell Bob outside TapChat");
+    expect(notice?.advice).toContain("new recovery phrase");
+    expect(notice?.advice).toContain("verify its safety number in person");
+    expect(notice?.advice).toContain("current safety number still matches");
   });
 });
