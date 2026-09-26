@@ -1415,12 +1415,42 @@ impl MlsAdapter {
         message_type: MessageType,
         payload_b64: &str,
     ) -> CoreResult<IngestResult> {
+        self.ingest_message_with(conversation_id, message_type, payload_b64, false)
+    }
+
+    /// [`Self::ingest_message`] for a two-party conversation, whose members
+    /// are fixed at one device per party: a commit may refresh keys, but a
+    /// commit that changes who is in the group, or what a member signs with,
+    /// is refused. Inside `E(P,t)` a snapshot commits in P's name; a leaf it
+    /// could add would outlive P's healing, since P's rotation replaces only
+    /// P's own leaf.
+    pub fn ingest_direct_message(
+        &mut self,
+        conversation_id: &str,
+        message_type: MessageType,
+        payload_b64: &str,
+    ) -> CoreResult<IngestResult> {
+        self.ingest_message_with(conversation_id, message_type, payload_b64, true)
+    }
+
+    fn ingest_message_with(
+        &mut self,
+        conversation_id: &str,
+        message_type: MessageType,
+        payload_b64: &str,
+        fixed_membership: bool,
+    ) -> CoreResult<IngestResult> {
         match message_type {
             MessageType::MlsCommit | MessageType::MlsApplication | MessageType::MlsProposal => {
                 if !self.groups.contains_key(conversation_id) {
                     return Ok(IngestResult::Deferred(DeferReason::NoLocalGroup));
                 }
-                self.ingest_protocol_message(conversation_id, message_type, payload_b64)
+                self.ingest_protocol_message(
+                    conversation_id,
+                    message_type,
+                    payload_b64,
+                    fixed_membership,
+                )
             }
             MessageType::MlsWelcome => Err(CoreError::unsupported(
                 "welcomes name a trusted author and go through ingest_welcome",
@@ -2205,6 +2235,28 @@ impl MlsAdapter {
         author: &WelcomeAuthor,
         payload_b64: &str,
     ) -> CoreResult<IngestResult> {
+        self.ingest_welcome_with(conversation_id, author, payload_b64, false)
+    }
+
+    /// [`Self::ingest_welcome`] for a two-party conversation: the group it
+    /// brings has exactly two leaves, its author and this device. A third
+    /// would be a member no one in the conversation vouched for.
+    pub fn ingest_direct_welcome(
+        &mut self,
+        conversation_id: &str,
+        author: &WelcomeAuthor,
+        payload_b64: &str,
+    ) -> CoreResult<IngestResult> {
+        self.ingest_welcome_with(conversation_id, author, payload_b64, true)
+    }
+
+    fn ingest_welcome_with(
+        &mut self,
+        conversation_id: &str,
+        author: &WelcomeAuthor,
+        payload_b64: &str,
+        two_party: bool,
+    ) -> CoreResult<IngestResult> {
         let Some(welcome) = decode_welcome_body(payload_b64) else {
             log::warn!(
                 "ingest_welcome: discarding undecodable welcome for conversation {}",
@@ -2285,6 +2337,21 @@ impl MlsAdapter {
                 return Ok(IngestResult::Rejected(RejectReason::Malformed));
             }
         };
+        if two_party {
+            let own_key = fork.signer.to_public_vec();
+            let signature_keys: BTreeSet<Vec<u8>> =
+                group.members().map(|member| member.signature_key).collect();
+            let expected: BTreeSet<Vec<u8>> = [expected_key.as_bytes().to_vec(), own_key]
+                .into_iter()
+                .collect();
+            if group.members().count() != 2 || signature_keys != expected {
+                log::warn!(
+                    "ingest_welcome: two-party welcome brings other members for conversation {}",
+                    redact_id("conversation", conversation_id)
+                );
+                return Ok(IngestResult::Rejected(RejectReason::Unauthorized));
+            }
+        }
         let member_device_ids = extract_member_device_ids(&group)?;
         fork.groups.insert(
             conversation_id.to_string(),
@@ -2326,6 +2393,7 @@ impl MlsAdapter {
         conversation_id: &str,
         message_type: MessageType,
         payload_b64: &str,
+        fixed_membership: bool,
     ) -> CoreResult<IngestResult> {
         let Some(protocol_message) = decode_protocol_message(payload_b64) else {
             log::warn!(
@@ -2361,6 +2429,7 @@ impl MlsAdapter {
             message_type,
             protocol_message,
             from_previous_epoch,
+            fixed_membership,
         )?;
         if matches!(
             verdict,
@@ -2379,6 +2448,7 @@ impl MlsAdapter {
         message_type: MessageType,
         protocol_message: ProtocolMessage,
         from_previous_epoch: bool,
+        fixed_membership: bool,
     ) -> CoreResult<IngestResult> {
         let provider = &adapter.provider;
         let state = adapter.groups.get_mut(conversation_id).ok_or_else(|| {
@@ -2427,10 +2497,19 @@ impl MlsAdapter {
                 if message_type != MessageType::MlsCommit {
                     return Ok(IngestResult::Rejected(RejectReason::Malformed));
                 }
+                let members_before = fixed_membership.then(|| member_keys(&state.group));
                 state
                     .group
                     .merge_staged_commit(provider, *staged_commit)
                     .map_err(|_| CoreError::invalid_state("failed to merge staged commit"))?;
+                // Merged on the fork, so refusing here discards it.
+                if members_before.is_some_and(|before| before != member_keys(&state.group)) {
+                    log::warn!(
+                        "ingest_protocol_message: refusing a commit that changes the members of two-party conversation {}",
+                        redact_id("conversation", conversation_id)
+                    );
+                    return Ok(IngestResult::Rejected(RejectReason::Unauthorized));
+                }
                 state.member_device_ids = extract_member_device_ids(&state.group)?;
                 state.pcs_updates.clear();
                 state.pcs_update_epoch = state.group.epoch().as_u64();
@@ -2670,6 +2749,19 @@ fn extract_sender_identity(credential: &Credential) -> CoreResult<String> {
         .map_err(|_| CoreError::invalid_input("unsupported MLS credential type"))?;
     String::from_utf8(basic.identity().to_vec())
         .map_err(|_| CoreError::invalid_input("credential identity must be utf-8"))
+}
+
+/// Who is in the group, and what each signs with.
+fn member_keys(group: &MlsGroup) -> BTreeSet<(Vec<u8>, Vec<u8>)> {
+    group
+        .members()
+        .map(|member| {
+            (
+                member.credential.serialized_content().to_vec(),
+                member.signature_key,
+            )
+        })
+        .collect()
 }
 
 fn extract_member_device_ids(group: &MlsGroup) -> CoreResult<BTreeSet<String>> {

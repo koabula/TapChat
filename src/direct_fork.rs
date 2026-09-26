@@ -52,6 +52,9 @@ pub struct PeerCommitWitness {
     /// The signer. A double sign is two commits from **one** device key; two
     /// devices of the same user committing on one epoch is an ordinary race.
     pub device_id: String,
+    /// Empty for a session this device left for a rebuild Welcome from
+    /// `device_id`: no commit of that device's is expected under this key at
+    /// all, so any commit contradicts it.
     pub commit_hash: String,
     /// `K(base_epoch, inbound)`.
     pub wrap_key: [u8; WRAP_KEY_LEN],

@@ -3660,6 +3660,35 @@ impl CoreEngine {
         }
     }
 
+    /// Keep the commit key of a session this device just left for a Welcome
+    /// from `device_id`. That device rebuilt out of the session, so a commit
+    /// it signs under this key afterwards contradicts the rebuild: someone
+    /// else holds its key and stayed behind. An honest race loser never holds
+    /// the winner's keys, so it cannot produce one.
+    pub(super) fn record_retired_session_witness(
+        &mut self,
+        conversation_id: &str,
+        epoch: u64,
+        device_id: &str,
+        wrap_key: [u8; crate::lane_wrap::WRAP_KEY_LEN],
+        received_at_ms: u64,
+    ) {
+        let now_ms = current_unix_millis(self.state.message_nonce);
+        if let Some(state) = self.state.conversations.get_mut(conversation_id) {
+            state.fork.record(
+                crate::direct_fork::PeerCommitWitness {
+                    base_epoch: epoch,
+                    device_id: device_id.to_string(),
+                    commit_hash: String::new(),
+                    wrap_key,
+                    merged_at_ms: now_ms,
+                    received_at_ms,
+                },
+                now_ms,
+            );
+        }
+    }
+
     /// Act on proof that the counterparty's device key is in someone else's
     /// hands: stop sending, for good.
     ///

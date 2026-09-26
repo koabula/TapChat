@@ -5441,7 +5441,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn reconcile_membership_add_devices_claims_key_package_before_adding_member() {
+    fn a_new_peer_device_does_not_join_an_established_conversation() {
         let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
         let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
@@ -5474,58 +5474,26 @@ pub(crate) mod tests {
             .handle_command(CoreCommand::ReconcileConversationMembership {
                 conversation_id: conversation_id.clone(),
             })
-            .expect("reconcile claims the new device's key package");
+            .expect("reconcile");
 
-        assert!(
-            output.view_model.is_none(),
-            "nothing changes until the claim resolves"
-        );
-        assert_eq!(output.effects.len(), 1);
-        let request = match &output.effects[0] {
-            CoreEffect::ExecuteHttpRequest { request } => request.clone(),
-            other => panic!("expected a claim request, got {other:?}"),
-        };
-        assert!(request.url.ends_with("/claim"));
-        assert!(request
-            .url
-            .contains(&urlencoding::encode(&laptop_device_id).into_owned()));
+        // A device the conversation was not set up with is a change at the
+        // identity layer, signed by a root key a snapshot also holds. It does
+        // not get as far as a KeyPackage claim.
+        assert!(!output.effects.iter().any(|effect| matches!(
+            effect,
+            CoreEffect::ExecuteHttpRequest { request } if request.url.ends_with("/claim")
+        )));
         assert!(!alice
             .state
             .pending_outbox
             .iter()
-            .any(|item| { item.envelope.recipient_device_id == laptop_device_id }));
-
-        let body = serde_json::json!({
-            "keyPackage": {
-                "keyPackageId": "claim-laptop",
-                "keyPackage": laptop_keypackage_b64,
-                "lifecycleVersion": 1,
-                "notBefore": 0,
-                "createdAt": 0,
-                "expiresAt": 0,
-            }
-        })
-        .to_string();
-        let completed = alice
-            .handle_event(CoreEvent::HttpResponseReceived {
-                request_id: request.request_id.clone(),
-                status: 200,
-                body: Some(body),
-            })
-            .expect("claim response adds the new device");
-
-        assert!(completed.state_update.conversations_changed);
-        assert!(alice.state.pending_outbox.iter().any(|item| {
-            item.envelope.recipient_device_id == laptop_device_id
-                && crate::mls_adapter::MlsAdapter::payload_is_welcome(
-                    item.envelope.payload_b64().unwrap_or_default(),
-                )
-        }));
-        assert!(alice
-            .state
-            .pending_outbox
+            .any(|item| item.envelope.recipient_device_id == laptop_device_id));
+        assert!(!alice.state.conversations[&conversation_id]
+            .conversation
+            .member_devices
             .iter()
-            .any(|item| outbox_item_matches_type(item, MessageType::MlsCommit)));
+            .any(|member| member.device_id == laptop_device_id));
+        let _ = laptop_keypackage_b64;
     }
 
     #[test]
@@ -7041,10 +7009,14 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn identity_bundle_response_reconciles_membership_and_queues_transport_messages() {
+    fn a_device_swap_in_the_peers_bundle_leaves_the_conversation_as_it_was() {
         let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
         let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
+        let members_before = alice.state.conversations[&conversation_id]
+            .conversation
+            .member_devices
+            .clone();
 
         let output = alice
             .handle_command(CoreCommand::RefreshIdentityState {
@@ -7056,7 +7028,10 @@ pub(crate) mod tests {
             CoreEffect::FetchIdentityBundle { fetch } if fetch.user_id == bob_bundle.user_id
         )));
 
+        // Bob's bundle now names a laptop instead of the phone the
+        // conversation was set up with.
         let updated_bundle = sample_identity_bundle(BOB_MNEMONIC, "laptop");
+        let laptop_device_id = updated_bundle.devices[0].device_id.clone();
         let response = alice
             .handle_event(CoreEvent::IdentityBundleFetched {
                 user_id: bob_bundle.user_id.clone(),
@@ -7067,25 +7042,23 @@ pub(crate) mod tests {
                 .expect("bundle"),
             })
             .expect("identity bundle response");
-        // Bob's device swap (phone -> laptop) is an added + revoked device
-        // for the existing direct conversation, which now claims a one-time
-        // KeyPackage for the new device before the membership commit is
-        // generated.
         let response = simulate_pending_key_package_claims(&mut alice, response);
 
-        assert!(response.state_update.conversations_changed);
-        assert!(response.effects.iter().any(|effect| matches!(
+        assert!(!response.effects.iter().any(|effect| matches!(
             effect,
-            CoreEffect::ExecuteHttpRequest { request } if request.url.contains("/messages")
+            CoreEffect::ExecuteHttpRequest { request } if request.url.ends_with("/claim")
         )));
+        assert!(!alice
+            .state
+            .pending_outbox
+            .iter()
+            .any(|item| item.envelope.recipient_device_id == laptop_device_id));
+        let conversation = &alice.state.conversations[&conversation_id];
+        assert_eq!(conversation.conversation.member_devices, members_before);
         assert_eq!(
-            alice
-                .state
-                .conversations
-                .get(&conversation_id)
-                .expect("conversation")
-                .recovery_status,
-            crate::conversation::RecoveryStatus::NeedsRecovery
+            conversation.recovery_status,
+            crate::conversation::RecoveryStatus::Healthy,
+            "an identity change that is not applied leaves nothing to recover from"
         );
     }
 
@@ -9804,8 +9777,7 @@ pub(crate) mod tests {
     fn additional_device_snapshot_round_trip_restores_bootstrap_for_welcome_staging() {
         let bob_phone_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_phone_bundle.clone());
-        let conversation_id =
-            create_direct_conversation(&mut alice, bob_phone_bundle.user_id.clone());
+        create_direct_conversation(&mut alice, bob_phone_bundle.user_id.clone());
 
         let mut laptop = CoreEngine::new();
         laptop
@@ -9873,29 +9845,30 @@ pub(crate) mod tests {
             .expect("local identity")
             .state
             .clone();
-        let merged = IdentityManager::export_identity_bundle_with_devices(
-            &laptop_identity,
-            &sample_deployment(),
-            vec![bob_phone_bundle.devices[0].clone(), laptop_profile.clone()],
-            None,
-            None,
-        )
-        .expect("merged bundle");
-        let output = alice
-            .handle_command(CoreCommand::ApplyIdentityBundleUpdate { bundle: merged })
-            .expect("apply merged bundle");
-        simulate_pending_key_package_claims(&mut alice, output);
-        let welcome = alice
+        // The laptop joins a conversation of its own: one device per party,
+        // so it is never added to the phone's.
+        let laptop_conversation = crate::model::random_opaque_id();
+        let artifacts = alice
             .state
-            .pending_outbox
-            .iter()
-            .find(|item| {
-                true && crate::mls_adapter::MlsAdapter::payload_is_welcome(
-                    item.envelope.payload_b64().unwrap_or_default(),
-                ) && item.envelope.recipient_device_id == laptop_profile.device_id
-            })
-            .map(|item| item.envelope.clone())
-            .expect("welcome for laptop");
+            .mls_adapter
+            .as_mut()
+            .expect("alice adapter")
+            .create_conversation(
+                &laptop_conversation,
+                &[crate::mls_adapter::PeerDeviceKeyPackage {
+                    user_id: laptop_identity.user_identity.user_id.clone(),
+                    device_id: laptop_profile.device_id.clone(),
+                    device_public_key: laptop_identity.device_identity.device_public_key.clone(),
+                    key_package_b64: laptop_profile
+                        .keypackage_ref
+                        .as_ref()
+                        .expect("laptop key package")
+                        .object_ref
+                        .clone(),
+                }],
+            )
+            .expect("a conversation with the laptop");
+        let welcome_b64 = artifacts.welcomes[0].payload_b64.clone();
 
         let phone = alice
             .state
@@ -9911,12 +9884,12 @@ pub(crate) mod tests {
             .as_mut()
             .expect("restored laptop adapter")
             .ingest_welcome(
-                &conversation_id,
+                &laptop_conversation,
                 &crate::mls_adapter::WelcomeAuthor {
                     device_id: phone.device_id,
                     device_public_key: phone.device_public_key,
                 },
-                welcome.bytes.as_deref().expect("welcome payload"),
+                &welcome_b64,
             )
             .expect("stage welcome after snapshot restore");
         assert!(matches!(
@@ -10544,7 +10517,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn identity_bundle_update_with_new_device_queues_welcome_and_commit() {
+    fn a_bundle_update_adding_a_device_leaves_the_group_as_it_was() {
         let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
         let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
@@ -10577,18 +10550,22 @@ pub(crate) mod tests {
                 bundle: merged.clone(),
             })
             .expect("apply bundle update");
+        let pending_before = alice.state.pending_outbox.len();
         simulate_pending_key_package_claims(&mut alice, output);
 
-        assert!(alice.state.pending_outbox.iter().any(|item| {
-            crate::mls_adapter::MlsAdapter::payload_is_welcome(
-                item.envelope.payload_b64().unwrap_or_default(),
-            ) && item.envelope.recipient_device_id == bob_laptop_profile.device_id
-        }));
-        assert!(alice
+        // Even beside the phone the conversation was set up with, a new
+        // device is refused: nothing out of band vouched for it.
+        assert!(!alice
             .state
             .pending_outbox
             .iter()
-            .any(|item| { outbox_item_matches_type(item, MessageType::MlsCommit) }));
+            .any(|item| item.envelope.recipient_device_id == bob_laptop_profile.device_id));
+        assert_eq!(alice.state.pending_outbox.len(), pending_before);
+        assert!(!alice.state.conversations[&conversation_id]
+            .conversation
+            .member_devices
+            .iter()
+            .any(|member| member.device_id == bob_laptop_profile.device_id));
     }
 
     #[test]
@@ -13726,6 +13703,323 @@ pub(crate) mod tests {
             &conversation_id,
             "after the reset"
         ));
+    }
+
+    /// **One device per party: a commit cannot change who is in the group.**
+    /// Inside `E(P,t)` a snapshot can commit in P's name. If that commit could
+    /// add a leaf, the leaf would outlive P's healing: P's rotation replaces
+    /// only P's own leaf. A 1:1 commit may refresh keys, nothing else.
+    #[test]
+    fn a_commit_cannot_add_a_leaf_to_a_two_party_session() {
+        let mut chat = paired_direct_chat();
+        let conversation_id = chat.conversation_id.clone();
+        let victim = alice_is_designated(&chat);
+        let peer_device = peer_device_id(&chat, victim).to_string();
+        let mut thief =
+            CoreEngine::try_from_restored_state(rotator_engine(&chat, victim).refresh_snapshot())
+                .expect("the snapshot restores");
+        let base_epoch = conversation_epoch(&thief, &conversation_id);
+        let lanes = thief.state.conversations[&conversation_id]
+            .lanes
+            .clone()
+            .expect("lanes");
+        let commit_key = thief
+            .state
+            .mls_adapter
+            .as_ref()
+            .expect("adapter")
+            .export_commit_wrap_key(&conversation_id, lanes.outbound_dir)
+            .expect("commit key");
+
+        // A device of the thief's own, under the victim's user.
+        let victim_mnemonic = if victim { ALICE_MNEMONIC } else { BOB_MNEMONIC };
+        let extra = IdentityManager::create_or_recover(Some(victim_mnemonic), Some("thief"))
+            .expect("an extra device");
+        let (_, extra_package) = MlsAdapter::bootstrap(&extra).expect("extra adapter");
+        let artifacts = thief
+            .state
+            .mls_adapter
+            .as_mut()
+            .expect("adapter")
+            .add_members(
+                &conversation_id,
+                &[crate::mls_adapter::PeerDeviceKeyPackage {
+                    user_id: extra.user_identity.user_id.clone(),
+                    device_id: extra.device_identity.device_id.clone(),
+                    device_public_key: extra.device_identity.device_public_key.clone(),
+                    key_package_b64: extra_package.key_package_b64,
+                }],
+            )
+            .expect("the thief adds a leaf");
+
+        let identity = thief.state.local_identity.as_ref().expect("identity");
+        let digest = crate::direct_frame::commit_sha256(&artifacts.commit_b64).expect("digest");
+        let signature =
+            identity.sign_payload(crate::model::signing::direct_commit_arbitration_payload(
+                &conversation_id,
+                &identity.user_identity.user_id,
+                &identity.device_identity.device_id,
+                base_epoch,
+                &digest,
+            ));
+        let frame = crate::direct_frame::encode(
+            &artifacts.commit_b64,
+            Some(&crate::direct_frame::signature_from_hex(&signature).expect("signature")),
+        )
+        .expect("frame");
+        let envelope = Envelope::with_bytes(
+            peer_device.clone(),
+            lanes.outbound_lane.clone(),
+            crate::model::random_opaque_id(),
+            STANDARD.encode(crate::lane_wrap::wrap_frame(&commit_key, &frame).expect("wrap")),
+        );
+
+        let fingerprint = |engine: &CoreEngine| {
+            engine
+                .state
+                .mls_adapter
+                .as_ref()
+                .expect("adapter")
+                .state_fingerprint()
+                .expect("fingerprint")
+        };
+        let before = fingerprint(peer_engine(&chat, victim));
+        deliver_inbox_envelope(
+            peer_engine_mut(&mut chat, victim),
+            &peer_device,
+            envelope,
+            800,
+        );
+        assert_eq!(
+            fingerprint(peer_engine(&chat, victim)),
+            before,
+            "a commit that adds a leaf must not be merged into a two-party session"
+        );
+        assert_eq!(
+            conversation_epoch(peer_engine(&chat, victim), &conversation_id),
+            base_epoch
+        );
+    }
+
+    /// **One device per party: a Welcome brings exactly two leaves.** Its
+    /// author and this device; anything more would be a member nobody in the
+    /// conversation vouched for.
+    #[test]
+    fn a_welcome_with_a_third_leaf_is_refused() {
+        let mut chat = paired_direct_chat();
+        let conversation_id = chat.conversation_id.clone();
+        let bob_device = chat.bob_device_id.clone();
+        chat.bob
+            .state
+            .conversations
+            .get_mut(&conversation_id)
+            .expect("conversation")
+            .rebuild
+            .awaits_peer_welcome = true;
+        let bob_identity = chat.bob.state.local_identity.clone().expect("bob identity");
+        let bob_package = crate::mls_adapter::PeerDeviceKeyPackage {
+            user_id: bob_identity.user_identity.user_id.clone(),
+            device_id: bob_identity.device_identity.device_id.clone(),
+            device_public_key: bob_identity.device_identity.device_public_key.clone(),
+            key_package_b64: chat
+                .bob
+                .state
+                .published_key_package
+                .as_ref()
+                .expect("bob key package")
+                .key_package_b64
+                .clone(),
+        };
+        let extra = IdentityManager::create_or_recover(Some(ALICE_MNEMONIC), Some("extra"))
+            .expect("an extra device");
+        let (_, extra_package) = MlsAdapter::bootstrap(&extra).expect("extra adapter");
+        let extra_package = crate::mls_adapter::PeerDeviceKeyPackage {
+            user_id: extra.user_identity.user_id.clone(),
+            device_id: extra.device_identity.device_id.clone(),
+            device_public_key: extra.device_identity.device_public_key.clone(),
+            key_package_b64: extra_package.key_package_b64,
+        };
+        let mut adapter = chat
+            .alice
+            .state
+            .mls_adapter
+            .as_ref()
+            .expect("adapter")
+            .fork()
+            .expect("copy");
+        adapter.clear_conversation(&conversation_id);
+        let artifacts = adapter
+            .create_conversation(&conversation_id, &[bob_package, extra_package])
+            .expect("a three-leaf group");
+        let welcome = artifacts
+            .welcomes
+            .iter()
+            .find(|welcome| welcome.recipient_device_id == bob_device)
+            .expect("bob's welcome")
+            .payload_b64
+            .clone();
+        let lane = chat.bob.state.conversations[&conversation_id]
+            .lanes
+            .as_ref()
+            .expect("lanes")
+            .inbound_lane
+            .clone();
+        let before = chat
+            .bob
+            .state
+            .mls_adapter
+            .as_ref()
+            .unwrap()
+            .state_fingerprint()
+            .unwrap();
+        deliver_inbox_envelope(
+            &mut chat.bob,
+            &bob_device,
+            Envelope::with_bytes(
+                bob_device.clone(),
+                lane,
+                crate::model::random_opaque_id(),
+                welcome,
+            ),
+            810,
+        );
+        assert_eq!(
+            chat.bob
+                .state
+                .mls_adapter
+                .as_ref()
+                .unwrap()
+                .state_fingerprint()
+                .unwrap(),
+            before,
+            "a two-party Welcome brings its author and this device, nobody else"
+        );
+    }
+
+    /// **A fork made through a race rebuild is detected too.** Inside
+    /// `E(P,t)` a snapshot can lose a commit race on purpose: its rebuild
+    /// Welcome travels under the losing commit's key, which is exactly what
+    /// the winner accepts, and the winner moves into the thief's group. The
+    /// real P never lost anything; it follows the winner's commit in the old
+    /// session and, sooner or later, commits there. An honest loser has left
+    /// that session and never holds the winner's keys, so a commit signed by
+    /// P's device under them is two holders of one key.
+    #[test]
+    fn a_race_rebuild_by_a_thief_is_detected_when_the_victim_commits() {
+        let mut chat = paired_direct_chat();
+        let conversation_id = chat.conversation_id.clone();
+        let victim = !alice_is_designated(&chat);
+        let victim_device = rotator_device_id(&chat, victim).to_string();
+        let peer_device = peer_device_id(&chat, victim).to_string();
+        let mut thief =
+            CoreEngine::try_from_restored_state(rotator_engine(&chat, victim).refresh_snapshot())
+                .expect("the snapshot restores");
+
+        // The counterparty, designated at this epoch, rotates.
+        set_direct_pcs_debt(
+            peer_engine_mut(&mut chat, victim),
+            &conversation_id,
+            DIRECT_PCS_COMMIT_INTERVAL - 1,
+        );
+        peer_engine_mut(&mut chat, victim)
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "counterparty rotation".into(),
+            })
+            .expect("counterparty rotates");
+        let winning = last_pending_envelope(
+            peer_engine(&chat, victim),
+            &victim_device,
+            MessageType::MlsCommit,
+        );
+
+        // The thief races it from the same base epoch and loses on purpose.
+        set_direct_pcs_debt(
+            &mut thief,
+            &conversation_id,
+            DIRECT_PCS_COMMIT_INTERVAL * 2 - 1,
+        );
+        thief
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "thief rotation".into(),
+            })
+            .expect("thief rotates");
+        let losing = last_pending_envelope(&thief, &peer_device, MessageType::MlsCommit);
+        let losing_key = thief.state.conversations[&conversation_id]
+            .pcs
+            .own_commit
+            .as_ref()
+            .and_then(|own| own.wrap_key)
+            .expect("the losing commit's key");
+        deliver_inbox_envelope(
+            peer_engine_mut(&mut chat, victim),
+            &peer_device,
+            losing,
+            900,
+        );
+
+        let output = deliver_inbox_envelope(&mut thief, &victim_device, winning.clone(), 900);
+        let key_package = peer_engine(&chat, victim)
+            .state
+            .published_key_package
+            .as_ref()
+            .expect("the counterparty's KeyPackage")
+            .key_package_b64
+            .clone();
+        answer_key_package_claims(&mut thief, output, &key_package);
+        let welcome = rebuild_welcome(&thief, &losing_key);
+        let old_epoch = conversation_epoch(peer_engine(&chat, victim), &conversation_id);
+        deliver_inbox_envelope(
+            peer_engine_mut(&mut chat, victim),
+            &peer_device,
+            welcome,
+            901,
+        );
+        assert_ne!(
+            conversation_epoch(peer_engine(&chat, victim), &conversation_id),
+            old_epoch,
+            "the counterparty moved into the thief's group"
+        );
+        assert!(!conversation_is_compromised(
+            peer_engine(&chat, victim),
+            &conversation_id
+        ));
+
+        // The real victim follows the winning commit, then commits itself.
+        deliver_inbox_envelope(
+            rotator_engine_mut(&mut chat, victim),
+            &victim_device,
+            winning,
+            902,
+        );
+        set_direct_pcs_debt(
+            rotator_engine_mut(&mut chat, victim),
+            &conversation_id,
+            DIRECT_PCS_COMMIT_INTERVAL * 2 - 1,
+        );
+        rotator_engine_mut(&mut chat, victim)
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "still in the old session".into(),
+            })
+            .expect("victim rotates");
+        let genuine = last_pending_envelope(
+            rotator_engine(&chat, victim),
+            &peer_device,
+            MessageType::MlsCommit,
+        );
+        deliver_inbox_envelope(
+            peer_engine_mut(&mut chat, victim),
+            &peer_device,
+            genuine,
+            903,
+        );
+        assert!(
+            conversation_is_compromised(peer_engine(&chat, victim), &conversation_id),
+            "a commit signed by the victim's device in the session it supposedly rebuilt out of \
+             is two holders of one key"
+        );
     }
 
     /// The designated side waits one interval, everyone else waits two. This

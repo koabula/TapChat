@@ -17,7 +17,41 @@ impl CoreEngine {
             .as_ref()
             .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))?;
         let peer_user_id = self.peer_user_for_conversation(&conversation_id)?;
-        let peer_active_device_ids = self.peer_active_device_ids(&peer_user_id)?;
+        // One device per party. Once a conversation is established, a change
+        // in the peer's device list is a change at the identity layer: it is
+        // signed by a root key that a snapshot of the peer also holds, and
+        // nothing out of band has confirmed it. It does not reach the group.
+        // The accepted device is the one the session was set up with.
+        let accepted = self
+            .state
+            .conversations
+            .get(&conversation_id)
+            .map(|state| state.last_known_peer_active_devices.clone())
+            .unwrap_or_default();
+        let peer_active_device_ids: Vec<String> = self
+            .peer_active_device_ids(&peer_user_id)?
+            .into_iter()
+            .filter(|device_id| accepted.is_empty() || accepted.contains(device_id))
+            .collect();
+        if peer_active_device_ids.is_empty() {
+            log::warn!(
+                "reconcile: the peer's accepted device is no longer in its bundle for conversation {}",
+                redact_id("conversation", &conversation_id)
+            );
+            // The group is exactly as it was, so the identity change that got
+            // us here leaves nothing to recover from.
+            if let Some(adapter) = self.state.mls_adapter.as_mut() {
+                if adapter.has_conversation(&conversation_id) {
+                    if let Ok(summary) = adapter.attempt_recovery(&conversation_id) {
+                        self.state
+                            .mls_summaries
+                            .insert(conversation_id.clone(), summary);
+                    }
+                    self.clear_recovery_context_as_healthy(&conversation_id);
+                }
+            }
+            return self.reconcile_unchanged(&conversation_id);
+        }
         let reconcile = {
             let conversation_state = self
                 .state
@@ -81,22 +115,7 @@ impl CoreEngine {
                 "reconcile: conversation {} waits for its peer to rebuild",
                 redact_id("conversation", &conversation_id)
             );
-            return Ok(CoreOutput {
-                state_update: CoreStateUpdate {
-                    conversations_changed: true,
-                    ..CoreStateUpdate::default()
-                },
-                effects: vec![persist_effect(
-                    &self.state,
-                    vec![PersistOp::SaveConversation {
-                        conversation_id: conversation_id.clone(),
-                    }],
-                )],
-                view_model: Some(CoreViewModel {
-                    conversations: vec![self.conversation_summary(&conversation_id)?],
-                    ..CoreViewModel::default()
-                }),
-            });
+            return self.reconcile_unchanged(&conversation_id);
         }
 
         if !reconcile.changed && !needs_rebootstrap {
@@ -231,6 +250,42 @@ impl CoreEngine {
             },
             remaining_devices,
         )
+    }
+
+    /// A reconcile that leaves the group as it is.
+    fn reconcile_unchanged(&self, conversation_id: &str) -> CoreResult<CoreOutput> {
+        let conversation_id_owned = conversation_id.to_string();
+        let recovery_op = if self.state.recovery_contexts.contains_key(conversation_id) {
+            PersistOp::SaveRecoveryContext {
+                conversation_id: conversation_id_owned.clone(),
+            }
+        } else {
+            PersistOp::DeleteRecoveryContext {
+                conversation_id: conversation_id_owned.clone(),
+            }
+        };
+        Ok(CoreOutput {
+            state_update: CoreStateUpdate {
+                conversations_changed: true,
+                ..CoreStateUpdate::default()
+            },
+            effects: vec![persist_effect(
+                &self.state,
+                vec![
+                    PersistOp::SaveConversation {
+                        conversation_id: conversation_id_owned.clone(),
+                    },
+                    PersistOp::SaveMlsState {
+                        conversation_id: conversation_id_owned,
+                    },
+                    recovery_op,
+                ],
+            )],
+            view_model: Some(CoreViewModel {
+                conversations: vec![self.conversation_summary(conversation_id)?],
+                ..CoreViewModel::default()
+            }),
+        })
     }
 
     pub(super) fn finalize_reconcile_membership_rebootstrap(

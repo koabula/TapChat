@@ -2950,10 +2950,10 @@ impl CoreEngine {
             .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?;
         match (message_type, welcome_author) {
             (MessageType::MlsWelcome, Some(author)) => {
-                adapter.ingest_welcome(conversation_id, &author, payload_b64)
+                adapter.ingest_direct_welcome(conversation_id, &author, payload_b64)
             }
             (MessageType::MlsWelcome, None) => Ok(IngestResult::Rejected(RejectReason::Malformed)),
-            _ => adapter.ingest_message(conversation_id, message_type, payload_b64),
+            _ => adapter.ingest_direct_message(conversation_id, message_type, payload_b64),
         }
     }
 
@@ -3619,8 +3619,22 @@ impl CoreEngine {
                         if arbitrated {
                             // Terminal for this record.
                         } else {
-                            let previous_wrap = if inbound_message_type == MessageType::MlsCommit {
+                            let previous_wrap = if matches!(
+                                inbound_message_type,
+                                MessageType::MlsCommit | MessageType::MlsWelcome
+                            ) {
                                 self.capture_previous_inbound_wrap(&conversation_id)?
+                            } else {
+                                None
+                            };
+                            // A Welcome that replaces a session retires its keys;
+                            // the previous epoch's too, for a peer one commit behind.
+                            let retiring_prev = if inbound_message_type == MessageType::MlsWelcome {
+                                self.state
+                                    .conversations
+                                    .get(&conversation_id)
+                                    .and_then(|state| state.lanes.as_ref())
+                                    .and_then(|lanes| lanes.wrap_prev.clone())
                             } else {
                                 None
                             };
@@ -3823,6 +3837,23 @@ impl CoreEngine {
                                         &conversation_id,
                                         &record.envelope.lane,
                                     );
+                                    if let Some(author) = welcome_author.as_ref() {
+                                        for retired in
+                                            [previous_wrap.as_ref(), retiring_prev.as_ref()]
+                                                .into_iter()
+                                                .flatten()
+                                        {
+                                            if let Some(key) = retired.commit_key {
+                                                self.record_retired_session_witness(
+                                                    &conversation_id,
+                                                    retired.epoch,
+                                                    &author.device_id,
+                                                    key,
+                                                    record.received_at,
+                                                );
+                                            }
+                                        }
+                                    }
                                     if let Some(state) =
                                         self.state.conversations.get_mut(&conversation_id)
                                     {
