@@ -1,9 +1,10 @@
 //! Epoch-and-direction wrap around MLS frames so the host never sees
 //! RFC 9420 PrivateMessage headers.
 //!
-//! `K(e, dir) = Exporter_e("tapchat.lane-wrap.v1", dir)`. The adapter
-//! exports only the current epoch; the previous key is kept on the
-//! conversation sidecar to match `max_past_epochs(1)`.
+//! `K(e, dir) = Exporter_e("tapchat.lane-wrap.v1", dir)` for every frame but
+//! a commit, `K_c(e, dir) = Exporter_e("tapchat.commit-wrap.v1", dir)` for a
+//! commit. The adapter exports only the current epoch; the previous epoch's
+//! keys are kept on the conversation sidecar to match `max_past_epochs(1)`.
 
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
@@ -12,6 +13,10 @@ use rand::RngCore;
 use crate::error::{CoreError, CoreResult};
 
 pub const LANE_WRAP_LABEL: &str = "tapchat.lane-wrap.v1";
+/// Commits travel under a key of their own, `K_c(e, dir)`. A receiver keeps
+/// the one for each peer commit it merged (`direct_fork`); drawn from the same
+/// exporter as the frame key, it would open every frame of that epoch.
+pub const COMMIT_WRAP_LABEL: &str = "tapchat.commit-wrap.v1";
 pub const WRAP_DIR_C1: u8 = 0x00;
 pub const WRAP_DIR_C2: u8 = 0x01;
 pub const WRAP_KEY_LEN: usize = 32;

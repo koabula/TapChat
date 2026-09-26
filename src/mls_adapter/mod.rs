@@ -1436,6 +1436,23 @@ impl MlsAdapter {
         conversation_id: &str,
         dir: u8,
     ) -> CoreResult<[u8; crate::lane_wrap::WRAP_KEY_LEN]> {
+        self.export_wrap_key(conversation_id, crate::lane_wrap::LANE_WRAP_LABEL, dir)
+    }
+
+    pub fn export_commit_wrap_key(
+        &self,
+        conversation_id: &str,
+        dir: u8,
+    ) -> CoreResult<[u8; crate::lane_wrap::WRAP_KEY_LEN]> {
+        self.export_wrap_key(conversation_id, crate::lane_wrap::COMMIT_WRAP_LABEL, dir)
+    }
+
+    fn export_wrap_key(
+        &self,
+        conversation_id: &str,
+        label: &str,
+        dir: u8,
+    ) -> CoreResult<[u8; crate::lane_wrap::WRAP_KEY_LEN]> {
         let state = self
             .groups
             .get(conversation_id)
@@ -1444,7 +1461,7 @@ impl MlsAdapter {
             .group
             .export_secret(
                 self.provider.crypto(),
-                crate::lane_wrap::LANE_WRAP_LABEL,
+                label,
                 &[dir],
                 crate::lane_wrap::WRAP_KEY_LEN,
             )

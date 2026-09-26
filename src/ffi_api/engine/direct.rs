@@ -3301,7 +3301,7 @@ impl CoreEngine {
         // the pending commit is consumed.
         let peer_user_id = self.peer_user_for_conversation(conversation_id)?;
         let recipient_device_ids = self.recipient_device_ids(conversation_id)?;
-        let outbound_prev = self.export_outbound_wrap_key(conversation_id)?;
+        let outbound_prev = self.export_outbound_commit_wrap_key(conversation_id)?;
         let inbound_prev = self.capture_previous_inbound_wrap(conversation_id)?;
         let rotated = self
             .state
@@ -3338,8 +3338,8 @@ impl CoreEngine {
                 rotated.commit_b64.clone(),
             )?;
             // `build_envelope` wraps with the post-merge key. The peer is
-            // still on the previous epoch, so re-wrap with the outbound key
-            // we exported before the self-update.
+            // still on the previous epoch, so re-wrap with the outbound commit
+            // key we exported before the self-update.
             envelope.bytes = Some(self.wrap_outbound_frame_with_key(
                 conversation_id,
                 MessageType::MlsCommit,

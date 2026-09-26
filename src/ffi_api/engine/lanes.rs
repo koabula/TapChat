@@ -209,7 +209,12 @@ impl CoreEngine {
         }
         let epoch = adapter.export_group_summary(conversation_id)?.epoch;
         let key = adapter.export_lane_wrap_key(conversation_id, inbound_dir)?;
-        Ok(Some(LaneWrapCache { epoch, key }))
+        let commit_key = adapter.export_commit_wrap_key(conversation_id, inbound_dir)?;
+        Ok(Some(LaneWrapCache {
+            epoch,
+            key,
+            commit_key: Some(commit_key),
+        }))
     }
 
     pub(super) fn install_previous_inbound_wrap(
@@ -230,7 +235,9 @@ impl CoreEngine {
         }
     }
 
-    pub(super) fn export_outbound_wrap_key(
+    /// `K_c(e, outbound)` for the current epoch: what a commit made from it
+    /// has to travel under, exported before the commit moves the group on.
+    pub(super) fn export_outbound_commit_wrap_key(
         &self,
         conversation_id: &str,
     ) -> CoreResult<[u8; lane_wrap::WRAP_KEY_LEN]> {
@@ -246,16 +253,16 @@ impl CoreEngine {
             .mls_adapter
             .as_ref()
             .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?;
-        adapter.export_lane_wrap_key(conversation_id, dir)
+        adapter.export_commit_wrap_key(conversation_id, dir)
     }
 
-    /// The frame under the current epoch's key or the previous one's, and the
-    /// key that opened it.
+    /// The frame under one of the current or previous epoch's keys, the key
+    /// that opened it, and which of the epoch's two keys that was.
     fn open_inbound_frame(
         &self,
         conversation_id: &str,
         payload_b64: &str,
-    ) -> Option<(Vec<u8>, [u8; lane_wrap::WRAP_KEY_LEN])> {
+    ) -> Option<(Vec<u8>, [u8; lane_wrap::WRAP_KEY_LEN], WrapKind)> {
         let lanes = self
             .state
             .conversations
@@ -265,15 +272,24 @@ impl CoreEngine {
         if !adapter.has_conversation(conversation_id) {
             return None;
         }
-        let current = adapter
-            .export_lane_wrap_key(conversation_id, lanes.inbound_dir())
-            .ok()?;
-        let previous = lanes.wrap_prev.as_ref().map(|cache| cache.key);
+        let dir = lanes.inbound_dir();
+        let current = adapter.export_lane_wrap_key(conversation_id, dir).ok()?;
+        let current_commit = adapter.export_commit_wrap_key(conversation_id, dir).ok()?;
+        let previous = lanes.wrap_prev.as_ref();
         let wrapped = STANDARD.decode(payload_b64).ok()?;
-        [Some(current), previous]
-            .into_iter()
-            .flatten()
-            .find_map(|key| lane_wrap::unwrap_frame(&key, &wrapped).map(|frame| (frame, key)))
+        [
+            Some((current, WrapKind::Frame)),
+            Some((current_commit, WrapKind::Commit)),
+            previous.map(|cache| (cache.key, WrapKind::Frame)),
+            previous
+                .and_then(|cache| cache.commit_key)
+                .map(|key| (key, WrapKind::Commit)),
+        ]
+        .into_iter()
+        .flatten()
+        .find_map(|(key, kind)| {
+            lane_wrap::unwrap_frame(&key, &wrapped).map(|frame| (frame, key, kind))
+        })
     }
 
     /// The frame under the base-epoch key of a peer commit this device merged.
@@ -296,7 +312,7 @@ impl CoreEngine {
         payload_b64: &str,
     ) -> Option<Vec<u8>> {
         self.open_inbound_frame(conversation_id, payload_b64)
-            .map(|(frame, _)| frame)
+            .map(|(frame, _, _)| frame)
     }
 
     pub(crate) fn unwrap_inbound_bytes(
@@ -320,7 +336,7 @@ impl CoreEngine {
         if let Some(conversation_id) = self.conversation_id_for_lane(&record.envelope.lane) {
             let opened = self.open_inbound_frame(&conversation_id, payload_b64);
             let evidence = match opened.as_ref() {
-                Some((frame, key)) => self.double_sign_evidence(&conversation_id, frame, key),
+                Some((frame, key, _)) => self.double_sign_evidence(&conversation_id, frame, key),
                 None => self
                     .open_under_witness_keys(&conversation_id, payload_b64)
                     .and_then(|(frame, key)| {
@@ -333,7 +349,7 @@ impl CoreEngine {
                     forked_since_ms,
                 });
             }
-            if let Some((plaintext, _)) = opened {
+            if let Some((plaintext, _, kind)) = opened {
                 let Ok((mls_b64, commit_signature)) = crate::direct_frame::decode(&plaintext)
                 else {
                     return Ok(InboundFrameResolution::Rejected);
@@ -341,6 +357,12 @@ impl CoreEngine {
                 let Some(message_type) = MlsAdapter::classify_mls_payload(&mls_b64) else {
                     return Ok(InboundFrameResolution::Rejected);
                 };
+                // The key a frame opened under is part of what it claims to
+                // be: a commit under the frame key, or anything else under
+                // the commit key, does not match its own wrapping.
+                if (message_type == MessageType::MlsCommit) != (kind == WrapKind::Commit) {
+                    return Ok(InboundFrameResolution::Rejected);
+                }
                 let authenticated_commit = match message_type {
                     MessageType::MlsCommit => {
                         let Some(commit) = self.authenticate_direct_commit(
@@ -587,6 +609,13 @@ pub(super) struct ResolvedInbound {
     pub payload_b64: String,
     pub welcome_author: Option<WelcomeAuthor>,
     pub authenticated_commit: Option<crate::direct_frame::AuthenticatedDirectCommit>,
+}
+
+/// Which of an epoch's two wrap keys opened a frame; see `lane_wrap`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum WrapKind {
+    Frame,
+    Commit,
 }
 
 pub(super) enum InboundFrameResolution {

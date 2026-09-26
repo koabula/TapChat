@@ -12745,6 +12745,111 @@ pub(crate) mod tests {
         );
     }
 
+    /// **Commits travel under a key of their own.** The counterparty keeps the
+    /// wrap key of each peer commit's base epoch for fork detection, and a
+    /// corruption of it hands that key over. Drawn from the frame key it would
+    /// open every frame the peer sent in that epoch; drawn separately it opens
+    /// the commits and nothing else. The kinds do not mix: a commit under the
+    /// frame key is refused.
+    #[test]
+    fn commits_travel_under_their_own_wrap_key() {
+        let mut chat = paired_direct_chat();
+        let conversation_id = chat.conversation_id.clone();
+        let author = alice_is_designated(&chat);
+        let peer_device = peer_device_id(&chat, author).to_string();
+        let base_epoch = conversation_epoch(rotator_engine(&chat, author), &conversation_id);
+        let (frame_key, commit_key) = {
+            let engine = rotator_engine(&chat, author);
+            let dir = engine.state.conversations[&conversation_id]
+                .lanes
+                .as_ref()
+                .expect("lanes")
+                .outbound_dir;
+            let adapter = engine.state.mls_adapter.as_ref().expect("adapter");
+            (
+                adapter
+                    .export_lane_wrap_key(&conversation_id, dir)
+                    .expect("frame key"),
+                adapter
+                    .export_commit_wrap_key(&conversation_id, dir)
+                    .expect("commit key"),
+            )
+        };
+
+        rotator_engine_mut(&mut chat, author)
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "in the base epoch".into(),
+            })
+            .expect("send");
+        let application =
+            last_pending_application_envelope(rotator_engine(&chat, author), &peer_device);
+        set_direct_pcs_debt(
+            rotator_engine_mut(&mut chat, author),
+            &conversation_id,
+            DIRECT_PCS_COMMIT_INTERVAL - 1,
+        );
+        rotator_engine_mut(&mut chat, author)
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "rotation trigger".into(),
+            })
+            .expect("rotate");
+        let commit = last_pending_envelope(
+            rotator_engine(&chat, author),
+            &peer_device,
+            MessageType::MlsCommit,
+        );
+
+        // The same commit frame under the frame key is refused.
+        let frame = unwrap_envelope_payload(&commit_key, &commit)
+            .or_else(|| unwrap_envelope_payload(&frame_key, &commit))
+            .expect("the author can open its own commit");
+        let mut misfiled = commit.clone();
+        misfiled.mid = crate::model::random_opaque_id();
+        misfiled.bytes =
+            Some(STANDARD.encode(crate::lane_wrap::wrap_frame(&frame_key, &frame).expect("wrap")));
+        deliver_inbox_envelope(
+            peer_engine_mut(&mut chat, author),
+            &peer_device,
+            misfiled,
+            100,
+        );
+        assert_eq!(
+            conversation_epoch(peer_engine(&chat, author), &conversation_id),
+            base_epoch,
+            "a commit under the frame key must not be applied"
+        );
+
+        deliver_inbox_envelope(
+            peer_engine_mut(&mut chat, author),
+            &peer_device,
+            application.clone(),
+            101,
+        );
+        deliver_inbox_envelope(
+            peer_engine_mut(&mut chat, author),
+            &peer_device,
+            commit.clone(),
+            102,
+        );
+        assert_eq!(
+            conversation_epoch(peer_engine(&chat, author), &conversation_id),
+            base_epoch + 1
+        );
+        let witness_key = peer_engine(&chat, author).state.conversations[&conversation_id]
+            .fork
+            .witnesses
+            .last()
+            .expect("a witness for the merged commit")
+            .wrap_key;
+        assert!(unwrap_envelope_payload(&witness_key, &commit).is_some());
+        assert!(
+            unwrap_envelope_payload(&witness_key, &application).is_none(),
+            "the retained key must not open the peer's other frames of that epoch"
+        );
+    }
+
     /// **A fork is detected by the counterparty.** A snapshot of P commits in
     /// P's name and Q merges it first, so the two continue in different
     /// epochs. P never saw the forged commit, so its own next commit builds on
@@ -13854,7 +13959,7 @@ pub(crate) mod tests {
             .mls_adapter
             .as_ref()
             .unwrap()
-            .export_lane_wrap_key(&conversation_id, victim_lanes.inbound_dir())
+            .export_commit_wrap_key(&conversation_id, victim_lanes.inbound_dir())
             .unwrap();
 
         // Make the peer rotate, so a commit it really signed exists.
@@ -13951,7 +14056,7 @@ pub(crate) mod tests {
             .mls_adapter
             .as_ref()
             .unwrap()
-            .export_lane_wrap_key(&conversation_id, lanes.inbound_dir())
+            .export_commit_wrap_key(&conversation_id, lanes.inbound_dir())
             .unwrap();
         set_direct_pcs_debt(
             rotator_engine_mut(&mut chat, alice_rotated),
@@ -14898,14 +15003,16 @@ pub(crate) mod tests {
             .get(conversation_id)?
             .lanes
             .as_ref()?;
-        let key = sender
-            .state
-            .mls_adapter
-            .as_ref()?
+        let adapter = sender.state.mls_adapter.as_ref()?;
+        let key = adapter
             .export_lane_wrap_key(conversation_id, lanes.outbound_dir)
             .ok()?;
+        let commit_key = adapter
+            .export_commit_wrap_key(conversation_id, lanes.outbound_dir)
+            .ok()?;
         let wrapped = STANDARD.decode(payload).ok()?;
-        let plaintext = crate::lane_wrap::unwrap_with_cached_keys(&key, None, &wrapped)?;
+        let plaintext =
+            crate::lane_wrap::unwrap_with_cached_keys(&key, Some(&commit_key), &wrapped)?;
         let (mls_b64, _) = crate::direct_frame::decode(&plaintext).ok()?;
         MlsAdapter::classify_mls_payload(&mls_b64)
     }

@@ -19,7 +19,8 @@ impl CoreEngine {
 
     /// Build a host-visible 1:1 envelope: lane, mid, recipient, bytes.
     /// Welcome travels unwrapped. Every other MLS frame is wrapped under
-    /// the current epoch's exporter so the host never sees a group_id.
+    /// the current epoch's exporter so the host never sees a group_id: a
+    /// commit under `K_c`, anything else under `K`.
     pub(super) fn build_envelope_with_storage_refs(
         &mut self,
         conversation_id: &str,
@@ -69,7 +70,11 @@ impl CoreEngine {
             .mls_adapter
             .as_ref()
             .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?;
-        let key = adapter.export_lane_wrap_key(conversation_id, dir)?;
+        let key = if message_type == MessageType::MlsCommit {
+            adapter.export_commit_wrap_key(conversation_id, dir)?
+        } else {
+            adapter.export_lane_wrap_key(conversation_id, dir)?
+        };
         self.wrap_outbound_frame_with_key(conversation_id, message_type, payload_b64, &key)
     }
 

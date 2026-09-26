@@ -3710,7 +3710,7 @@ impl CoreEngine {
                                 IngestResult::AppliedCommit { epoch } => {
                                     touched_conversation_ids.insert(conversation_id.clone());
                                     let base_epoch_key =
-                                        previous_wrap.as_ref().map(|wrap| wrap.key);
+                                        previous_wrap.as_ref().and_then(|wrap| wrap.commit_key);
                                     self.install_previous_inbound_wrap(
                                         &conversation_id,
                                         previous_wrap,

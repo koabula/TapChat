@@ -105,6 +105,10 @@ pub struct ConversationLanes {
 pub struct LaneWrapCache {
     pub epoch: u64,
     pub key: [u8; 32],
+    /// `K_c` of the same epoch. Absent in caches written before commits had
+    /// a key of their own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_key: Option<[u8; 32]>,
 }
 
 impl ConversationLanes {
