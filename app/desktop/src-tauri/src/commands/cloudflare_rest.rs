@@ -283,7 +283,7 @@ fn build_worker_metadata(config: &WorkerDeployConfig) -> Value {
                 "enabled": true,
                 "head_sampling_rate": 0.01,
                 "invocation_logs": false,
-                "persist": true,
+                "persist": false,
             },
             "traces": {
                 "enabled": false,
@@ -1002,6 +1002,8 @@ mod tests {
             0.01
         );
         assert_eq!(metadata["observability"]["logs"]["invocation_logs"], false);
+        // Live tail only: the operator keeps no request log it could later hand over.
+        assert_eq!(metadata["observability"]["logs"]["persist"], false);
         assert_eq!(metadata["observability"]["traces"]["enabled"], false);
 
         let bindings = metadata["bindings"].as_array().expect("bindings");

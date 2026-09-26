@@ -47,7 +47,7 @@
       "enabled": true,
       "head_sampling_rate": 0.01,
       "invocation_logs": false,
-      "persist": true
+      "persist": false
     },
     "traces": {
       "enabled": false,
