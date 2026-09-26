@@ -12587,6 +12587,136 @@ pub(crate) mod tests {
         );
     }
 
+    /// **`Inject` is confined to `E(P,t)`.** A snapshot of the victim speaks for
+    /// it only until the victim's own rotation has reached the peer and the
+    /// peer has left the epochs the snapshot could reach.
+    ///
+    /// The thief is the victim's own engine restored from its persisted state,
+    /// so it runs the victim's code on the victim's keys and lanes. The control
+    /// half is not optional: without it the closing assertions hold for a thief
+    /// that could never speak at all, and the ideal's `Inject` window would be
+    /// untested in the direction that makes it necessary.
+    #[test]
+    fn injection_is_confined_to_the_exposure_window() {
+        let mut chat = paired_direct_chat();
+        let conversation_id = chat.conversation_id.clone();
+        let victim = alice_is_designated(&chat);
+        let peer_device = peer_device_id(&chat, victim).to_string();
+        let snapshot_epoch = conversation_epoch(rotator_engine(&chat, victim), &conversation_id);
+
+        let mut thief =
+            CoreEngine::try_from_restored_state(rotator_engine(&chat, victim).refresh_snapshot())
+                .expect("the snapshot restores");
+        set_direct_pcs_debt(&mut thief, &conversation_id, 0);
+
+        // Inside the window: the snapshot alone impersonates the victim.
+        thief
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "forged inside the window".into(),
+            })
+            .expect("thief sends inside the window");
+        let inside = last_pending_application_envelope(&thief, &peer_device);
+        deliver_inbox_envelope(
+            peer_engine_mut(&mut chat, victim),
+            &peer_device,
+            inside,
+            100,
+        );
+        assert!(
+            conversation_has_plaintext(
+                peer_engine(&chat, victim),
+                &conversation_id,
+                "forged inside the window"
+            ),
+            "a snapshot must be able to speak for its owner before the owner rotates; \
+             otherwise the ideal would not need Inject and this test would prove nothing"
+        );
+
+        // The victim rotates and the peer merges it.
+        set_direct_pcs_debt(
+            rotator_engine_mut(&mut chat, victim),
+            &conversation_id,
+            DIRECT_PCS_COMMIT_INTERVAL - 1,
+        );
+        assert_eq!(trigger_direct_pcs_from_designated(&mut chat), victim);
+        complete_direct_pcs_rotation(&mut chat, victim);
+
+        // One more epoch, so the snapshot's epoch leaves the peer's retention
+        // window of one past epoch.
+        let second = alice_is_designated(&chat);
+        set_direct_pcs_debt(
+            rotator_engine_mut(&mut chat, second),
+            &conversation_id,
+            DIRECT_PCS_COMMIT_INTERVAL - 1,
+        );
+        assert_eq!(trigger_direct_pcs_from_designated(&mut chat), second);
+        complete_direct_pcs_rotation(&mut chat, second);
+        assert_eq!(
+            conversation_epoch(peer_engine(&chat, victim), &conversation_id),
+            snapshot_epoch + 2,
+            "the peer must have left the snapshot's epoch and the one after it"
+        );
+
+        // After the window: an application frame and a commit, both minted
+        // from the snapshot, leave no trace at the peer.
+        thief
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "forged after the window".into(),
+            })
+            .expect("thief sends after the window");
+        let after = last_pending_application_envelope(&thief, &peer_device);
+        set_direct_pcs_debt(&mut thief, &conversation_id, DIRECT_PCS_COMMIT_INTERVAL - 1);
+        thief
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "thief rotation trigger".into(),
+            })
+            .expect("thief commits in the victim's name");
+        let forged_commit = last_pending_envelope(&thief, &peer_device, MessageType::MlsCommit);
+
+        let peer = peer_engine(&chat, victim);
+        let fingerprint_before = peer
+            .state
+            .mls_adapter
+            .as_ref()
+            .expect("peer adapter")
+            .state_fingerprint()
+            .expect("peer fingerprint");
+        let messages_before = peer.state.conversations[&conversation_id].messages.len();
+
+        deliver_inbox_envelope(peer_engine_mut(&mut chat, victim), &peer_device, after, 200);
+        deliver_inbox_envelope(
+            peer_engine_mut(&mut chat, victim),
+            &peer_device,
+            forged_commit,
+            201,
+        );
+
+        let peer = peer_engine(&chat, victim);
+        assert_eq!(
+            peer.state
+                .mls_adapter
+                .as_ref()
+                .expect("peer adapter")
+                .state_fingerprint()
+                .expect("peer fingerprint"),
+            fingerprint_before,
+            "frames minted from a pre-rotation snapshot must not touch the peer's MLS state"
+        );
+        assert_eq!(
+            peer.state.conversations[&conversation_id].messages.len(),
+            messages_before,
+            "frames minted from a pre-rotation snapshot must not reach the transcript"
+        );
+        assert_eq!(
+            conversation_epoch(peer, &conversation_id),
+            snapshot_epoch + 2,
+            "a commit minted from a pre-rotation snapshot must not move the peer"
+        );
+    }
+
     /// The designated side waits one interval, everyone else waits two. This
     /// asymmetry is what keeps the common case free of collisions: exactly one
     /// party sits at the 1x threshold at any epoch.
