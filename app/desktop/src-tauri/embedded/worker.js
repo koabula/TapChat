@@ -1963,6 +1963,7 @@ _RistrettoPoint.Fn = /* @__PURE__ */ (() => Fn)();
 
 // src/types/contracts.ts
 var CURRENT_MODEL_VERSION = "0.1";
+var APPEND_ACK = Object.freeze({});
 
 // src/storage/sharing.ts
 var encoder = new TextEncoder();
@@ -5437,11 +5438,8 @@ var InboxService = class {
   }
   async appendEnvelope(input, now, authContext = { mode: "verified" }) {
     this.validateAppendRequest(input);
-    const existingResult = await this.state.get(
-      INBOX_DO_KEYS.appendResult(input.envelope.mid)
-    );
-    if (existingResult) {
-      return existingResult;
+    if (await this.state.get(INBOX_DO_KEYS.appendResult(input.envelope.mid)) !== void 0) {
+      return APPEND_ACK;
     }
     if (authContext.mode !== "verified") {
       throw new HttpError(426, "upgrade_required", "verified append authorization is required");
@@ -5682,11 +5680,9 @@ var InboxService = class {
   }
   async deliverEnvelope(input, now, persistAppendResult = true) {
     const meta = await this.getMeta();
-    const existingSeq = await this.state.get(INBOX_DO_KEYS.idempotency(input.envelope.mid));
-    if (existingSeq !== void 0) {
-      return { seq: existingSeq };
+    if (await this.state.get(INBOX_DO_KEYS.idempotency(input.envelope.mid)) !== void 0) {
+      return APPEND_ACK;
     }
-    const appendSeq = meta.appendSeq + 1;
     const seq = meta.headSeq + 1;
     const expiresAt = now + meta.retentionDays * 24 * 60 * 60 * 1e3;
     const bytes = input.envelope.bytes;
@@ -5740,12 +5736,11 @@ var InboxService = class {
         storageRef: input.envelope.storageRef
       };
     }
-    const result = { seq: appendSeq };
     await this.state.putEntries({
       [INBOX_DO_KEYS.record(seq)]: index,
-      [INBOX_DO_KEYS.idempotency(record.messageId)]: appendSeq,
-      ...persistAppendResult ? { [INBOX_DO_KEYS.appendResult(record.messageId)]: result } : {},
-      [INBOX_DO_KEYS.meta]: { ...meta, appendSeq, headSeq: seq }
+      [INBOX_DO_KEYS.idempotency(record.messageId)]: true,
+      ...persistAppendResult ? { [INBOX_DO_KEYS.appendResult(record.messageId)]: APPEND_ACK } : {},
+      [INBOX_DO_KEYS.meta]: { ...meta, headSeq: seq }
     });
     this.publish({
       event: "head_updated",
@@ -5758,7 +5753,7 @@ var InboxService = class {
       seq,
       record
     });
-    return result;
+    return APPEND_ACK;
   }
   async queueMessageRequestWithLimit(input, now) {
     await this.enforceMessageRequestRateLimit(now);
@@ -5800,15 +5795,11 @@ var InboxService = class {
       totalBytes: queueMeta.totalBytes + requestBytes,
       senderCount: nextIndex.length
     };
-    const meta = await this.getMeta();
-    const appendSeq = meta.appendSeq + 1;
-    const result = { seq: appendSeq };
     await this.state.putEntries({
       [key]: entry,
       [INBOX_DO_KEYS.messageRequestIndex]: nextIndex,
       [INBOX_DO_KEYS.messageRequestMeta]: nextQueueMeta,
-      [INBOX_DO_KEYS.meta]: { ...meta, appendSeq },
-      [INBOX_DO_KEYS.appendResult(input.envelope.mid)]: result
+      [INBOX_DO_KEYS.appendResult(input.envelope.mid)]: APPEND_ACK
     });
     await this.scheduleNextAlarm(now);
     this.publish({
@@ -5817,7 +5808,7 @@ var InboxService = class {
       requestId: entry.requestId,
       change: "queued"
     });
-    return result;
+    return APPEND_ACK;
   }
   messageRequestCapacityExceeded(message) {
     throw new HttpError(429, "message_request_capacity_exceeded", message);
@@ -6183,7 +6174,6 @@ async function handleInboxDurableRequest(request, deps) {
   const now = deps.now ?? Date.now();
   const url = new URL(request.url);
   const service = new InboxService(deps.deviceId, deps.state, deps.spillStore, deps.sessions, {
-    appendSeq: 0,
     headSeq: 0,
     ackedSeq: 0,
     retentionDays: deps.retentionDays,
@@ -6355,7 +6345,6 @@ var InboxDurableObject = class extends DurableObjectBase3 {
         new R2JsonBlobStore2(this.envRef.TAPCHAT_STORAGE),
         [],
         {
-          appendSeq: 0,
           headSeq: 0,
           ackedSeq: 0,
           retentionDays: Number(this.envRef.RETENTION_DAYS ?? "30"),

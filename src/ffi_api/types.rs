@@ -1118,11 +1118,10 @@ pub struct MessageRequestActionSummary {
     pub action: MessageRequestAction,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AppendResultSummary {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub seq: Option<u64>,
-}
+/// That an append was answered. The answer carries nothing more; see
+/// `AppendEnvelopeResult`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppendResultSummary {}
 
 /// Result of a single failed group operation within a batch sync.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

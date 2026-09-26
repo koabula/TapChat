@@ -25,17 +25,16 @@ pub enum MessageRequestRealtimeChange {
     Rejected,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-/// What an append is answered with: a sequence number and nothing else.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// What an append is answered with: nothing but the fact of the answer.
 ///
-/// There used to be an `accepted` flag beside it, and it was always true.
-/// Whether a record joined the record stream or is waiting for its recipient
-/// to accept a first contact is the recipient's business, not the transport's
-/// to report — and the number itself is now drawn from one counter over every
-/// append, so it does not report it either.
-pub struct AppendEnvelopeResult {
-    pub seq: u64,
-}
+/// It used to carry an `accepted` flag, which was always true, and then a
+/// sequence number drawn from one counter over every append to the inbox.
+/// Whether a record joined the record stream or waits for its recipient to
+/// accept a first contact is the recipient's business, and so is how much else
+/// it receives: two replies to one sender, subtracted, counted everyone else's
+/// traffic in between.
+pub struct AppendEnvelopeResult {}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FetchMessagesRequest {
@@ -763,18 +762,14 @@ mod tests {
     }
 
     #[test]
-    fn append_result_carries_a_sequence_number_and_nothing_else() {
-        let result = AppendEnvelopeResult { seq: 7 };
-
-        let json = serde_json::to_string(&result).expect("serialize");
-        let decoded: AppendEnvelopeResult = serde_json::from_str(&json).expect("deserialize");
-
-        assert_eq!(decoded.seq, 7);
-        assert_eq!(json, r#"{"seq":7}"#);
-        // Each of these was, at some point, a way for the reply to report what
-        // the inbox did with the record.
-        for reported in ["delivered", "queued", "request_id", "accepted", "rejected"] {
-            assert!(!json.contains(reported), "append reply reports {reported}");
+    fn append_result_is_a_constant() {
+        let json = serde_json::to_string(&AppendEnvelopeResult::default()).expect("serialize");
+        assert_eq!(json, "{}");
+        // What a host adds around it, and what older hosts sent, decodes to the
+        // same nothing.
+        for reply in [r#"{"version":"0.1"}"#, r#"{"seq":7}"#] {
+            let decoded: AppendEnvelopeResult = serde_json::from_str(reply).expect("deserialize");
+            assert_eq!(decoded, AppendEnvelopeResult::default());
         }
     }
 

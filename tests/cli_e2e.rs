@@ -881,7 +881,7 @@ fn cli_contact_request_and_allowlist_commands_work() -> Result<()> {
     ])?;
     assert_eq!(first_send["sent"], Value::Bool(true));
     assert_eq!(first_send["pending_outbox"], Value::from(0));
-    assert_append_result(&first_send, "message_request", true, Some(true))?;
+    assert_append_result(&first_send)?;
     assert!(first_send["latest_notification"]
         .as_str()
         .unwrap_or_default()
@@ -927,7 +927,7 @@ fn cli_contact_request_and_allowlist_commands_work() -> Result<()> {
     ])?;
     assert_eq!(second_send["sent"], Value::Bool(true));
     assert_eq!(second_send["pending_outbox"], Value::from(0));
-    assert_append_result(&second_send, "rejected", true, None)?;
+    assert_append_result(&second_send)?;
     assert!(second_send["latest_notification"]
         .as_str()
         .unwrap_or_default()
@@ -1222,7 +1222,7 @@ fn cli_sender_policy_and_recovery_status_remain_consistent_e2e_work() -> Result<
     ])?;
     assert_eq!(third_send["sent"], Value::Bool(true));
     assert_eq!(third_send["pending_outbox"], Value::from(0));
-    assert_append_result(&third_send, "inbox", true, None)?;
+    assert_append_result(&third_send)?;
     assert!(third_send["latest_notification"].is_null());
 
     let delivered_sync = sync_once(&bob_profile)?;
@@ -1353,7 +1353,7 @@ fn cli_sender_policy_and_recovery_status_remain_consistent_e2e_work() -> Result<
         "policy recovery post heal",
     ])?;
     assert_eq!(bob_messages_after_recovery["sent"], Value::Bool(true));
-    assert_append_result(&bob_messages_after_recovery, "inbox", true, None)?;
+    assert_append_result(&bob_messages_after_recovery)?;
     assert!(bob_messages_after_recovery["latest_notification"].is_null());
 
     let post_heal_sync = sync_once(&ctx.bob_profile)?;
@@ -1511,7 +1511,7 @@ fn cli_sender_policy_identity_refresh_and_reconcile_do_not_overclaim_delivery_e2
         "policy refresh request",
     ])?;
     assert_eq!(first_send["sent"], Value::Bool(true));
-    assert_append_result(&first_send, "message_request", true, Some(true))?;
+    assert_append_result(&first_send)?;
     assert!(first_send["latest_notification"]
         .as_str()
         .unwrap_or_default()
@@ -1560,7 +1560,7 @@ fn cli_sender_policy_identity_refresh_and_reconcile_do_not_overclaim_delivery_e2
         "policy refresh rejected",
     ])?;
     assert_eq!(second_send["sent"], Value::Bool(true));
-    assert_append_result(&second_send, "rejected", true, None)?;
+    assert_append_result(&second_send)?;
     assert!(second_send["latest_notification"]
         .as_str()
         .unwrap_or_default()
@@ -1748,7 +1748,7 @@ fn cli_sender_policy_identity_refresh_and_reconcile_do_not_overclaim_delivery_e2
         "policy refresh after heal",
     ])?;
     assert_eq!(fourth_send["sent"], Value::Bool(true));
-    assert_append_result(&fourth_send, "inbox", true, None)?;
+    assert_append_result(&fourth_send)?;
     assert!(fourth_send["latest_notification"].is_null());
 
     let laptop_sync_after_heal = sync_once(&laptop.laptop_profile)?;
@@ -1799,7 +1799,7 @@ fn cli_needs_rebuild_surfaces_escalation_reason_e2e_work() -> Result<()> {
         "--text",
         "before corruption",
     ])?;
-    assert_append_result(&baseline_send, "inbox", true, None)?;
+    assert_append_result(&baseline_send)?;
     let baseline_sync = sync_once(&ctx.bob_profile)?;
     let baseline_acked = required_u64(&baseline_sync["checkpoint"], "last_acked_seq")?;
     assert!(baseline_acked > 0);
@@ -1902,7 +1902,7 @@ fn cli_needs_rebuild_surfaces_escalation_reason_e2e_work() -> Result<()> {
         "--text",
         "after rebuild",
     ])?;
-    assert_append_result(&after_send, "inbox", true, None)?;
+    assert_append_result(&after_send)?;
     let final_sync = sync_once(&ctx.bob_profile)?;
     let final_acked = required_u64(&final_sync["checkpoint"], "last_acked_seq")?;
     assert!(final_acked >= last_acked);
@@ -1935,7 +1935,7 @@ fn cli_rebuild_command_surfaces_stable_escalation_reason_e2e_work() -> Result<()
         "--text",
         "before policy exhausted rebuild",
     ])?;
-    assert_append_result(&baseline_send, "inbox", true, None)?;
+    assert_append_result(&baseline_send)?;
     let baseline_sync = sync_once(&ctx.bob_profile)?;
     let mut last_acked = required_u64(&baseline_sync["checkpoint"], "last_acked_seq")?;
 
@@ -2033,7 +2033,7 @@ fn cli_rebuild_command_surfaces_stable_escalation_reason_e2e_work() -> Result<()
         "--text",
         "after stable rebuild escalation",
     ])?;
-    assert_append_result(&after_send, "inbox", true, None)?;
+    assert_append_result(&after_send)?;
     let final_sync = sync_once(&ctx.bob_profile)?;
     let final_acked = required_u64(&final_sync["checkpoint"], "last_acked_seq")?;
     assert!(final_acked >= last_acked);
@@ -2070,7 +2070,7 @@ fn cli_realtime_out_of_order_or_duplicate_delivery_e2e_work() -> Result<()> {
         "--text",
         "duplicate realtime delivery",
     ])?;
-    assert_append_result(&first_send, "inbox", true, None)?;
+    assert_append_result(&first_send)?;
 
     let first_sync = sync_once(&ctx.bob_profile)?;
     let first_acked = required_u64(&first_sync["checkpoint"], "last_acked_seq")?;
@@ -2446,7 +2446,7 @@ fn cli_direct_message_and_attachment_e2e_work() -> Result<()> {
         "--text",
         "hello from cli e2e",
     ])?;
-    assert_append_result(&text_send, "inbox", true, None)?;
+    assert_append_result(&text_send)?;
     let first_sync = run_cli_json([
         "sync",
         "once",
@@ -2520,7 +2520,7 @@ fn cli_direct_message_and_attachment_e2e_work() -> Result<()> {
     assert_eq!(attachment_send["queued"], Value::Bool(true));
     assert_eq!(attachment_send["pending_outbox"].as_u64(), Some(0));
     assert_eq!(attachment_send["pending_blob_uploads"].as_u64(), Some(0));
-    assert_append_result(&attachment_send, "inbox", true, None)?;
+    assert_append_result(&attachment_send)?;
 
     let alice_sync_status = run_cli_json([
         "sync",
@@ -3755,7 +3755,7 @@ fn cli_multi_device_restart_rebuild_and_repeated_sync_remain_consistent_e2e_work
         "--text",
         "before multi device rebuild",
     ])?;
-    assert_append_result(&pre_rebuild_send, "inbox", true, None)?;
+    assert_append_result(&pre_rebuild_send)?;
     let laptop_sync_before = sync_once(&laptop.laptop_profile)?;
     let baseline_acked = required_u64(&laptop_sync_before["checkpoint"], "last_acked_seq")?;
     assert!(baseline_acked > 0);
@@ -3880,7 +3880,7 @@ fn cli_multi_device_restart_rebuild_and_repeated_sync_remain_consistent_e2e_work
         "--text",
         "after multi device rebuild",
     ])?;
-    assert_append_result(&post_rebuild_send, "inbox", true, None)?;
+    assert_append_result(&post_rebuild_send)?;
     let final_phone_sync_one = sync_once(&ctx.bob_profile)?;
     let final_phone_sync_two = sync_once(&ctx.bob_profile)?;
     let final_phone_seq_one = required_u64(&final_phone_sync_one["checkpoint"], "last_acked_seq")?;
@@ -4580,19 +4580,11 @@ fn append_result<'a>(value: &'a Value) -> Result<&'a Value> {
         .context("append_result not object")
 }
 
-fn assert_append_result(
-    value: &Value,
-    _delivered_to: &str,
-    accepted: bool,
-    _request_expected: Option<bool>,
-) -> Result<()> {
+/// An append is answered, and the answer says nothing: not where the record
+/// went, and not how much else the recipient's inbox has taken in.
+fn assert_append_result(value: &Value) -> Result<()> {
     let result = append_result(value)?;
-    assert_eq!(result["accepted"].as_bool(), Some(accepted));
-    if accepted {
-        assert!(result["seq"].as_u64().is_some());
-    } else {
-        assert!(result["seq"].is_null());
-    }
+    assert!(result.as_object().is_some_and(|fields| fields.is_empty()));
     Ok(())
 }
 

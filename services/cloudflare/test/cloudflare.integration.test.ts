@@ -620,7 +620,7 @@ test("runtime integration: append -> subscribe push -> reconnect/fetch recovery 
   const firstMessage = waitForWebSocketMessage(socket);
 
   const append1 = await appendEnvelope(mf, deviceId, "msg:1", "cipher-1");
-  assert.equal(append1.seq, 1);
+  assert.deepEqual(append1, { status: 200, version: CURRENT_MODEL_VERSION });
 
   const pushed = (await firstMessage) as { event: string; seq: number; record?: { seq: number; messageId: string } };
   assert.equal(pushed.event, "head_updated");
@@ -634,7 +634,7 @@ test("runtime integration: append -> subscribe push -> reconnect/fetch recovery 
 
   const bigCiphertext = "x".repeat(1_024);
   const append2 = await appendEnvelope(mf, deviceId, "msg:2", bigCiphertext);
-  assert.equal(append2.seq, 2);
+  assert.deepEqual(append2, { status: 200, version: CURRENT_MODEL_VERSION });
 
   const headResponse = await mf.dispatchFetch(`${BASE_URL}/v1/inbox/${encodeURIComponent(deviceId)}/head`, {
     headers: authHeaders(token)
@@ -690,8 +690,8 @@ test("runtime integration: cleanup keeps head monotonic across repeated recovery
 
   const append1 = await appendEnvelope(mf, deviceId, "msg:cleanup-1", "cipher-cleanup-1");
   const append2 = await appendEnvelope(mf, deviceId, "msg:cleanup-2", "cipher-cleanup-2");
-  assert.equal(append1.seq, 1);
-  assert.equal(append2.seq, 2);
+  assert.deepEqual(append1, { status: 200, version: CURRENT_MODEL_VERSION });
+  assert.deepEqual(append2, { status: 200, version: CURRENT_MODEL_VERSION });
 
   const ackResponse = await mf.dispatchFetch(`${BASE_URL}/v1/inbox/${encodeURIComponent(deviceId)}/ack`, {
     method: "POST",
@@ -753,12 +753,11 @@ test("runtime integration: message request changes push over realtime and inbox 
   await waitForSubscribeReady(socket);
   const queuedMessage = waitForWebSocketMessage(socket);
 
-  // A queued append is answered with a number from the same counter an
-  // admitted one draws from, and the record stream does not move for it. The
-  // reply and the head deliberately disagree: the head is the recipient's
-  // business, the reply is all the sender gets.
+  // A queued append gets the same answer an admitted one does, and the record
+  // stream does not move for it: the head is the recipient's business, the
+  // reply is all the sender gets.
   const queued = await appendEnvelope(mf, deviceId, "msg:req-1", "cipher-req", "user:mallory");
-  assert.equal(queued.seq, 1);
+  assert.deepEqual(queued, { status: 200, version: CURRENT_MODEL_VERSION });
   const queuedEvent = (await queuedMessage) as {
     event: string;
     deviceId: string;

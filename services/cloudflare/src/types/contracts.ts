@@ -603,16 +603,18 @@ export interface AppendEnvelopeRequest {
 }
 
 /**
- * What an append is answered with: a sequence number and nothing else.
+ * What an append is answered with: nothing but the fact of the answer.
  *
- * There used to be an `accepted` flag beside it, and it was always true —
- * whether a record joined the record stream or is waiting for its recipient to
- * accept a first contact is the recipient's business, not the transport's to
- * report.
+ * It used to carry an `accepted` flag, which was always true, and then a
+ * sequence number, which was one counter over every append to the inbox.
+ * Whether a record joined the record stream or waits for its recipient to
+ * accept a first contact is the recipient's business, and how much else the
+ * recipient receives is nobody's: two replies to one sender, subtracted,
+ * counted everyone else's traffic in between.
  */
-export interface AppendEnvelopeResult {
-  seq: number;
-}
+export type AppendEnvelopeResult = Record<string, never>;
+
+export const APPEND_ACK: AppendEnvelopeResult = Object.freeze({}) as AppendEnvelopeResult;
 
 export interface FetchMessagesRequest {
   deviceId: string;

@@ -7498,17 +7498,13 @@ pub(crate) mod tests {
             .handle_event(CoreEvent::HttpResponseReceived {
                 request_id,
                 status: 200,
-                body: Some(r#"{"seq":41}"#.into()),
+                body: Some(r#"{"version":"0.1"}"#.into()),
             })
-            .expect("a sequence number is the whole reply");
-        assert_eq!(
-            accepted
-                .view_model
-                .as_ref()
-                .and_then(|view| view.append_result.as_ref())
-                .and_then(|result| result.seq),
-            Some(41)
-        );
+            .expect("the constant acknowledgement is the whole reply");
+        assert!(accepted
+            .view_model
+            .as_ref()
+            .is_some_and(|view| view.append_result.is_some()));
     }
 
     #[test]
@@ -7641,7 +7637,10 @@ pub(crate) mod tests {
             .as_ref()
             .and_then(|view| view.append_result.as_ref())
             .expect("append result");
-        assert!(append_result.seq.is_some());
+        assert_eq!(
+            append_result,
+            &crate::ffi_api::AppendResultSummary::default()
+        );
         let stored = alice
             .state
             .conversations
@@ -7696,7 +7695,10 @@ pub(crate) mod tests {
             .as_ref()
             .and_then(|view| view.append_result.as_ref())
             .expect("append result");
-        assert_eq!(append_result.seq, Some(0));
+        assert_eq!(
+            append_result,
+            &crate::ffi_api::AppendResultSummary::default()
+        );
     }
 
     #[test]
@@ -7731,7 +7733,10 @@ pub(crate) mod tests {
             .as_ref()
             .and_then(|view| view.append_result.as_ref())
             .expect("append result");
-        assert_eq!(append_result.seq, Some(3));
+        assert_eq!(
+            append_result,
+            &crate::ffi_api::AppendResultSummary::default()
+        );
     }
 
     #[test]

@@ -4353,9 +4353,8 @@ impl CoreEngine {
 
         let envelope = pending_item.map(|item| item.envelope.clone());
 
-        let append_result = AppendResultSummary {
-            seq: Some(result.seq),
-        };
+        let AppendEnvelopeResult {} = result;
+        let append_result = AppendResultSummary::default();
         let protocol_only_contact_control = false;
         let current_relationship_removed = self
             .state

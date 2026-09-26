@@ -272,9 +272,8 @@ impl DesktopTransport {
 
         let result: AppendEnvelopeResult = response.json().await.context("parse append result")?;
         timetest!(
-            "append_done msg_id={} seq={} status={} elapsed_ms={} ts={}",
+            "append_done msg_id={} status={} elapsed_ms={} ts={}",
             msg_ref,
-            result.seq,
             status,
             elapsed_ms,
             crate::ts_ms()

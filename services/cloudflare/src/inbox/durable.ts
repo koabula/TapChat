@@ -172,7 +172,6 @@ export async function handleInboxDurableRequest(
   const now = deps.now ?? Date.now();
   const url = new URL(request.url);
   const service = new InboxService(deps.deviceId, deps.state, deps.spillStore, deps.sessions, {
-    appendSeq: 0,
     headSeq: 0,
     ackedSeq: 0,
     retentionDays: deps.retentionDays,
@@ -363,7 +362,6 @@ export class InboxDurableObject extends DurableObjectBase {
         new R2JsonBlobStore(this.envRef.TAPCHAT_STORAGE),
         [],
         {
-          appendSeq: 0,
           headSeq: 0,
           ackedSeq: 0,
           retentionDays: Number(this.envRef.RETENTION_DAYS ?? "30"),

@@ -1567,10 +1567,7 @@ test("accepts append requests only with explicit capability header", async () =>
   const { env } = createEnv();
   const response = await appendWithCapability(env);
   assert.equal(response.status, 200);
-  assert.deepEqual(await response.json(), {
-    version: CURRENT_MODEL_VERSION,
-    seq: 1
-  });
+  assert.deepEqual(await response.json(), { version: CURRENT_MODEL_VERSION });
 });
 
 test("verified append capability delivers allowlisted sender to inbox", async () => {
@@ -1596,10 +1593,7 @@ test("verified append capability delivers allowlisted sender to inbox", async ()
   );
 
   assert.equal(response.status, 200);
-  assert.deepEqual(await response.json(), {
-    version: CURRENT_MODEL_VERSION,
-    seq: 1
-  });
+  assert.deepEqual(await response.json(), { version: CURRENT_MODEL_VERSION });
 
   const head = await handleRequest(
     new Request(`https://example.com/v1/inbox/${fixture.deviceId}/head`, {
@@ -1733,10 +1727,7 @@ test("enforces append payload size and ignores conversation scope", async () => 
   const { env } = createEnv();
   const queued = await appendWithCapability(env, sampleAppend());
   assert.equal(queued.status, 200);
-  assert.deepEqual(await queued.json(), {
-    version: CURRENT_MODEL_VERSION,
-    seq: 1
-  });
+  assert.deepEqual(await queued.json(), { version: CURRENT_MODEL_VERSION });
 
   const fixture = signedIdentityFixture({ deviceId: "device:bob:phone", maxBytes: 1 });
   await env.TAPCHAT_STORAGE.put(
@@ -1806,15 +1797,10 @@ test("message requests stay out of inbox until accepted", async () => {
     "33333333333333333333333333333333"
   ]);
 
-  // 5, not 3: the two appends that queued as a first contact drew from the
-  // same counter. That is the point — an admitted sender's number moves
-  // because of records it never sees, so the number reports nothing about
-  // what the inbox did with any of them.
+  // The same answer as the queued ones: nothing in it moves with what the
+  // inbox did with this record or with anyone else's.
   const registeredAppend = await appendWithCapability(env, sampleAppend("device:bob:phone", "44444444444444444444444444444444", aliceLane));
-  assert.deepEqual(await registeredAppend.json(), {
-    version: CURRENT_MODEL_VERSION,
-    seq: 5
-  });
+  assert.deepEqual(await registeredAppend.json(), { version: CURRENT_MODEL_VERSION });
 
   const otherLane = await appendWithCapability(env, sampleAppend("device:bob:phone", "55555555555555555555555555555555", malloryLane));
   assert.equal(otherLane.status, 200);
@@ -1834,12 +1820,9 @@ test("message requests stay out of inbox until accepted", async () => {
   );
   assert.equal(reject.status, 200);
 
-  // Once 2, because a rejected lane kept its own counter and started over.
+  // And after a rejection, still the same answer.
   const afterReject = await appendWithCapability(env, sampleAppend("device:bob:phone", "66666666666666666666666666666666", malloryLane));
-  assert.deepEqual(await afterReject.json(), {
-    version: CURRENT_MODEL_VERSION,
-    seq: 7
-  });
+  assert.deepEqual(await afterReject.json(), { version: CURRENT_MODEL_VERSION });
 });
 
 test("direct message request accept promotes only the accepted lane", async () => {
@@ -1981,10 +1964,7 @@ test("rate limit is per accepted lane and idempotent retries do not consume extr
 
   const duplicate = await appendWithCapability(env, sampleAppend("device:bob:phone", "77777777777777777777777777777777", acceptedLane));
   assert.equal(duplicate.status, 200);
-  assert.deepEqual(await duplicate.json(), {
-    version: CURRENT_MODEL_VERSION,
-    seq: 1
-  });
+  assert.deepEqual(await duplicate.json(), { version: CURRENT_MODEL_VERSION });
 
   const limited = await appendWithCapability(env, sampleAppend("device:bob:phone", "88888888888888888888888888888888", acceptedLane));
   assert.equal(limited.status, 429);
@@ -2027,18 +2007,17 @@ test("append_response_does_not_disclose_disposition", async () => {
   const stranger = "cccccccccccccccccccccccccccccccc";
   await registerAcceptedLane(env, bundle.runtimeCredential.token, "device:bob:phone", admitted);
 
-  const seqOf = async (mid: string, lane: string): Promise<number> => {
+  const replyTo = async (mid: string, lane: string): Promise<unknown> => {
     const response = await appendWithCapability(env, sampleAppend("device:bob:phone", mid, lane));
     assert.equal(response.status, 200);
-    return ((await response.json()) as { seq: number }).seq;
+    return response.json();
   };
 
-  const first = await seqOf("11111111111111111111111111111111", admitted);
-  const queued = await seqOf("22222222222222222222222222222222", stranger);
-  const second = await seqOf("33333333333333333333333333333333", admitted);
+  const first = await replyTo("11111111111111111111111111111111", admitted);
+  const queued = await replyTo("22222222222222222222222222222222", stranger);
+  const second = await replyTo("33333333333333333333333333333333", admitted);
 
-  assert.equal(queued, first + 1, "a queued append draws from the same counter");
-  assert.equal(second, queued + 1, "and the next admitted append continues from it");
+  assert.deepEqual([first, queued, second], Array(3).fill({ version: CURRENT_MODEL_VERSION }));
 
   // The record stream moved only for the two that were admitted, and that
   // number is the recipient's to see, not the sender's.
@@ -2065,7 +2044,6 @@ test("inbox_state_does_not_name_the_sender", async () => {
   const state = new MemoryState();
   const owner = "device:bob:phone";
   const service = new InboxService(owner, state, new MemoryR2Store(), [], {
-    appendSeq: 0,
     headSeq: 0,
     ackedSeq: 0,
     retentionDays: 30,
@@ -3169,7 +3147,6 @@ test("inbox hard retention advances history floor even while the client is offli
   const state = new MemoryState();
   const spillStore = new MemoryR2Store();
   const service = new InboxService("device:bob:phone", state, spillStore, [], {
-    appendSeq: 0,
     headSeq: 0,
     ackedSeq: 0,
     retentionDays: 1,
@@ -3180,7 +3157,7 @@ test("inbox hard retention advances history floor even while the client is offli
 
   await service.registerAcceptedLane("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", 500);
   const delivered = await service.appendEnvelope(sampleAppend(), 1_000);
-  assert.equal(delivered.seq, 1);
+  assert.deepEqual(delivered, {});
   assert.equal(spillStore.keysUnder("inbox-payload/").length, 1);
 
   await assert.rejects(
@@ -3247,11 +3224,36 @@ test("inbox hard retention advances history floor even while the client is offli
   assert.deepEqual(await service.getHead(), { headSeq: 1 });
 });
 
+test("an append is answered with one constant, whoever sent it and wherever it landed", async () => {
+  // A number here was one counter over every append to the inbox, so a sender
+  // could subtract two of its own replies and learn how much the recipient
+  // received from everyone else in between.
+  const state = new MemoryState();
+  const service = new InboxService("device:bob:phone", state, new MemoryR2Store(), [], {
+    headSeq: 0,
+    ackedSeq: 0,
+    retentionDays: 1,
+    maxInlineBytes: 1024,
+    rateLimitPerMinute: 100,
+    rateLimitPerHour: 1000
+  });
+  const admitted = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+  await service.registerAcceptedLane(admitted, 500);
+
+  const first = await service.appendEnvelope(sampleAppend(undefined, "11111111111111111111111111111111", admitted), 1_000);
+  const second = await service.appendEnvelope(sampleAppend(undefined, "22222222222222222222222222222222", admitted), 1_001);
+  const queued = await service.appendEnvelope(sampleAppend(undefined, "33333333333333333333333333333333", "cccccccccccccccccccccccccccccccc"), 1_002);
+  const retried = await service.appendEnvelope(sampleAppend(undefined, "11111111111111111111111111111111", admitted), 1_003);
+  for (const reply of [first, second, queued, retried]) {
+    assert.deepEqual(reply, {});
+  }
+  assert.deepEqual(await service.getHead(), { headSeq: 2 });
+});
+
 test("inbox serializes spill writes before assigning the next sequence", async () => {
   const state = new MemoryState();
   const spillStore = new PausableR2Store();
   const service = new InboxService("device:bob:phone", state, spillStore, [], {
-    appendSeq: 0,
     headSeq: 0,
     ackedSeq: 0,
     retentionDays: 1,
@@ -3276,7 +3278,7 @@ test("inbox serializes spill writes before assigning the next sequence", async (
 
   spillStore.release();
   const [firstResult, secondResult] = await Promise.all([first, second]);
-  assert.deepEqual([firstResult.seq, secondResult.seq], [1, 2]);
+  assert.deepEqual([firstResult, secondResult], [{}, {}]);
   assert.deepEqual(await service.getHead(), { headSeq: 2 });
   const fetched = await service.fetchMessages({ deviceId: "device:bob:phone", fromSeq: 1, limit: 10 });
   assert.deepEqual(fetched.records.map((record) => record.messageId), [
@@ -3289,7 +3291,7 @@ test("inbox serializes spill writes before assigning the next sequence", async (
     operations.run(() => service.appendEnvelope(duplicateRequest, 1_002)),
     operations.run(() => service.appendEnvelope(duplicateRequest, 1_003))
   ]);
-  assert.deepEqual(duplicateFirst, { seq: 3 });
+  assert.deepEqual(duplicateFirst, {});
   assert.deepEqual(duplicateSecond, duplicateFirst);
   assert.deepEqual(await service.getHead(), { headSeq: 3 });
   assert.equal((await state.list({ prefix: "record:" })).size, 3);
@@ -3299,7 +3301,6 @@ test("inbox R2 failure leaves no sequence gap and retry result is stable", async
   const state = new MemoryState();
   const spillStore = new FailOnceR2Store();
   const service = new InboxService("device:bob:phone", state, spillStore, [], {
-    appendSeq: 0,
     headSeq: 0,
     ackedSeq: 0,
     retentionDays: 1,
@@ -3320,7 +3321,7 @@ test("inbox R2 failure leaves no sequence gap and retry result is stable", async
 
   const committed = await operations.run(() => service.appendEnvelope(request, 1_001));
   const retry = await operations.run(() => service.appendEnvelope(request, 1_002));
-  assert.deepEqual(committed, { seq: 1 });
+  assert.deepEqual(committed, {});
   assert.deepEqual(retry, committed);
   assert.deepEqual(await service.getHead(), { headSeq: 1 });
   assert.equal((await service.fetchMessages({ deviceId: "device:bob:phone", fromSeq: 1, limit: 10 })).records.length, 1);
@@ -3330,7 +3331,6 @@ test("inbox DO commit failure retains the spill and retries at the same sequence
   const state = new FailOnceCommitState();
   const spillStore = new MemoryR2Store();
   const service = new InboxService("device:bob:phone", state, spillStore, [], {
-    appendSeq: 0,
     headSeq: 0,
     ackedSeq: 0,
     retentionDays: 1,
@@ -3351,14 +3351,13 @@ test("inbox DO commit failure retains the spill and retries at the same sequence
   assert.equal(spillStore.keysUnder("inbox-payload/").length, 1);
 
   const committed = await operations.run(() => service.appendEnvelope(request, 1_001));
-  assert.deepEqual(committed, { seq: 1 });
+  assert.deepEqual(committed, {});
   assert.deepEqual(await service.getHead(), { headSeq: 1 });
 });
 
 test("message request promotion preserves the original append result across retries", async () => {
   const state = new MemoryState();
   const service = new InboxService("device:bob:phone", state, new MemoryR2Store(), [], {
-    appendSeq: 0,
     headSeq: 0,
     ackedSeq: 0,
     retentionDays: 1,
@@ -3397,7 +3396,6 @@ test("inbox fetch fails closed when an R2 spill payload is missing", async () =>
   const state = new MemoryState();
   const spillStore = new MemoryR2Store();
   const service = new InboxService("device:bob:phone", state, spillStore, [], {
-    appendSeq: 0,
     headSeq: 0,
     ackedSeq: 0,
     retentionDays: 1,
@@ -3845,7 +3843,6 @@ test("append request body limit checks actual streamed bytes", async () => {
 test("message request quotas, global rate limit, expiry, and capacity recovery work", async () => {
   const state = new MemoryState();
   const service = new InboxService("device:bob:phone", state, new MemoryR2Store(), [], {
-    appendSeq: 0,
     headSeq: 0,
     ackedSeq: 0,
     retentionDays: 30,
@@ -3874,7 +3871,6 @@ test("message request quotas, global rate limit, expiry, and capacity recovery w
   assert.equal((await service.listMessageRequests(11_006)).length, 0);
 
   const rateService = new InboxService("device:bob:phone", new MemoryState(), new MemoryR2Store(), [], {
-    appendSeq: 0,
     headSeq: 0,
     ackedSeq: 0,
     retentionDays: 30,
@@ -3928,7 +3924,6 @@ test("legacy message request entries are migrated lazily and expire", async () =
     pendingRequests: [pending]
   });
   const service = new InboxService("device:bob:phone", state, new MemoryR2Store(), [], {
-    appendSeq: 0,
     headSeq: 0,
     ackedSeq: 0,
     retentionDays: 30,
