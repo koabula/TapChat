@@ -990,18 +990,24 @@ impl CoreEngine {
                 view_model: None,
             })
         } else {
-            let mut output = CoreOutput::default();
-            for conversation_id in affected_conversations {
-                output = merge_outputs(
-                    output,
-                    self.escalate_conversation_to_rebuild(
-                        &conversation_id,
-                        RecoveryEscalationReason::IdentityRefreshRetryExhausted,
-                        message.clone(),
-                    )?,
-                );
-            }
-            Ok(output)
+            // Giving up on a fresh bundle is no reason to destroy a session:
+            // the group works with the bundle already held, and failing a
+            // fetch is the host's to do at will. Tearing the group down here
+            // let a host put a conversation into the rebuild state, which is
+            // exactly what a Welcome signed with a stolen device key needs.
+            log::warn!(
+                "identity refresh gave up for a peer; {} conversation(s) keep their sessions",
+                affected_conversations.len()
+            );
+            Ok(CoreOutput {
+                state_update: CoreStateUpdate {
+                    contacts_changed: true,
+                    system_statuses_changed: vec![SystemStatus::IdentityRefreshNeeded],
+                    ..CoreStateUpdate::default()
+                },
+                effects: Vec::new(),
+                view_model: None,
+            })
         }
     }
 }

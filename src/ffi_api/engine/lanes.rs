@@ -332,6 +332,18 @@ impl CoreEngine {
     ) -> CoreResult<InboundFrameResolution> {
         let payload_b64 = record.envelope.payload_b64().unwrap_or_default();
         if let Some(conversation_id) = self.conversation_id_for_lane(&record.envelope.lane) {
+            // Only the inbound address admits records. The outbound one is
+            // indexed too, and a record a host relabels onto it would open
+            // under the inbound key and fail only after it had been applied.
+            let inbound = self
+                .state
+                .conversations
+                .get(&conversation_id)
+                .and_then(|conversation| conversation.lanes.as_ref())
+                .is_some_and(|lanes| lanes.inbound_lane == record.envelope.lane);
+            if !inbound {
+                return Ok(InboundFrameResolution::Rejected);
+            }
             let opened = self.open_inbound_frame(&conversation_id, payload_b64);
             let evidence = match opened.as_ref() {
                 Some((frame, key, _)) => self.double_sign_evidence(&conversation_id, frame, key),

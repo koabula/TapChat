@@ -9273,7 +9273,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn identity_refresh_retries_then_marks_conversation_for_rebuild() {
+    fn identity_refresh_retries_then_leaves_the_session_intact() {
         let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
         let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
@@ -9320,10 +9320,12 @@ pub(crate) mod tests {
                 assert!(output
                     .state_update
                     .system_statuses_changed
-                    .contains(&crate::ffi_api::SystemStatus::ConversationNeedsRebuild));
+                    .contains(&crate::ffi_api::SystemStatus::IdentityRefreshNeeded));
             }
         }
 
+        // Giving up on a fresh bundle keeps the session: the host can fail a
+        // fetch at will, and must not be able to tear a group down with it.
         assert_eq!(
             alice
                 .state
@@ -9332,19 +9334,22 @@ pub(crate) mod tests {
                 .expect("conversation")
                 .conversation
                 .state,
-            crate::model::ConversationState::NeedsRebuild
+            crate::model::ConversationState::Active
         );
+        assert!(alice
+            .state
+            .mls_adapter
+            .as_ref()
+            .expect("adapter")
+            .has_conversation(&conversation_id));
         let recovery = alice
             .recovery_context_snapshot(&conversation_id)
             .expect("recovery context");
         assert_eq!(
             recovery.phase,
-            crate::ffi_api::RecoveryPhase::EscalatedToRebuild
+            crate::ffi_api::RecoveryPhase::WaitingForIdentityRefresh
         );
-        assert_eq!(
-            recovery.escalation_reason,
-            Some(crate::ffi_api::RecoveryEscalationReason::IdentityRefreshRetryExhausted)
-        );
+        assert_eq!(recovery.escalation_reason, None);
     }
 
     /// R2: `ControlConversationNeedsRebuild` has no honest producer on the
@@ -14020,6 +14025,88 @@ pub(crate) mod tests {
             "a commit signed by the victim's device in the session it supposedly rebuilt out of \
              is two holders of one key"
         );
+    }
+
+    /// **Remote input cannot tear a session down.** The only unauthenticated
+    /// way into the waiting state a Welcome can then exploit is a local fault,
+    /// and that exception rests on nothing remote being able to cause one.
+    /// Here the host fails every identity fetch and relabels one of the
+    /// peer's frames onto this side's outbound address; the session stays
+    /// exactly as it was, and the batch does not fail.
+    #[test]
+    fn remote_input_cannot_tear_down_a_session() {
+        let mut chat = paired_direct_chat();
+        let conversation_id = chat.conversation_id.clone();
+        let peer_user_id = chat.alice.state.conversations[&conversation_id]
+            .peer_user_id
+            .clone();
+        let bob_device = chat.bob_device_id.clone();
+        let fingerprint = |engine: &CoreEngine| {
+            engine
+                .state
+                .mls_adapter
+                .as_ref()
+                .expect("adapter")
+                .state_fingerprint()
+                .expect("fingerprint")
+        };
+        let before = fingerprint(&chat.alice);
+
+        for _ in 0..=crate::ffi_api::MAX_TRANSPORT_RETRIES {
+            chat.alice
+                .handle_event(CoreEvent::IdentityBundleFetchFailed {
+                    user_id: peer_user_id.clone(),
+                    failure: test_failure("network_unavailable", true, None),
+                })
+                .expect("a failed fetch is not an error");
+        }
+        let conversation = &chat.alice.state.conversations[&conversation_id];
+        assert_eq!(conversation.conversation.state, ConversationState::Active);
+        assert!(!conversation.rebuild.awaits_peer_welcome);
+        assert_eq!(
+            fingerprint(&chat.alice),
+            before,
+            "failed fetches must not touch the group"
+        );
+
+        // Alice's frame, relabelled by Bob's host onto Bob's outbound address.
+        chat.alice
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "relabelled".into(),
+            })
+            .expect("alice sends");
+        let genuine = last_pending_application_envelope(&chat.alice, &bob_device);
+        let mut relabelled = under_fresh_mid(genuine.clone());
+        relabelled.lane = chat.bob.state.conversations[&conversation_id]
+            .lanes
+            .as_ref()
+            .expect("lanes")
+            .outbound_lane
+            .clone();
+        let bob_before = fingerprint(&chat.bob);
+        chat.bob
+            .handle_event(CoreEvent::InboxRecordsFetched {
+                device_id: bob_device.clone(),
+                to_seq: 950,
+                records: vec![InboxRecord {
+                    seq: 950,
+                    recipient_device_id: bob_device.clone(),
+                    message_id: relabelled.mid.clone(),
+                    received_at: 950,
+                    expires_at: None,
+                    state: InboxRecordState::Available,
+                    envelope: relabelled,
+                }],
+            })
+            .expect("a relabelled record must not fail the batch");
+        assert_eq!(fingerprint(&chat.bob), bob_before);
+        deliver_inbox_envelope(&mut chat.bob, &bob_device, genuine, 951);
+        assert!(conversation_has_plaintext(
+            &chat.bob,
+            &conversation_id,
+            "relabelled"
+        ));
     }
 
     /// The designated side waits one interval, everyone else waits two. This
