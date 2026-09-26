@@ -1746,6 +1746,10 @@ pub enum ConversationState {
     Closed,
     Archived,
     Dissolved,
+    /// The counterparty's device key signed two commits on one base epoch
+    /// (see `direct_fork`). Terminal: nothing more is sent, and nothing
+    /// rebuilds the session on a key someone else holds.
+    Compromised,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

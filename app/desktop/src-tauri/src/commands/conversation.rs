@@ -141,6 +141,7 @@ pub async fn list_conversations(
                 ConversationState::Closed => "closed".into(),
                 ConversationState::Archived => "archived".into(),
                 ConversationState::Dissolved => "dissolved".into(),
+                ConversationState::Compromised => "compromised".into(),
             },
             kind: Some(persisted.state.conversation.kind),
             title: None,
@@ -164,6 +165,7 @@ pub async fn list_conversations(
             recovery: recovery_by_conversation
                 .get(&persisted.conversation_id)
                 .cloned(),
+            forked_since_ms: persisted.state.fork.forked_since_ms,
         })
         .collect();
 

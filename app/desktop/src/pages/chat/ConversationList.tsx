@@ -91,6 +91,7 @@ export default function ConversationList({ searchQuery = "" }: ConversationListP
           isGroup && (conv.group_role === "owner" || conv.group_role === "admin");
         const dissolved = isGroup && conv.dissolved_at != null;
         const archived = conv.state === "archived";
+        const compromised = !isGroup && conv.state === "compromised";
         const showArchiveHeader =
           archived && index === activeConversations.length && archivedConversations.length > 0;
 
@@ -154,6 +155,11 @@ export default function ConversationList({ searchQuery = "" }: ConversationListP
                   {archived && (
                     <span className="badge badge-muted text-[10px] uppercase tracking-wide">
                       Archived
+                    </span>
+                  )}
+                  {compromised && (
+                    <span className="badge bg-red-500/10 status-error text-[10px] uppercase tracking-wide">
+                      Compromised
                     </span>
                   )}
                   {showRolePill && !dissolved && (

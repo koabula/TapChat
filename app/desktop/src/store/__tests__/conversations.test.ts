@@ -20,6 +20,7 @@ const baseConversation = (id: string): Conversation => ({
   group_role: null,
   group_cursor: null,
   recovery: null,
+  forked_since_ms: null,
   dissolved_at: null,
 });
 

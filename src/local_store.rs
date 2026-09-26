@@ -2857,6 +2857,7 @@ mod tests {
                 archive_metadata: None,
                 pcs: Default::default(),
                 lanes: None,
+                fork: Default::default(),
             },
         };
         store
@@ -2991,6 +2992,7 @@ mod tests {
                 archive_metadata: None,
                 pcs: Default::default(),
                 lanes: None,
+                fork: Default::default(),
             },
         };
         store
@@ -3076,6 +3078,7 @@ mod tests {
                 archive_metadata: None,
                 pcs: Default::default(),
                 lanes: None,
+                fork: Default::default(),
             },
         };
         let snapshot = CorePersistenceSnapshot {
@@ -3296,6 +3299,7 @@ mod tests {
             archive_metadata: None,
             pcs: Default::default(),
             lanes: None,
+            fork: Default::default(),
         };
         store
             .save_snapshot(&CorePersistenceSnapshot {

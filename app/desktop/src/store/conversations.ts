@@ -28,6 +28,8 @@ export interface Conversation {
   group_role: GroupRole | null;
   group_cursor: GroupCursor | null;
   recovery: RecoveryDiagnostics | null;
+  /** See `ConversationSummary.forked_since_ms`. */
+  forked_since_ms: number | null;
   /**
    * Unix ms timestamp when the group was dissolved (owner-only atomic
    * seal, PLAN_GROUP Phase 6 / Wave A). `null` for active groups and
@@ -161,6 +163,7 @@ function mergeConversationState(
       group_role: conversation.group_role ?? prior?.group_role ?? null,
       group_cursor: conversation.group_cursor ?? prior?.group_cursor ?? null,
       recovery: conversation.recovery ?? null,
+      forked_since_ms: conversation.forked_since_ms ?? null,
       dissolved_at: conversation.dissolved_at ?? prior?.dissolved_at ?? null,
     };
   });
@@ -214,6 +217,7 @@ export const useConversationsStore = create<ConversationsState>((set) => ({
         group_role: conversation.group_role ?? null,
         group_cursor: conversation.group_cursor ?? null,
         recovery: conversation.recovery ?? null,
+        forked_since_ms: conversation.forked_since_ms ?? null,
         // `ConversationSummary` does not currently carry `dissolved_at`;
         // the `useCoreUpdate` hook fans out to `getGroupSnapshot` for
         // groups and merges the authoritative dissolved_at via the
@@ -296,6 +300,7 @@ export const useConversationsStore = create<ConversationsState>((set) => ({
           group_role: group.local_role,
           group_cursor: null,
           recovery: null,
+          forked_since_ms: null,
           dissolved_at: group.dissolved_at,
         }));
       return { conversations: [...conversations, ...missingGroups] };

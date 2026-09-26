@@ -43,6 +43,7 @@ export const ERROR_DEFAULTS = {
   contact_share_rotation_unverified: ["identity", true, "reconnect"],
   contact_share_revoked: ["identity", false, null],
   relationship_closed: ["identity", false, null],
+  conversation_compromised: ["security", false, null],
   group_transition_conflict: ["group", true, "sync_now"],
   roster_version_conflict: ["group", true, "sync_now"],
   already_sealed: ["group", false, null],

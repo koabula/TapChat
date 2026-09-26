@@ -45,6 +45,7 @@
     { "code": "contact_share_rotation_unverified", "domain": "identity", "retryable": true, "action": "reconnect", "title": "Share link status is unknown", "message": "TapChat couldn't verify whether the link was rotated. Reconnect to check which link is active." },
     { "code": "contact_share_revoked", "domain": "identity", "retryable": false, "action": null, "title": "Share link expired", "message": "This share link is no longer valid. Ask the contact for a new link." },
     { "code": "relationship_closed", "domain": "identity", "retryable": false, "action": null, "title": "Conversation unavailable", "message": "This contact relationship is closed." },
+    { "code": "conversation_compromised", "domain": "security", "retryable": false, "action": null, "title": "Session compromised", "message": "Someone else holds this contact's device key. Sending is disabled for this conversation." },
     { "code": "group_transition_conflict", "domain": "group", "retryable": true, "action": "sync_now", "title": "Group changed", "message": "Sync the latest group state and try again." },
     { "code": "roster_version_conflict", "domain": "group", "retryable": true, "action": "sync_now", "title": "Group membership changed", "message": "Sync the latest group membership and try again." },
     { "code": "already_sealed", "domain": "group", "retryable": false, "action": null, "title": "Group already closed", "message": "This group is already closed." },

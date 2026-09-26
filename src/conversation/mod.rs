@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 
+use crate::direct_fork::ForkGuard;
 use crate::direct_pcs::DirectPcsState;
 use crate::error::{CoreError, CoreResult};
 use crate::model::{
@@ -84,6 +85,8 @@ pub struct LocalConversationState {
     pub pcs: DirectPcsState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lanes: Option<ConversationLanes>,
+    #[serde(default, skip_serializing_if = "ForkGuard::is_empty")]
+    pub fork: ForkGuard,
 }
 
 /// Per-direction admission tokens and the wrap key for the previous epoch.
@@ -207,6 +210,7 @@ impl ConversationManager {
             archive_metadata: None,
             pcs: DirectPcsState::default(),
             lanes: None,
+            fork: Default::default(),
         })
     }
 

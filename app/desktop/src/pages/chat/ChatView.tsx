@@ -9,6 +9,7 @@ import {
   Loader,
   MessageCircle,
   Music,
+  ShieldAlert,
   UserX,
   Users,
 } from "lucide-react";
@@ -42,6 +43,7 @@ import {
 } from "@/lib/tauri";
 import type { Message, MessagePage, CoreUpdateEvent, CloudflareStatus, StorageRef } from "@/lib/types";
 import { buildGroupNameResolver } from "@/lib/groupDisplayNames";
+import { COMPROMISED_COMPOSER_TEXT, compromisedNotice } from "@/lib/compromisedBanner";
 import { findMessageMatches, moveSearchIndex } from "@/lib/messageSearch";
 import { mergeMessagePage, reconcileLatestMessagePage } from "@/lib/messageMerge";
 
@@ -116,9 +118,12 @@ export default function ChatView() {
   }, [activeConversation, contacts]);
   const directPendingOutbound =
     !isGroup && activeDirectContact?.relationship_status === "pending_outbound";
+  // Terminal and beyond repair: it takes precedence over every other state.
+  const directCompromised = !isGroup && activeConversation?.state === "compromised";
   const conversationRecovery = activeConversation?.recovery ?? null;
   const conversationRecovering =
     Boolean(activeConversation) &&
+    !directCompromised &&
     (activeConversation?.state === "needs_recovery" ||
       activeConversation?.state === "needs_rebuild" ||
       Boolean(conversationRecovery));
@@ -223,6 +228,7 @@ export default function ChatView() {
           .length ?? 0
       : 0;
   const composerDisabled =
+    directCompromised ||
     directPendingOutbound ||
     conversationRecovering ||
     directClosed ||
@@ -232,7 +238,9 @@ export default function ChatView() {
       (groupSnapshot?.local_role == null ||
         localMember?.status === "removed" ||
         localMember?.status === "left"));
-  const composerTooltip = directPendingOutbound
+  const composerTooltip = directCompromised
+    ? COMPROMISED_COMPOSER_TEXT
+    : directPendingOutbound
     ? "Waiting for contact to accept request."
     : conversationRecovering
       ? "Secure chat needs recovery before sending."
@@ -270,6 +278,9 @@ export default function ChatView() {
     const contact = contacts.find((item) => item.user_id === activeConversation.peer_user_id);
     return contact?.display_name || activeConversation.display_name || activeConversation.peer_user_id;
   }, [conversationId, activeConversation, contacts]);
+  const compromised = directCompromised
+    ? compromisedNotice(activeConversation?.state, activeConversation?.forked_since_ms, peerName)
+    : null;
 
   const conversationMediaItems = useMemo(() => {
     if (!conversationId) return [];
@@ -1071,7 +1082,14 @@ export default function ChatView() {
               </>
             ) : (
               <>
-                {directPendingOutbound ? (
+                {directCompromised ? (
+                  // Replaces the Verified badge: a safety number compared
+                  // before the theft still matches, and must not reassure.
+                  <span className="inline-flex items-center gap-1 status-error">
+                    <ShieldAlert size={12} />
+                    Session compromised
+                  </span>
+                ) : directPendingOutbound ? (
                   <span className="text-muted-color">Waiting for accept</span>
                 ) : conversationRecovering ? (
                   <span className="text-yellow-500">
@@ -1136,7 +1154,19 @@ export default function ChatView() {
         />
       )}
 
-      {conversationRecovery && (
+      {compromised && (
+        <div className="border-b border-subtle bg-surface px-4 py-3">
+          <div className="mx-auto flex max-w-4xl items-start gap-3 text-sm">
+            <ShieldAlert size={16} className="mt-0.5 shrink-0 status-error" />
+            <div className="min-w-0 flex-1">
+              <div className="font-medium status-error">{compromised.headline}</div>
+              <div className="break-words text-muted-color">{compromised.detail}</div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {conversationRecovery && !directCompromised && (
         <div className="border-b border-subtle bg-surface px-4 py-3">
           <div className="mx-auto flex max-w-4xl flex-wrap items-center gap-3 text-sm">
             <AlertTriangle size={16} className="shrink-0 text-yellow-500" />
@@ -1167,6 +1197,7 @@ export default function ChatView() {
       )}
 
       {!isGroup &&
+        !directCompromised &&
         !directPendingOutbound &&
         !directClosed &&
         !conversationRecovering &&
@@ -1237,7 +1268,11 @@ export default function ChatView() {
           className="flex flex-wrap items-center gap-2 border-t border-subtle bg-base px-4 py-3 text-sm text-muted-color"
           title={composerTooltip}
         >
-          <UserX size={16} />
+          {directCompromised ? (
+            <ShieldAlert size={16} className="status-error" />
+          ) : (
+            <UserX size={16} />
+          )}
           <span>{composerTooltip ?? "You cannot send messages to this conversation."}</span>
           {pendingGroupSetup && (
             <>

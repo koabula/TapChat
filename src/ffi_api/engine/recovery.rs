@@ -8,6 +8,9 @@ impl CoreEngine {
         &mut self,
         conversation_id: String,
     ) -> CoreResult<CoreOutput> {
+        if self.conversation_is_compromised(&conversation_id) {
+            return Ok(CoreOutput::default());
+        }
         let local_identity = self
             .state
             .local_identity
@@ -404,6 +407,9 @@ impl CoreEngine {
         &mut self,
         conversation_id: String,
     ) -> CoreResult<CoreOutput> {
+        if self.conversation_is_compromised(&conversation_id) {
+            return Ok(CoreOutput::default());
+        }
         let (member_device_ids, last_message_type, peer_user_id) = {
             let conversation_state = self
                 .state
@@ -412,6 +418,7 @@ impl CoreEngine {
                 .ok_or_else(|| CoreError::invalid_input("conversation does not exist"))?;
             conversation_state.conversation.state = ConversationState::NeedsRebuild;
             conversation_state.recovery_status = RecoveryStatus::NeedsRebuild;
+            conversation_state.fork.clear_witnesses();
             (
                 conversation_state
                     .conversation
@@ -477,6 +484,7 @@ impl CoreEngine {
                     last_message_type,
                     message_count: None,
                     recovery: self.recovery_snapshot_for_conversation(&conversation_id),
+                    forked_since_ms: None,
                 }],
                 ..CoreViewModel::default()
             }),
@@ -590,6 +598,9 @@ impl CoreEngine {
         escalation_reason: RecoveryEscalationReason,
         message: impl Into<String>,
     ) -> CoreResult<CoreOutput> {
+        if self.conversation_is_compromised(conversation_id) {
+            return Ok(CoreOutput::default());
+        }
         let message = message.into();
         if let Some(context) = self.state.recovery_contexts.get_mut(conversation_id) {
             context.phase = RecoveryPhase::EscalatedToRebuild;

@@ -56,6 +56,7 @@
           "src/sync_engine/",
           "src/capability/mod.rs",
           "src/local_store.rs",
+          "src/direct_fork.rs",
           "src/direct_pcs.rs",
           "src/group_pcs.rs",
           "src/profile_crypto.rs",

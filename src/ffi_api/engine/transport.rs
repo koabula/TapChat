@@ -948,6 +948,12 @@ impl CoreEngine {
                 continue;
             }
             let item = self.state.pending_outbox[index].clone();
+            if self
+                .conversation_id_for_lane(&item.envelope.lane)
+                .is_some_and(|conversation_id| self.conversation_is_compromised(&conversation_id))
+            {
+                continue;
+            }
             let request = self.build_append_request(&item)?;
             self.state.pending_outbox[index].in_flight = true;
             effects.push(CoreEffect::ExecuteHttpRequest { request });
@@ -3211,6 +3217,30 @@ impl CoreEngine {
                     processed_records.push(record);
                     continue;
                 }
+                // Authenticated evidence, not a rejection: acting on it is not
+                // the trace Remark 1(a) forbids.
+                InboundFrameResolution::Forked {
+                    conversation_id,
+                    forked_since_ms,
+                } => {
+                    output = merge_outputs(
+                        output,
+                        self.mark_conversation_compromised(&conversation_id, forked_since_ms)?,
+                    );
+                    let sync_state = self
+                        .state
+                        .sync_states
+                        .entry(device_id.clone())
+                        .or_insert_with(|| SyncEngine::new_device_state(&device_id));
+                    SyncEngine::release_quarantined(sync_state, record.seq);
+                    advance_contiguous_ack(
+                        &mut contiguous_ack,
+                        &mut deferred_ackable_seqs,
+                        record.seq,
+                    );
+                    processed_records.push(record);
+                    continue;
+                }
             };
             let conversation_id = resolved.conversation_id.clone();
             let inbound_message_type = resolved.message_type;
@@ -3679,10 +3709,21 @@ impl CoreEngine {
                                 }
                                 IngestResult::AppliedCommit { epoch } => {
                                     touched_conversation_ids.insert(conversation_id.clone());
+                                    let base_epoch_key =
+                                        previous_wrap.as_ref().map(|wrap| wrap.key);
                                     self.install_previous_inbound_wrap(
                                         &conversation_id,
                                         previous_wrap,
                                     );
+                                    if let (Some(commit), Some(wrap_key)) =
+                                        (authenticated_commit.as_ref(), base_epoch_key)
+                                    {
+                                        self.record_peer_commit_witness(
+                                            &conversation_id,
+                                            commit,
+                                            wrap_key,
+                                        );
+                                    }
                                     self.record_authenticated_inbound(
                                         &conversation_id,
                                         &inbound_peer_user_id,
@@ -3781,6 +3822,11 @@ impl CoreEngine {
                                         &conversation_id,
                                         &record.envelope.lane,
                                     );
+                                    if let Some(state) =
+                                        self.state.conversations.get_mut(&conversation_id)
+                                    {
+                                        state.fork.clear_witnesses();
+                                    }
                                     self.initialize_direct_pcs_from_mls(&conversation_id)?;
                                     self.record_authenticated_inbound(
                                         &conversation_id,

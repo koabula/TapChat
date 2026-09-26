@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use futures_util::StreamExt;
@@ -18,6 +19,7 @@ use crate::ffi_api::{
     RealtimeEvent, RealtimeSessionSnapshot, RecoveryContextSnapshot, RecoveryDiagnostics,
     SyncCheckpointSnapshot,
 };
+use crate::local_store::ProfileStorageSession;
 use crate::model::{
     DeviceRuntimeAuth, DeviceStatusKind, Envelope, IdentityBundle, MessageType, MlsStateStatus,
 };
@@ -70,6 +72,7 @@ pub struct DriverRuntime {
     recent_appends: Vec<Envelope>,
     recent_messages: Vec<(String, MessageType)>,
     runtime_credential: Option<DeviceRuntimeAuth>,
+    store: Option<Arc<ProfileStorageSession>>,
 }
 
 pub struct CoreDriver {
@@ -133,9 +136,18 @@ impl CoreDriver {
                 recent_appends: Vec::new(),
                 recent_messages: Vec::new(),
                 runtime_credential: None,
+                store: None,
             },
             suppress_realtime: false,
         })
+    }
+
+    /// Route `PersistState` effects to durable storage as they are emitted.
+    /// Core orders a persist ahead of the network effects that depend on it —
+    /// a merged commit is on disk before its envelope leaves — and that order
+    /// only holds if the host writes when told to.
+    pub fn attach_store(&mut self, store: Arc<ProfileStorageSession>) {
+        self.runtime.store = Some(store);
     }
 
     pub fn latest_snapshot(&self) -> Option<&CorePersistenceSnapshot> {
@@ -1166,11 +1178,13 @@ impl CoreDriver {
         Ok(Vec::new())
     }
 
-    fn persist_state(&mut self, _persist: PersistStateEffect) -> Result<()> {
-        // The driver refreshes its in-memory diagnostic snapshot directly
-        // from Core after each command/event. Durable profiles apply typed
-        // mutations through ProfileStorageSession.
-        Ok(())
+    fn persist_state(&mut self, persist: PersistStateEffect) -> Result<()> {
+        // The in-memory diagnostic snapshot is refreshed from Core after each
+        // command/event; this is only the durable write.
+        match self.runtime.store.as_ref() {
+            Some(store) => store.persist_state(&persist),
+            None => Ok(()),
+        }
     }
 
     fn take_due_timer_event(

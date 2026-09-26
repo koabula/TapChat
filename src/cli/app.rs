@@ -2244,6 +2244,7 @@ fn load_driver(profile: &Profile) -> Result<CoreDriver> {
     });
     let mut driver = CoreDriver::from_snapshot(snapshot, contact_share_url)?;
     driver.set_runtime_credential(profile.load_runtime_credential()?);
+    driver.attach_store(profile.storage_session());
     Ok(driver)
 }
 

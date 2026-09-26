@@ -77,6 +77,8 @@ export interface ConversationSummary {
   message_count?: number;
   unread_count?: number;
   recovery?: RecoveryDiagnostics;
+  /** Set when `state` is "compromised": when the contradicted commit merged. */
+  forked_since_ms?: number | null;
 }
 
 export interface MessageSummary {
@@ -324,7 +326,8 @@ export type SystemStatus =
   | "attachment_download_failed"
   | "temporary_network_failure"
   | "message_queued_for_approval"
-  | "message_rejected_by_policy";
+  | "message_rejected_by_policy"
+  | "conversation_compromised";
 
 export interface SystemBanner {
   status: SystemStatus;

@@ -249,11 +249,13 @@ impl CoreEngine {
         adapter.export_lane_wrap_key(conversation_id, dir)
     }
 
-    fn unwrap_inbound_plaintext(
+    /// The frame under the current epoch's key or the previous one's, and the
+    /// key that opened it.
+    fn open_inbound_frame(
         &self,
         conversation_id: &str,
         payload_b64: &str,
-    ) -> Option<Vec<u8>> {
+    ) -> Option<(Vec<u8>, [u8; lane_wrap::WRAP_KEY_LEN])> {
         let lanes = self
             .state
             .conversations
@@ -266,9 +268,35 @@ impl CoreEngine {
         let current = adapter
             .export_lane_wrap_key(conversation_id, lanes.inbound_dir())
             .ok()?;
-        let previous = lanes.wrap_prev.as_ref().map(|cache| &cache.key);
+        let previous = lanes.wrap_prev.as_ref().map(|cache| cache.key);
         let wrapped = STANDARD.decode(payload_b64).ok()?;
-        lane_wrap::unwrap_with_cached_keys(&current, previous, &wrapped)
+        [Some(current), previous]
+            .into_iter()
+            .flatten()
+            .find_map(|key| lane_wrap::unwrap_frame(&key, &wrapped).map(|frame| (frame, key)))
+    }
+
+    /// The frame under the base-epoch key of a peer commit this device merged.
+    /// Only ever consulted for fork evidence; see [`crate::direct_fork`].
+    fn open_under_witness_keys(
+        &self,
+        conversation_id: &str,
+        payload_b64: &str,
+    ) -> Option<(Vec<u8>, [u8; lane_wrap::WRAP_KEY_LEN])> {
+        let conversation = self.state.conversations.get(conversation_id)?;
+        let mut keys = conversation.fork.wrap_keys().peekable();
+        keys.peek()?;
+        let wrapped = STANDARD.decode(payload_b64).ok()?;
+        keys.find_map(|key| lane_wrap::unwrap_frame(key, &wrapped).map(|frame| (frame, *key)))
+    }
+
+    fn unwrap_inbound_plaintext(
+        &self,
+        conversation_id: &str,
+        payload_b64: &str,
+    ) -> Option<Vec<u8>> {
+        self.open_inbound_frame(conversation_id, payload_b64)
+            .map(|(frame, _)| frame)
     }
 
     pub(crate) fn unwrap_inbound_bytes(
@@ -290,7 +318,22 @@ impl CoreEngine {
     ) -> CoreResult<InboundFrameResolution> {
         let payload_b64 = record.envelope.payload_b64().unwrap_or_default();
         if let Some(conversation_id) = self.conversation_id_for_lane(&record.envelope.lane) {
-            if let Some(plaintext) = self.unwrap_inbound_plaintext(&conversation_id, payload_b64) {
+            let opened = self.open_inbound_frame(&conversation_id, payload_b64);
+            let evidence = match opened.as_ref() {
+                Some((frame, key)) => self.double_sign_evidence(&conversation_id, frame, key),
+                None => self
+                    .open_under_witness_keys(&conversation_id, payload_b64)
+                    .and_then(|(frame, key)| {
+                        self.double_sign_evidence(&conversation_id, &frame, &key)
+                    }),
+            };
+            if let Some(forked_since_ms) = evidence {
+                return Ok(InboundFrameResolution::Forked {
+                    conversation_id,
+                    forked_since_ms,
+                });
+            }
+            if let Some((plaintext, _)) = opened {
                 let Ok((mls_b64, commit_signature)) = crate::direct_frame::decode(&plaintext)
                 else {
                     return Ok(InboundFrameResolution::Rejected);
@@ -368,6 +411,57 @@ impl CoreEngine {
         }))
     }
 
+    /// Whether `frame`, opened under `key`, is a second commit signed by the
+    /// device whose commit this device merged at the same base epoch.
+    ///
+    /// The key scopes the comparison to one epoch of one incarnation of the
+    /// group, so no epoch check against local MLS state is needed -- and none
+    /// is possible, since that state has moved on. The signature is checked
+    /// against the device key the identity chain vouches for rather than the
+    /// member leaf: after a fork the leaf in the local group is whatever the
+    /// forged commit put there. Returns when the contradicted commit merged.
+    fn double_sign_evidence(
+        &self,
+        conversation_id: &str,
+        frame: &[u8],
+        key: &[u8; lane_wrap::WRAP_KEY_LEN],
+    ) -> Option<u64> {
+        let conversation = self.state.conversations.get(conversation_id)?;
+        if conversation.fork.forked_since_ms.is_some() {
+            return None;
+        }
+        let witness = conversation.fork.witness_for_key(key)?;
+        let (mls_b64, Some(signature)) = crate::direct_frame::decode(frame).ok()? else {
+            return None;
+        };
+        if MlsAdapter::classify_mls_payload(&mls_b64) != Some(MessageType::MlsCommit) {
+            return None;
+        }
+        let base_epoch = MlsAdapter::protocol_message_epoch(&mls_b64).ok()?;
+        let digest = crate::direct_frame::commit_sha256(&mls_b64).ok()?;
+        let commit_hash = crate::direct_frame::commit_hash(&digest);
+        if !crate::direct_fork::ForkGuard::contradicts(witness, base_epoch, &commit_hash) {
+            return None;
+        }
+        let peer_user_id = &conversation.peer_user_id;
+        let trusted_key = self
+            .trusted_device_public_key(peer_user_id, &witness.device_id)
+            .ok()?;
+        crate::identity::verify_device_payload_signature(
+            &trusted_key,
+            crate::model::signing::direct_commit_arbitration_payload(
+                conversation_id,
+                peer_user_id,
+                &witness.device_id,
+                base_epoch,
+                &digest,
+            ),
+            &crate::identity::encode_hex(&signature),
+        )
+        .ok()?;
+        Some(witness.merged_at_ms)
+    }
+
     /// Establish that a rival commit really came from the counterparty.
     ///
     /// MLS cannot say so: by now the local group has merged its own commit for
@@ -425,6 +519,7 @@ impl CoreEngine {
                 return Some(crate::direct_frame::AuthenticatedDirectCommit {
                     base_epoch,
                     commit_hash: crate::direct_frame::commit_hash(&digest),
+                    device_id,
                 });
             }
         }
@@ -498,6 +593,11 @@ pub(super) enum InboundFrameResolution {
     Ready(ResolvedInbound),
     Deferred,
     Rejected,
+    /// The counterparty's device key signed two commits on one base epoch.
+    Forked {
+        conversation_id: String,
+        forked_since_ms: u64,
+    },
 }
 
 pub(super) fn new_lane_pair() -> (String, String) {

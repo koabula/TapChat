@@ -65,6 +65,8 @@ const TAG_COMMIT: u8 = 0x01;
 pub(crate) struct AuthenticatedDirectCommit {
     pub base_epoch: u64,
     pub commit_hash: String,
+    /// The device whose key produced the signature.
+    pub device_id: String,
 }
 
 pub(crate) fn encode(

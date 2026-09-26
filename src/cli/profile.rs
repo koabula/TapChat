@@ -709,6 +709,10 @@ impl Profile {
         self.storage_session.persist_state(persist)
     }
 
+    pub fn storage_session(&self) -> Arc<ProfileStorageSession> {
+        Arc::clone(&self.storage_session)
+    }
+
     pub fn save_deployment_bundle(&mut self, bundle: &DeploymentBundle) -> Result<PathBuf> {
         let path = self.meta.bundles_dir.join("deployment_bundle.json");
         let bytes = serde_json::to_vec_pretty(bundle)?;

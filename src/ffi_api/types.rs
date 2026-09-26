@@ -1009,6 +1009,7 @@ pub enum SystemStatus {
     MessageQueuedForApproval,
     MessageRejectedByPolicy,
     GroupMembershipRevoked,
+    ConversationCompromised,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -1054,6 +1055,10 @@ pub struct ConversationSummary {
     pub message_count: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovery: Option<RecoveryDiagnostics>,
+    /// Set once the conversation is `compromised`: when the commit that the
+    /// counterparty's double sign contradicts was merged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forked_since_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

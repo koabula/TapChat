@@ -774,7 +774,9 @@ impl CoreEngine {
             if let Some(conversation) = engine.state.conversations.get_mut(&conversation_id) {
                 if matches!(
                     conversation.conversation.state,
-                    ConversationState::Closed | ConversationState::Archived
+                    ConversationState::Closed
+                        | ConversationState::Archived
+                        | ConversationState::Compromised
                 ) {
                     engine.state.mls_summaries.remove(&conversation_id);
                     continue;
@@ -3416,6 +3418,7 @@ mod protected_application_message_tests {
                     outbound_dir: crate::lane_wrap::WRAP_DIR_C2,
                     wrap_prev: None,
                 }),
+                fork: Default::default(),
             },
         );
         engine

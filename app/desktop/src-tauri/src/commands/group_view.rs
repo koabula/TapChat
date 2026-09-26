@@ -27,6 +27,7 @@ pub(super) fn conversation_state_string(state: ConversationState) -> String {
         ConversationState::Closed => "closed".into(),
         ConversationState::Archived => "archived".into(),
         ConversationState::Dissolved => "dissolved".into(),
+        ConversationState::Compromised => "compromised".into(),
     }
 }
 

@@ -3455,6 +3455,7 @@ impl CoreEngine {
                     archive_metadata: None,
                     pcs: Default::default(),
                     lanes: None,
+                    fork: Default::default(),
                 },
             );
             self.state.group_cursors.insert(

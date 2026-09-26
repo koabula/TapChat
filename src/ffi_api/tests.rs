@@ -6868,6 +6868,7 @@ pub(crate) mod tests {
                 archive_metadata: None,
                 pcs: Default::default(),
                 lanes: None,
+                fork: Default::default(),
             },
         );
 
@@ -6936,6 +6937,7 @@ pub(crate) mod tests {
                 archive_metadata: None,
                 pcs: Default::default(),
                 lanes: None,
+                fork: Default::default(),
             },
         );
 
@@ -9691,6 +9693,7 @@ pub(crate) mod tests {
                 archive_metadata: None,
                 pcs: Default::default(),
                 lanes: None,
+                fork: Default::default(),
             },
         );
         engine
@@ -12684,7 +12687,15 @@ pub(crate) mod tests {
             .expect("peer adapter")
             .state_fingerprint()
             .expect("peer fingerprint");
-        let messages_before = peer.state.conversations[&conversation_id].messages.len();
+        let victim_device = rotator_device_id(&chat, victim).to_string();
+        let from_victim = |engine: &CoreEngine| {
+            engine.state.conversations[&conversation_id]
+                .messages
+                .iter()
+                .filter(|message| message.sender_device_id == victim_device)
+                .count()
+        };
+        let messages_before = from_victim(peer);
 
         deliver_inbox_envelope(peer_engine_mut(&mut chat, victim), &peer_device, after, 200);
         deliver_inbox_envelope(
@@ -12706,7 +12717,7 @@ pub(crate) mod tests {
             "frames minted from a pre-rotation snapshot must not touch the peer's MLS state"
         );
         assert_eq!(
-            peer.state.conversations[&conversation_id].messages.len(),
+            from_victim(peer),
             messages_before,
             "frames minted from a pre-rotation snapshot must not reach the transcript"
         );
@@ -12715,6 +12726,436 @@ pub(crate) mod tests {
             snapshot_epoch + 2,
             "a commit minted from a pre-rotation snapshot must not move the peer"
         );
+        // Speaking is over, but the forged commit is not nothing: it and the
+        // victim's own commit on that base epoch are two signatures by one
+        // device key, which is proof of the snapshot. The ideal allows the
+        // adversary to raise this only where it could inject, and the window
+        // it builds on is the one this test just used.
+        assert_eq!(
+            peer.state.conversations[&conversation_id]
+                .conversation
+                .state,
+            ConversationState::Compromised,
+            "a commit minted from the snapshot on a witnessed base epoch is evidence of it"
+        );
+    }
+
+    /// **A fork is detected by the counterparty.** A snapshot of P commits in
+    /// P's name and Q merges it first, so the two continue in different
+    /// epochs. P never saw the forged commit, so its own next commit builds on
+    /// the same base epoch — and Q now holds two commits that P's device key
+    /// signed on one base epoch, which an honest device never produces.
+    ///
+    /// Run twice: once with the honest commit arriving while Q still keeps the
+    /// base epoch's key as its previous one, and once after Q has rotated past
+    /// it, which is where only the retained witness key can open the frame.
+    #[test]
+    fn fork_is_detected_by_the_counterparty() {
+        for counterparty_moved_on in [false, true] {
+            assert_fork_detected(counterparty_moved_on);
+        }
+    }
+
+    fn assert_fork_detected(counterparty_moved_on: bool) {
+        let mut chat = paired_direct_chat();
+        let conversation_id = chat.conversation_id.clone();
+        let victim = alice_is_designated(&chat);
+        let peer_device = peer_device_id(&chat, victim).to_string();
+        let snapshot_epoch = conversation_epoch(rotator_engine(&chat, victim), &conversation_id);
+        let mut thief =
+            CoreEngine::try_from_restored_state(rotator_engine(&chat, victim).refresh_snapshot())
+                .expect("the snapshot restores");
+
+        // The thief commits in the victim's name and the counterparty merges
+        // it. A retransmission of the same bytes is not a second signature.
+        set_direct_pcs_debt(&mut thief, &conversation_id, DIRECT_PCS_COMMIT_INTERVAL - 1);
+        thief
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "thief rotation trigger".into(),
+            })
+            .expect("thief commits in the victim's name");
+        let forged = last_pending_envelope(&thief, &peer_device, MessageType::MlsCommit);
+        deliver_inbox_envelope(
+            peer_engine_mut(&mut chat, victim),
+            &peer_device,
+            forged.clone(),
+            100,
+        );
+        deliver_inbox_envelope(
+            peer_engine_mut(&mut chat, victim),
+            &peer_device,
+            under_fresh_mid(forged),
+            101,
+        );
+        assert_eq!(
+            conversation_epoch(peer_engine(&chat, victim), &conversation_id),
+            snapshot_epoch + 1,
+            "the counterparty merged the forged commit"
+        );
+        assert!(!conversation_is_compromised(
+            peer_engine(&chat, victim),
+            &conversation_id
+        ));
+
+        // The victim heals from the epoch it is still in.
+        set_direct_pcs_debt(
+            rotator_engine_mut(&mut chat, victim),
+            &conversation_id,
+            DIRECT_PCS_COMMIT_INTERVAL - 1,
+        );
+        rotator_engine_mut(&mut chat, victim)
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "honest heal".into(),
+            })
+            .expect("victim rotates");
+        let honest = last_pending_envelope(
+            rotator_engine(&chat, victim),
+            &peer_device,
+            MessageType::MlsCommit,
+        );
+        assert_eq!(
+            rotator_engine(&chat, victim).state.conversations[&conversation_id]
+                .pcs
+                .own_commit
+                .as_ref()
+                .expect("victim's own commit")
+                .base_epoch,
+            snapshot_epoch,
+            "the honest commit builds on the forged commit's base epoch"
+        );
+
+        if counterparty_moved_on {
+            set_direct_pcs_debt(
+                peer_engine_mut(&mut chat, victim),
+                &conversation_id,
+                DIRECT_PCS_COMMIT_INTERVAL * 2 - 1,
+            );
+            peer_engine_mut(&mut chat, victim)
+                .handle_command(CoreCommand::SendTextMessage {
+                    conversation_id: conversation_id.clone(),
+                    plaintext: "queued before the fork is known".into(),
+                })
+                .expect("counterparty rotates");
+            assert_eq!(
+                conversation_epoch(peer_engine(&chat, victim), &conversation_id),
+                snapshot_epoch + 2,
+                "the counterparty left the base epoch behind, previous key included"
+            );
+        }
+
+        let output = deliver_inbox_envelope(
+            peer_engine_mut(&mut chat, victim),
+            &peer_device,
+            honest,
+            200,
+        );
+
+        let peer = peer_engine(&chat, victim);
+        assert!(
+            conversation_is_compromised(peer, &conversation_id),
+            "two commits signed by one device key on one base epoch must be detected \
+             (counterparty_moved_on={counterparty_moved_on})"
+        );
+        assert!(peer.state.conversations[&conversation_id]
+            .fork
+            .forked_since_ms
+            .is_some());
+        assert!(output.effects.iter().any(|effect| matches!(
+            effect,
+            CoreEffect::EmitUserNotification { notification }
+                if notification.status == crate::ffi_api::SystemStatus::ConversationCompromised
+        )));
+        assert!(output
+            .view_model
+            .as_ref()
+            .is_some_and(|view| view.banners.iter().any(
+                |banner| banner.status == crate::ffi_api::SystemStatus::ConversationCompromised
+            )));
+        let lanes = peer.state.conversations[&conversation_id]
+            .lanes
+            .as_ref()
+            .expect("lanes");
+        assert!(
+            !peer.state.pending_outbox.iter().any(|item| {
+                item.envelope.lane == lanes.inbound_lane
+                    || item.envelope.lane == lanes.outbound_lane
+            }),
+            "nothing queued for the conversation may still go out"
+        );
+        if counterparty_moved_on {
+            assert!(
+                peer.state.conversations[&conversation_id]
+                    .messages
+                    .iter()
+                    .any(|message| {
+                        message.plaintext.as_deref() == Some("queued before the fork is known")
+                            && message.delivery_state
+                                == Some(crate::conversation::StoredMessageDeliveryState::Failed)
+                    }),
+                "a message the user queued must stay visible, as failed"
+            );
+        }
+        let error = peer_engine_mut(&mut chat, victim)
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "after detection".into(),
+            })
+            .expect_err("a compromised conversation refuses to send");
+        assert_eq!(error.code(), "conversation_compromised");
+
+        // Only sending stops: what arrives on the counterparty's branch is
+        // still received, under the banner the UI raises.
+        if !counterparty_moved_on {
+            thief
+                .handle_command(CoreCommand::SendTextMessage {
+                    conversation_id: conversation_id.clone(),
+                    plaintext: "still received".into(),
+                })
+                .expect("thief sends on the forked branch");
+            let inbound = last_pending_application_envelope(&thief, &peer_device);
+            deliver_inbox_envelope(
+                peer_engine_mut(&mut chat, victim),
+                &peer_device,
+                inbound,
+                300,
+            );
+            assert!(conversation_has_plaintext(
+                peer_engine(&chat, victim),
+                &conversation_id,
+                "still received"
+            ));
+        }
+    }
+
+    /// Control for the fork detector: honest traffic never raises it. That
+    /// covers rotations from both sides, each also replayed under a fresh
+    /// message id, and a same-epoch race settled by the loser rebuilding the
+    /// group -- after which the new group reuses base epochs, and the same
+    /// designated devices, that the old group's witnesses were recorded at.
+    #[test]
+    fn honest_rotations_never_look_like_a_fork() {
+        let mut chat = paired_direct_chat();
+        let conversation_id = chat.conversation_id.clone();
+        let mut seq = 90_000;
+        let first_epoch = conversation_epoch(&chat.alice, &conversation_id);
+        for _ in 0..3 {
+            honest_rotation(&mut chat, &mut seq);
+        }
+        assert!(
+            [&chat.alice, &chat.bob].iter().all(|engine| {
+                !engine.state.conversations[&conversation_id]
+                    .fork
+                    .witnesses
+                    .is_empty()
+            }),
+            "both sides hold witnesses from the first group"
+        );
+
+        // A race, settled by the loser rebuilding the group.
+        let alice_is_winner = alice_is_designated(&chat);
+        let winner_device = rotator_device_id(&chat, alice_is_winner).to_string();
+        let loser_device = peer_device_id(&chat, alice_is_winner).to_string();
+        set_direct_pcs_debt(
+            peer_engine_mut(&mut chat, alice_is_winner),
+            &conversation_id,
+            DIRECT_PCS_COMMIT_INTERVAL * 2 - 1,
+        );
+        peer_engine_mut(&mut chat, alice_is_winner)
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "loser rotation".into(),
+            })
+            .expect("loser send");
+        let loser_commit = last_pending_envelope(
+            peer_engine(&chat, alice_is_winner),
+            &winner_device,
+            MessageType::MlsCommit,
+        );
+        set_direct_pcs_debt(
+            rotator_engine_mut(&mut chat, alice_is_winner),
+            &conversation_id,
+            DIRECT_PCS_COMMIT_INTERVAL - 1,
+        );
+        rotator_engine_mut(&mut chat, alice_is_winner)
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "winner rotation".into(),
+            })
+            .expect("winner send");
+        let winner_commit = last_pending_envelope(
+            rotator_engine(&chat, alice_is_winner),
+            &loser_device,
+            MessageType::MlsCommit,
+        );
+        deliver_inbox_envelope(
+            rotator_engine_mut(&mut chat, alice_is_winner),
+            &winner_device,
+            loser_commit,
+            50_000,
+        );
+        let output = deliver_inbox_envelope(
+            peer_engine_mut(&mut chat, alice_is_winner),
+            &loser_device,
+            winner_commit,
+            50_001,
+        );
+        // The winner joined the first group with its published KeyPackage and
+        // has rotated it since, so the claim is answered with the current one.
+        let key_package = rotator_engine(&chat, alice_is_winner)
+            .state
+            .published_key_package
+            .as_ref()
+            .expect("winner's current key package")
+            .key_package_b64
+            .clone();
+        answer_key_package_claims(
+            peer_engine_mut(&mut chat, alice_is_winner),
+            output,
+            &key_package,
+        );
+        let welcome = last_pending_envelope(
+            peer_engine(&chat, alice_is_winner),
+            &winner_device,
+            MessageType::MlsWelcome,
+        );
+        deliver_inbox_envelope(
+            rotator_engine_mut(&mut chat, alice_is_winner),
+            &winner_device,
+            welcome,
+            50_002,
+        );
+        // The rebuilder stays fail-closed until it hears from the peer.
+        rotator_engine_mut(&mut chat, alice_is_winner)
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "joined the rebuilt group".into(),
+            })
+            .expect("winner speaks in the rebuilt group");
+        let hello = last_pending_application_envelope(
+            rotator_engine(&chat, alice_is_winner),
+            &loser_device,
+        );
+        deliver_inbox_envelope(
+            peer_engine_mut(&mut chat, alice_is_winner),
+            &loser_device,
+            hello,
+            50_003,
+        );
+        assert!(conversation_has_plaintext(
+            peer_engine(&chat, alice_is_winner),
+            &conversation_id,
+            "joined the rebuilt group"
+        ));
+        let rebuilt_epoch = conversation_epoch(&chat.alice, &conversation_id);
+        assert_eq!(
+            rebuilt_epoch,
+            conversation_epoch(&chat.bob, &conversation_id)
+        );
+        assert!(
+            rebuilt_epoch <= first_epoch,
+            "the rebuilt group counts epochs from the start again"
+        );
+
+        for _ in 0..4 {
+            honest_rotation(&mut chat, &mut seq);
+        }
+        for engine in [&chat.alice, &chat.bob] {
+            assert!(
+                !conversation_is_compromised(engine, &conversation_id),
+                "honest traffic must never read as a double sign"
+            );
+            assert_eq!(
+                engine.state.conversations[&conversation_id]
+                    .fork
+                    .forked_since_ms,
+                None
+            );
+        }
+    }
+
+    fn answer_key_package_claims(
+        engine: &mut CoreEngine,
+        mut output: CoreOutput,
+        key_package_b64: &str,
+    ) -> CoreOutput {
+        while let Some(request_id) = output.effects.iter().find_map(|effect| match effect {
+            CoreEffect::ExecuteHttpRequest { request }
+                if request.url.contains("/keypackage-pool/") && request.url.ends_with("/claim") =>
+            {
+                Some(request.request_id.clone())
+            }
+            _ => None,
+        }) {
+            let body = serde_json::json!({
+                "keyPackage": {
+                    "keyPackageId": "test-claim",
+                    "keyPackage": key_package_b64,
+                    "lifecycleVersion": 1,
+                    "notBefore": 0,
+                    "createdAt": 0,
+                    "expiresAt": 0,
+                }
+            })
+            .to_string();
+            output = engine
+                .handle_event(CoreEvent::HttpResponseReceived {
+                    request_id,
+                    status: 200,
+                    body: Some(body),
+                })
+                .expect("claim response applied");
+        }
+        output
+    }
+
+    /// One rotation by the designated side, merged by the peer and then
+    /// replayed to it under a fresh message id. Only the rotating side carries
+    /// debt, so the peer does not answer with a rotation of its own.
+    fn honest_rotation(chat: &mut PairedDirectChat, seq: &mut u64) {
+        let conversation_id = chat.conversation_id.clone();
+        let rotating = alice_is_designated(chat);
+        set_direct_pcs_debt(
+            rotator_engine_mut(chat, rotating),
+            &conversation_id,
+            DIRECT_PCS_COMMIT_INTERVAL - 1,
+        );
+        set_direct_pcs_debt(peer_engine_mut(chat, rotating), &conversation_id, 0);
+        assert_eq!(trigger_direct_pcs_from_designated(chat), rotating);
+        let device = peer_device_id(chat, rotating).to_string();
+        let commit = last_pending_envelope(
+            rotator_engine(chat, rotating),
+            &device,
+            MessageType::MlsCommit,
+        );
+        complete_direct_pcs_rotation(chat, rotating);
+        *seq += 1;
+        deliver_inbox_envelope(
+            peer_engine_mut(chat, rotating),
+            &device,
+            under_fresh_mid(commit),
+            *seq,
+        );
+        assert_eq!(
+            conversation_epoch(&chat.alice, &conversation_id),
+            conversation_epoch(&chat.bob, &conversation_id),
+            "both sides are in the same epoch after an honest rotation"
+        );
+    }
+
+    /// The same bytes again, as a replay under a new message id would carry
+    /// them past the inbox's message-id deduplication.
+    fn under_fresh_mid(mut envelope: Envelope) -> Envelope {
+        envelope.mid = crate::model::random_opaque_id();
+        envelope
+    }
+
+    fn conversation_is_compromised(engine: &CoreEngine, conversation_id: &str) -> bool {
+        engine.state.conversations[conversation_id]
+            .conversation
+            .state
+            == ConversationState::Compromised
     }
 
     /// The designated side waits one interval, everyone else waits two. This

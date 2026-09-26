@@ -967,6 +967,7 @@ impl CoreEngine {
                         last_message_type: existing_last_message_type,
                         message_count: None,
                         recovery,
+                        forked_since_ms: None,
                     }],
                     ..CoreViewModel::default()
                 }),
@@ -1098,6 +1099,7 @@ impl CoreEngine {
                         last_message_type: Some(MessageType::MlsWelcome),
                         message_count: None,
                         recovery: None,
+                        forked_since_ms: None,
                     }],
                     messages: generated
                         .iter()
@@ -2270,6 +2272,12 @@ impl CoreEngine {
             )
         };
 
+        if conv_state == ConversationState::Compromised {
+            return Err(CoreError::new(
+                "conversation_compromised",
+                "the counterparty's device key signed two conflicting commits",
+            ));
+        }
         if conv_state == ConversationState::NeedsRebuild {
             return Err(CoreError::invalid_state(
                 "conversation needs rebuild before sending new messages",
@@ -2373,6 +2381,7 @@ impl CoreEngine {
                 last_message_type: conversation.last_message_type,
                 message_count: Some(conversation.messages.len()),
                 recovery: self.recovery_snapshot_for_conversation(conversation_id),
+                forked_since_ms: None,
             });
         }
         Ok(ConversationSummary {
@@ -2388,6 +2397,7 @@ impl CoreEngine {
                 ConversationState::Closed => "closed".into(),
                 ConversationState::Archived => "archived".into(),
                 ConversationState::Dissolved => "dissolved".into(),
+                ConversationState::Compromised => "compromised".into(),
             },
             kind: Some(ConversationKind::Direct),
             title: None,
@@ -2404,6 +2414,7 @@ impl CoreEngine {
             last_message_type: conversation.last_message_type,
             message_count: None,
             recovery: self.recovery_snapshot_for_conversation(conversation_id),
+            forked_since_ms: conversation.fork.forked_since_ms,
         })
     }
 
@@ -3251,7 +3262,9 @@ impl CoreEngine {
     /// tail may hold the peer's own commit; deciding per record would fire
     /// before reading it and manufacture a collision that did not exist.
     pub(super) fn maybe_rotate_direct_pcs(&mut self, conversation_id: &str) -> CoreResult<bool> {
-        if !self.conversation_is_direct(conversation_id) {
+        if !self.conversation_is_direct(conversation_id)
+            || self.conversation_is_compromised(conversation_id)
+        {
             return Ok(false);
         }
         let Some(adapter) = self.state.mls_adapter.as_ref() else {
@@ -3584,6 +3597,146 @@ impl CoreEngine {
                 Ok(Some(merge_outputs(torn_down, rebuilt)))
             }
         }
+    }
+
+    pub(super) fn conversation_is_compromised(&self, conversation_id: &str) -> bool {
+        self.state
+            .conversations
+            .get(conversation_id)
+            .is_some_and(|state| state.conversation.state == ConversationState::Compromised)
+    }
+
+    /// Keep what a double sign on this commit's base epoch would be checked
+    /// against; see [`crate::direct_fork`].
+    pub(super) fn record_peer_commit_witness(
+        &mut self,
+        conversation_id: &str,
+        commit: &crate::direct_frame::AuthenticatedDirectCommit,
+        wrap_key: [u8; crate::lane_wrap::WRAP_KEY_LEN],
+    ) {
+        let now_ms = current_unix_millis(self.state.message_nonce);
+        if let Some(state) = self.state.conversations.get_mut(conversation_id) {
+            state.fork.record(
+                crate::direct_fork::PeerCommitWitness {
+                    base_epoch: commit.base_epoch,
+                    device_id: commit.device_id.clone(),
+                    commit_hash: commit.commit_hash.clone(),
+                    wrap_key,
+                    merged_at_ms: now_ms,
+                },
+                now_ms,
+            );
+        }
+    }
+
+    /// Act on proof that the counterparty's device key is in someone else's
+    /// hands: stop sending, for good.
+    ///
+    /// Inbound keeps flowing -- what was delivered stays delivered, and
+    /// `forked_since_ms` tells the user from when on it may not be the
+    /// counterparty speaking. Whatever was still queued is dropped rather
+    /// than sent into a session the adversary reads, and marked failed so the
+    /// user sees it did not go. Nothing rebuilds the session: a new group
+    /// would be keyed to the same device key.
+    pub(super) fn mark_conversation_compromised(
+        &mut self,
+        conversation_id: &str,
+        forked_since_ms: u64,
+    ) -> CoreResult<CoreOutput> {
+        let Some(state) = self.state.conversations.get_mut(conversation_id) else {
+            return Ok(CoreOutput::default());
+        };
+        if state.conversation.state == ConversationState::Compromised {
+            return Ok(CoreOutput::default());
+        }
+        state.conversation.state = ConversationState::Compromised;
+        state.fork.forked_since_ms = Some(forked_since_ms);
+        log::warn!(
+            "fork detected: the peer's device key signed two commits on one base epoch in conversation {}",
+            redact_id("conversation", conversation_id)
+        );
+
+        let lanes: BTreeSet<String> = state
+            .lanes
+            .as_ref()
+            .map(|lanes| BTreeSet::from([lanes.inbound_lane.clone(), lanes.outbound_lane.clone()]))
+            .unwrap_or_default();
+        let (dropped, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.state.pending_outbox)
+            .into_iter()
+            .partition(|item| lanes.contains(&item.envelope.lane));
+        self.state.pending_outbox = kept;
+        // A queued message has no bubble of its own until its append settles;
+        // the outbox row is what shows it. Give the user's own messages one,
+        // marked failed, before the row goes. Commits and empty control frames
+        // were never the user's to see.
+        let sender_user_id = self
+            .state
+            .local_identity
+            .as_ref()
+            .map(|identity| identity.user_identity.user_id.clone());
+        let sender_device_id = self.local_device_id().unwrap_or_default().to_string();
+        let now_ms = current_unix_millis(self.state.message_nonce);
+        let failed: Vec<crate::conversation::StoredMessage> = dropped
+            .iter()
+            .filter(|item| {
+                item.plaintext_cache
+                    .as_deref()
+                    .is_some_and(|text| !text.is_empty())
+                    || item.envelope.storage_ref.is_some()
+            })
+            .map(|item| crate::conversation::StoredMessage {
+                message_id: item.envelope.mid.clone(),
+                app_message_id: item.app_message_id.clone(),
+                mls_ciphertext_sha256: None,
+                sender_user_id: sender_user_id.clone(),
+                sender_device_id: sender_device_id.clone(),
+                recipient_device_id: item.envelope.recipient_device_id.clone(),
+                message_type: MessageType::MlsApplication,
+                created_at: now_ms,
+                plaintext: item.plaintext_cache.clone(),
+                storage_refs: Vec::new(),
+                delivery_state: Some(crate::conversation::StoredMessageDeliveryState::Failed),
+                message_request_id: None,
+            })
+            .collect();
+        if let Some(state) = self.state.conversations.get_mut(conversation_id) {
+            state.messages.extend(failed);
+        }
+        let mut persist_ops: Vec<PersistOp> = dropped
+            .iter()
+            .map(|item| PersistOp::DeleteOutgoingEnvelope {
+                message_id: item.envelope.mid.clone(),
+            })
+            .collect();
+        persist_ops.push(PersistOp::SaveConversation {
+            conversation_id: conversation_id.to_string(),
+        });
+        let message = "Someone else holds this contact's device key. Sending is disabled for this conversation.";
+        Ok(CoreOutput {
+            state_update: CoreStateUpdate {
+                conversations_changed: true,
+                messages_changed: true,
+                system_statuses_changed: vec![SystemStatus::ConversationCompromised],
+                ..CoreStateUpdate::default()
+            },
+            effects: vec![
+                CoreEffect::EmitUserNotification {
+                    notification: UserNotificationEffect {
+                        status: SystemStatus::ConversationCompromised,
+                        message: message.into(),
+                    },
+                },
+                persist_effect(&self.state, persist_ops),
+            ],
+            view_model: Some(CoreViewModel {
+                conversations: vec![self.conversation_summary(conversation_id)?],
+                banners: vec![SystemBanner {
+                    status: SystemStatus::ConversationCompromised,
+                    message: message.into(),
+                }],
+                ..CoreViewModel::default()
+            }),
+        })
     }
 
     pub(super) fn direct_send_persist_ops(&self, conversation_id: &str) -> Vec<PersistOp> {

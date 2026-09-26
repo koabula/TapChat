@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Mutex;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use openmls::framing::errors::{MessageDecryptionError, SecretTreeError};
@@ -288,6 +289,11 @@ struct PersistedGroupState {
     storage: SerializableStore,
     #[serde(default)]
     pcs_update_sidecar: BTreeMap<String, PcsUpdateSidecar>,
+    /// Orders dumps of `storage` taken from one adapter lineage; see
+    /// [`MlsAdapter::restore_from_persisted_states`]. Absent (0) in rows
+    /// written before it existed.
+    #[serde(default)]
+    store_revision: u64,
 }
 
 /// A compare-and-swap delta for the OpenMLS provider entries changed while a
@@ -388,10 +394,14 @@ fn record_restore_failure(
 /// This replaces a `format!("{error:?}")` substring match that was wrong in
 /// both directions: it tested for `GenerationOutOfBound`, which openmls 0.8.1
 /// never constructs, and it missed `TooDistantInThePast`,
-/// `StageCommitError::OwnCommit` and `CannotDecryptOwnMessage` — three routine
-/// conditions (the delivery service echoing our own traffic back at us) that
-/// consequently drove the conversation into recovery and stalled the ack
-/// cursor. Matching on the real types also means an openmls upgrade that adds
+/// `StageCommitError::OwnCommit` and `CannotDecryptOwnMessage`, which then
+/// drove the conversation into recovery and stalled the ack cursor. The last
+/// two are frames claiming our own leaf. The wrap is keyed per direction, so
+/// an honest echo of our own traffic does not unwrap under the inbound key
+/// and never gets here; what does is a frame minted by someone holding the
+/// epoch's secrets. That is a sign of compromise, but not evidence: the
+/// adversary can simply not send it, so it is discarded like any other
+/// rejection (the unavoidable signal is at the peer; see `direct_fork`). Matching on the real types also means an openmls upgrade that adds
 /// a variant fails the build instead of silently landing in a catch-all.
 fn classify_process_error(error: ProcessMessageError<MemoryStorageError>) -> CoreResult<Verdict> {
     use ProcessMessageError as P;
@@ -445,8 +455,9 @@ fn classify_stage_commit_error(error: StageCommitError) -> Verdict {
         // `epoch > live` fails earlier during decryption. Retryable by the
         // when-in-doubt rule.
         S::EpochMismatch => Verdict::Deferred(DeferReason::OutOfOrder),
-        // The delivery service echoed our own commit back at us. Nothing to
-        // apply, and it never becomes applicable.
+        // A commit claiming our own leaf. It did not unwrap as our own echo
+        // (the wrap is per direction), so someone holding the epoch's secrets
+        // made it; see `classify_process_error`. Never applicable.
         S::OwnCommit => Verdict::Rejected(RejectReason::Replay),
         // Our own key material for the update path is gone. Only reachable
         // after the commit authenticated, so escalating is safe.
@@ -496,8 +507,9 @@ fn classify_validation_error(error: ValidationError) -> Verdict {
         // `max_past_epochs(1)` already deleted that epoch's secrets. Retrying
         // cannot help: nothing arriving later restores deleted key material.
         V::NoPastEpochData => Verdict::Rejected(RejectReason::SecretsGone),
-        // The delivery service echoed our own application message back, and
-        // the deletion schedule removed our own sender keys. Never decryptable.
+        // A frame claiming our own leaf, which can only have been minted by
+        // someone holding the epoch's secrets; see `classify_process_error`.
+        // We keep no sender keys for our own leaf, so it never decrypts.
         V::CannotDecryptOwnMessage => Verdict::Rejected(RejectReason::Replay),
         V::UnableToDecrypt(error) => classify_decryption_error(error),
         V::LibraryError(error) => {
@@ -598,6 +610,18 @@ pub struct MlsAdapter {
     credential_identity: String,
     local_device_id: String,
     groups: BTreeMap<String, LocalMlsState>,
+    /// Stamped on every dump of the provider store, so the most recent one is
+    /// recognisable among the per-conversation rows that each carry one.
+    store_revision: Mutex<StoreRevision>,
+}
+
+/// Advances only when the store's content does: two dumps of an unchanged
+/// store carry the same revision, so a persisted snapshot stays a function of
+/// state.
+#[derive(Debug, Default)]
+struct StoreRevision {
+    revision: u64,
+    digest: String,
 }
 
 impl std::fmt::Debug for MlsAdapter {
@@ -760,6 +784,7 @@ impl MlsAdapter {
             credential_identity: credential_identity.clone(),
             local_device_id: local_identity.device_identity.device_id.clone(),
             groups: BTreeMap::new(),
+            store_revision: Mutex::default(),
         };
 
         Ok((adapter, package))
@@ -1435,13 +1460,26 @@ impl MlsAdapter {
         // matched KeyPackage from provider storage before any validation;
         // doing that on the live adapter would drain the pool before
         // `ingest_welcome` could adopt the same Welcome.
-        let fork = self.fork().ok()?;
+        let mut fork = self.fork().ok()?;
         let config = MlsGroupJoinConfig::builder()
             .use_ratchet_tree_extension(true)
             .max_past_epochs(1)
             .build();
-        let staged =
-            StagedWelcome::new_from_welcome(&fork.provider, &config, welcome, None).ok()?;
+        let processed =
+            ProcessedWelcome::new_from_welcome(&fork.provider, &config, welcome).ok()?;
+        // A rebuild re-creates the group under the id we already hold, and
+        // staging refuses a group id that exists. `ingest_welcome` replaces the
+        // old group on its fork; do the same here, or the Welcome that repairs
+        // a lost commit race is refused before it is ever looked at.
+        let group_id = processed
+            .unverified_group_info()
+            .group_id()
+            .as_slice()
+            .to_vec();
+        if let Ok(existing) = String::from_utf8(group_id) {
+            fork.clear_conversation(&existing);
+        }
+        let staged = processed.into_staged_welcome(&fork.provider, None).ok()?;
         let conversation_id =
             String::from_utf8(staged.group_context().group_id().as_slice().to_vec()).ok()?;
         if !crate::model::is_opaque_id(&conversation_id) {
@@ -1693,6 +1731,19 @@ impl MlsAdapter {
         Ok(())
     }
 
+    fn stamp_store_revision(&self, storage: &SerializableStore) -> CoreResult<u64> {
+        let digest = store_sha256(storage)?;
+        let mut current = self
+            .store_revision
+            .lock()
+            .map_err(|_| CoreError::invalid_state("MLS store revision lock is poisoned"))?;
+        if current.digest != digest {
+            current.revision += 1;
+            current.digest = digest;
+        }
+        Ok(current.revision)
+    }
+
     pub fn restore_from_bootstrap_state(serialized_state: &str) -> CoreResult<Self> {
         let provider = OpenMlsRustCrypto::default();
         let parsed: PersistedGroupState =
@@ -1708,7 +1759,9 @@ impl MlsAdapter {
             credential_with_key,
             storage,
             pcs_update_sidecar: _,
+            store_revision,
         } = parsed;
+        let digest = store_sha256(&storage)?;
         {
             let mut values = provider.storage().values.write().map_err(|_| {
                 CoreError::invalid_state("failed to write restored MLS provider storage")
@@ -1730,6 +1783,10 @@ impl MlsAdapter {
             credential_identity,
             local_device_id,
             groups: BTreeMap::new(),
+            store_revision: Mutex::new(StoreRevision {
+                revision: store_revision,
+                digest,
+            }),
         })
     }
 
@@ -1771,6 +1828,7 @@ impl MlsAdapter {
                 )
             })
             .collect();
+        let store_revision = self.stamp_store_revision(&storage)?;
         serde_json::to_string(&PersistedGroupState {
             credential_identity: self.credential_identity.clone(),
             local_device_id: self.local_device_id.clone(),
@@ -1778,12 +1836,23 @@ impl MlsAdapter {
             credential_with_key: self.credential_with_key.clone(),
             storage,
             pcs_update_sidecar,
+            store_revision,
         })
         .map_err(|error| {
             CoreError::invalid_state(format!("failed to serialize MLS group state: {error}"))
         })
     }
 
+    /// Rebuild the adapter from the per-conversation rows.
+    ///
+    /// Every row carries a dump of the **whole** provider store, taken when
+    /// that row was last saved, and a row is saved only when its own
+    /// conversation changes. Merging the dumps would let an old row roll a
+    /// sibling group back to an epoch it has left, and bring back secrets the
+    /// newer state had deleted. The store therefore comes from the single
+    /// most recent dump, which already holds every group as it stood then;
+    /// the other rows contribute only their own sidecar. Rows predating
+    /// `store_revision` cannot be ordered and are merged as before.
     pub fn restore_from_persisted_states(
         persisted_states: &[(String, MlsStateSummary, Option<String>)],
     ) -> CoreResult<RestoreMlsStateResult> {
@@ -1797,6 +1866,7 @@ impl MlsAdapter {
         let provider = OpenMlsRustCrypto::default();
         let mut template: Option<(SignatureKeyPair, CredentialWithKey, String, String)> = None;
         let mut restored_sidecars: BTreeMap<String, PcsUpdateSidecar> = BTreeMap::new();
+        let mut dumps: Vec<(u64, Vec<(Vec<u8>, Vec<u8>)>)> = Vec::new();
 
         for (conversation_id, summary, serialized_state) in persisted_states {
             let Some(serialized_state) = serialized_state.as_ref() else {
@@ -1840,6 +1910,7 @@ impl MlsAdapter {
                 credential_with_key,
                 storage,
                 mut pcs_update_sidecar,
+                store_revision,
             } = parsed;
             restored_sidecars.insert(
                 conversation_id.clone(),
@@ -1920,10 +1991,7 @@ impl MlsAdapter {
                 if storage_decode_failed {
                     continue;
                 }
-                let mut values = provider.storage().values.write().map_err(|_| {
-                    CoreError::invalid_state("failed to write restored MLS provider storage")
-                })?;
-                values.extend(decoded_values);
+                dumps.push((store_revision, decoded_values));
             }
 
             if failures
@@ -1934,6 +2002,26 @@ impl MlsAdapter {
             }
 
             parsed_states.push((conversation_id.clone(), summary.clone()));
+        }
+
+        let newest_revision = dumps.iter().map(|(revision, _)| *revision).max();
+        {
+            let mut values = provider.storage().values.write().map_err(|_| {
+                CoreError::invalid_state("failed to write restored MLS provider storage")
+            })?;
+            match newest_revision {
+                Some(0) => dumps
+                    .into_iter()
+                    .for_each(|(_, decoded)| values.extend(decoded)),
+                Some(newest) => {
+                    if let Some((_, decoded)) =
+                        dumps.into_iter().find(|(revision, _)| *revision == newest)
+                    {
+                        values.extend(decoded);
+                    }
+                }
+                None => {}
+            }
         }
 
         let Some((signer, credential_with_key, credential_identity, local_device_id)) = template
@@ -1957,7 +2045,16 @@ impl MlsAdapter {
             credential_identity,
             local_device_id,
             groups: BTreeMap::new(),
+            store_revision: Mutex::default(),
         };
+        *adapter
+            .store_revision
+            .get_mut()
+            .map_err(|_| CoreError::invalid_state("MLS store revision lock is poisoned"))? =
+            StoreRevision {
+                revision: newest_revision.unwrap_or(0),
+                digest: store_sha256(&adapter.serializable_store()?)?,
+            };
         let mut summaries = BTreeMap::new();
 
         for (conversation_id, mut summary) in parsed_states {
@@ -3834,6 +3931,48 @@ mod tests {
                 .has_pcs_update_proposals("conv:alice:bob")
                 .expect("b sidecar after restore"),
             "latest empty sidecar for this conversation must win over a stale peer dump"
+        );
+    }
+
+    #[test]
+    fn restore_does_not_roll_a_group_back_to_a_stale_sibling_row() {
+        let (mut alice, _bob, _, _, _) = pair_adapters();
+        alice
+            .create_owner_conversation("conv:solo")
+            .expect("solo conversation");
+        // `conv:solo` is saved once and never touched again, so its row keeps
+        // a copy of every other group as it stood at this moment.
+        let stale_solo = alice
+            .export_persisted_group_state("conv:solo")
+            .expect("solo row");
+        let summary_solo = alice.export_group_summary("conv:solo").expect("solo");
+        let before = alice
+            .export_group_summary("conv:alice:bob")
+            .expect("before")
+            .epoch;
+        alice
+            .rotate_direct_self_update("conv:alice:bob")
+            .expect("rotate");
+        let fresh = alice
+            .export_persisted_group_state("conv:alice:bob")
+            .expect("fresh row");
+        let summary = alice.export_group_summary("conv:alice:bob").expect("after");
+        assert_eq!(summary.epoch, before + 1);
+        // The store hands rows back `ORDER BY position, key`.
+        let restored = MlsAdapter::restore_from_persisted_states(&[
+            ("conv:alice:bob".into(), summary, Some(fresh)),
+            ("conv:solo".into(), summary_solo, Some(stale_solo)),
+        ])
+        .expect("restore")
+        .adapter
+        .expect("adapter");
+        assert_eq!(
+            restored
+                .export_group_summary("conv:alice:bob")
+                .expect("restored")
+                .epoch,
+            before + 1,
+            "a sibling row saved earlier must not roll this group back"
         );
     }
 

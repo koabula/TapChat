@@ -247,6 +247,7 @@ impl CoreEngine {
                 archive_metadata: None,
                 pcs: Default::default(),
                 lanes: None,
+                fork: Default::default(),
             },
         );
 

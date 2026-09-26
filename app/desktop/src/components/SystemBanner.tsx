@@ -11,6 +11,7 @@ import {
   FileWarning,
   WifiOff,
   Clock,
+  ShieldAlert,
   ShieldX,
   X,
 } from "lucide-react";
@@ -33,6 +34,7 @@ const statusIcons: Record<SystemBannerItem["status"], ReactNode> = {
   temporary_network_failure: <WifiOff size={18} />,
   message_queued_for_approval: <Clock size={18} />,
   message_rejected_by_policy: <ShieldX size={18} />,
+  conversation_compromised: <ShieldAlert size={18} />,
 };
 
 const statusTones: Record<SystemBannerItem["status"], "warning" | "error" | "info"> = {
@@ -44,6 +46,7 @@ const statusTones: Record<SystemBannerItem["status"], "warning" | "error" | "inf
   temporary_network_failure: "error",
   message_queued_for_approval: "info",
   message_rejected_by_policy: "error",
+  conversation_compromised: "error",
 };
 
 function bannerKey(banner: SystemBannerItem): string {
