@@ -328,8 +328,6 @@ impl CoreEngine {
 
     pub(super) fn resolve_inbound_frame(
         &self,
-        local_user_id: &str,
-        device_id: &str,
         record: &InboxRecord,
     ) -> CoreResult<InboundFrameResolution> {
         let payload_b64 = record.envelope.payload_b64().unwrap_or_default();
@@ -349,7 +347,9 @@ impl CoreEngine {
                     forked_since_ms,
                 });
             }
-            if let Some((plaintext, _, kind)) = opened {
+            let opened = opened
+                .or_else(|| self.open_under_expected_rebuild_key(&conversation_id, payload_b64));
+            if let Some((plaintext, key, kind)) = opened {
                 let Ok((mls_b64, commit_signature)) = crate::direct_frame::decode(&plaintext)
                 else {
                     return Ok(InboundFrameResolution::Rejected);
@@ -357,6 +357,18 @@ impl CoreEngine {
                 let Some(message_type) = MlsAdapter::classify_mls_payload(&mls_b64) else {
                     return Ok(InboundFrameResolution::Rejected);
                 };
+                // A Welcome inside the wrap is a race loser's rebuild; whether
+                // this is the one expected is decided by the key alone.
+                if message_type == MessageType::MlsWelcome {
+                    if commit_signature.is_some() {
+                        return Ok(InboundFrameResolution::Rejected);
+                    }
+                    return self.resolve_welcome_frame(
+                        Some(&conversation_id),
+                        &mls_b64,
+                        Some(&key),
+                    );
+                }
                 // The key a frame opened under is part of what it claims to
                 // be: a commit under the frame key, or anything else under
                 // the commit key, does not match its own wrapping.
@@ -369,6 +381,7 @@ impl CoreEngine {
                             &conversation_id,
                             &mls_b64,
                             commit_signature.as_ref(),
+                            key,
                         ) else {
                             return Ok(InboundFrameResolution::Rejected);
                         };
@@ -397,22 +410,43 @@ impl CoreEngine {
                 }));
             }
             if MlsAdapter::payload_is_welcome(payload_b64) {
-                return self.resolve_welcome_frame(local_user_id, device_id, record, payload_b64);
+                return self.resolve_welcome_frame(Some(&conversation_id), payload_b64, None);
             }
             return Ok(InboundFrameResolution::Deferred);
         }
         if MlsAdapter::payload_is_welcome(payload_b64) {
-            return self.resolve_welcome_frame(local_user_id, device_id, record, payload_b64);
+            return self.resolve_welcome_frame(None, payload_b64, None);
         }
         Ok(InboundFrameResolution::Deferred)
     }
 
+    /// A frame under the key a race loser's rebuild Welcome is expected
+    /// under. Consulted only once the session's own keys have failed.
+    fn open_under_expected_rebuild_key(
+        &self,
+        conversation_id: &str,
+        payload_b64: &str,
+    ) -> Option<(Vec<u8>, [u8; lane_wrap::WRAP_KEY_LEN], WrapKind)> {
+        let key = *self
+            .state
+            .conversations
+            .get(conversation_id)?
+            .rebuild
+            .expected_key()?;
+        let wrapped = STANDARD.decode(payload_b64).ok()?;
+        lane_wrap::unwrap_frame(&key, &wrapped).map(|frame| (frame, key, WrapKind::Commit))
+    }
+
+    /// Admit a Welcome. For a conversation this device already holds, see
+    /// [`crate::direct_rebuild`]: the author's device key is not enough, since
+    /// it outlives the peer's healing. `lane_conversation` is the conversation
+    /// of the pairwise address the record arrived on, and `wrapped_under` the
+    /// key a wrapped Welcome opened under.
     fn resolve_welcome_frame(
         &self,
-        _local_user_id: &str,
-        _device_id: &str,
-        _record: &InboxRecord,
+        lane_conversation: Option<&str>,
         payload_b64: &str,
+        wrapped_under: Option<&[u8; lane_wrap::WRAP_KEY_LEN]>,
     ) -> CoreResult<InboundFrameResolution> {
         let Some(adapter) = self.state.mls_adapter.as_ref() else {
             return Ok(InboundFrameResolution::Rejected);
@@ -423,6 +457,26 @@ impl CoreEngine {
         let Ok(author) = self.trusted_welcome_author(&inspection) else {
             return Ok(InboundFrameResolution::Rejected);
         };
+        // A Welcome speaks for the conversation whose address it came on.
+        if lane_conversation.is_some_and(|lane| lane != inspection.conversation_id) {
+            return Ok(InboundFrameResolution::Rejected);
+        }
+        if let Some(existing) = self.state.conversations.get(&inspection.conversation_id) {
+            let now_ms = current_unix_millis(self.state.message_nonce);
+            let admitted = existing.peer_user_id == inspection.author_user_id
+                && existing.conversation.state != ConversationState::Compromised
+                && match wrapped_under {
+                    Some(key) => existing
+                        .rebuild
+                        .admits_wrapped(key, &author.device_id, now_ms),
+                    None => existing.rebuild.awaits_peer_welcome,
+                };
+            if !admitted {
+                return Ok(InboundFrameResolution::Rejected);
+            }
+        } else if wrapped_under.is_some() {
+            return Ok(InboundFrameResolution::Rejected);
+        }
         Ok(InboundFrameResolution::Ready(ResolvedInbound {
             conversation_id: inspection.conversation_id,
             peer_user_id: inspection.author_user_id,
@@ -502,6 +556,7 @@ impl CoreEngine {
         conversation_id: &str,
         payload_b64: &str,
         signature: Option<&[u8; crate::direct_frame::COMMIT_SIGNATURE_LEN]>,
+        wrap_key: [u8; lane_wrap::WRAP_KEY_LEN],
     ) -> Option<crate::direct_frame::AuthenticatedDirectCommit> {
         let signature_hex = crate::identity::encode_hex(signature?);
         let conversation = self.state.conversations.get(conversation_id)?;
@@ -542,6 +597,7 @@ impl CoreEngine {
                     base_epoch,
                     commit_hash: crate::direct_frame::commit_hash(&digest),
                     device_id,
+                    wrap_key,
                 });
             }
         }

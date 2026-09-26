@@ -2858,6 +2858,7 @@ mod tests {
                 pcs: Default::default(),
                 lanes: None,
                 fork: Default::default(),
+                rebuild: Default::default(),
             },
         };
         store
@@ -2993,6 +2994,7 @@ mod tests {
                 pcs: Default::default(),
                 lanes: None,
                 fork: Default::default(),
+                rebuild: Default::default(),
             },
         };
         store
@@ -3079,6 +3081,7 @@ mod tests {
                 pcs: Default::default(),
                 lanes: None,
                 fork: Default::default(),
+                rebuild: Default::default(),
             },
         };
         let snapshot = CorePersistenceSnapshot {
@@ -3300,6 +3303,7 @@ mod tests {
             pcs: Default::default(),
             lanes: None,
             fork: Default::default(),
+            rebuild: Default::default(),
         };
         store
             .save_snapshot(&CorePersistenceSnapshot {

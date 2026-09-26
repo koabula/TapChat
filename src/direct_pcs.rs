@@ -23,6 +23,11 @@ pub struct OwnCommit {
     /// commits leave the two sides with different rosters — the arbitration
     /// verdict has to be the same on both sides or the fork never resolves.
     pub won_arbitration: bool,
+    /// `K_c(base_epoch, outbound)`, the key this commit went out under. If it
+    /// loses, the rebuild Welcome goes out under it too, and the winner, which
+    /// opened the commit with it, can tell that Welcome from a forgery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wrap_key: Option<[u8; crate::lane_wrap::WRAP_KEY_LEN]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -137,6 +142,7 @@ mod tests {
             base_epoch,
             commit_hash: hash.into(),
             won_arbitration: won,
+            wrap_key: None,
         }
     }
 

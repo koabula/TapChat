@@ -22,10 +22,12 @@
 //! By the time that commit arrives Q may have moved several epochs on, and a
 //! frame is wrapped under its own base epoch's key, which Q has overwritten.
 //! So for each peer commit it merges, Q keeps the inbound wrap key of that
-//! commit's base epoch alongside its signature data. The key also scopes the
-//! comparison: a frame opens under it only if it was wrapped at that epoch
-//! of this incarnation of the group, so a rebuild that restarts the epoch
-//! count cannot produce a false match.
+//! commit's base epoch (`K_c`, the commit key; see `lane_wrap`) alongside its
+//! signature data. The key also scopes the comparison: a frame opens under it
+//! only if it was wrapped at that epoch of this incarnation of the group, so a
+//! rebuild that restarts the epoch count cannot produce a false match, and
+//! witnesses survive a rebuild. They have to: a rebuild the adversary can
+//! provoke from a forked branch would otherwise erase the evidence.
 
 use serde::{Deserialize, Serialize};
 
@@ -105,12 +107,6 @@ impl ForkGuard {
     pub fn contradicts(witness: &PeerCommitWitness, base_epoch: u64, commit_hash: &str) -> bool {
         witness.base_epoch == base_epoch && witness.commit_hash != commit_hash
     }
-
-    /// A new incarnation of the group restarts the epoch count; its commits
-    /// cannot open under the old keys, so the old witnesses are dead weight.
-    pub fn clear_witnesses(&mut self) {
-        self.witnesses.clear();
-    }
 }
 
 #[cfg(test)]
@@ -160,16 +156,5 @@ mod tests {
             Some(3)
         );
         assert!(guard.witness_for_key(&[9; WRAP_KEY_LEN]).is_none());
-    }
-
-    #[test]
-    fn clearing_witnesses_keeps_the_verdict() {
-        let mut guard = ForkGuard::default();
-        guard.record(witness(3, 1, 0), 0);
-        guard.forked_since_ms = Some(0);
-        guard.clear_witnesses();
-        assert!(guard.witnesses.is_empty());
-        assert_eq!(guard.forked_since_ms, Some(0));
-        assert!(!guard.is_empty());
     }
 }

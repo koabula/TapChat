@@ -3183,7 +3183,7 @@ impl CoreEngine {
                 processed_records.push(record);
                 continue;
             }
-            let resolved = match self.resolve_inbound_frame(&local_user_id, &device_id, &record)? {
+            let resolved = match self.resolve_inbound_frame(&record)? {
                 InboundFrameResolution::Ready(resolved) => resolved,
                 InboundFrameResolution::Deferred => {
                     {
@@ -3825,7 +3825,15 @@ impl CoreEngine {
                                     if let Some(state) =
                                         self.state.conversations.get_mut(&conversation_id)
                                     {
-                                        state.fork.clear_witnesses();
+                                        state.rebuild.settled();
+                                        // A side that waited out a lost group
+                                        // has one again, from its peer.
+                                        if state.conversation.state
+                                            == ConversationState::NeedsRebuild
+                                        {
+                                            state.conversation.state = ConversationState::Active;
+                                            state.recovery_status = RecoveryStatus::Healthy;
+                                        }
                                     }
                                     self.initialize_direct_pcs_from_mls(&conversation_id)?;
                                     self.record_authenticated_inbound(

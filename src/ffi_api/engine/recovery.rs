@@ -67,6 +67,38 @@ impl CoreEngine {
                     .unwrap_or(false)
         };
 
+        // A new group needs its peer to accept an unsolicited Welcome, which
+        // it does only for a rebuild this device can authenticate or one its
+        // user asked for (`direct_rebuild`). Anything else would send a
+        // Welcome the peer refuses and leave this side on a group of one.
+        let may_bootstrap = self
+            .state
+            .conversations
+            .get(&conversation_id)
+            .is_some_and(|state| state.rebuild.may_bootstrap());
+        if needs_rebootstrap && !may_bootstrap {
+            log::info!(
+                "reconcile: conversation {} waits for its peer to rebuild",
+                redact_id("conversation", &conversation_id)
+            );
+            return Ok(CoreOutput {
+                state_update: CoreStateUpdate {
+                    conversations_changed: true,
+                    ..CoreStateUpdate::default()
+                },
+                effects: vec![persist_effect(
+                    &self.state,
+                    vec![PersistOp::SaveConversation {
+                        conversation_id: conversation_id.clone(),
+                    }],
+                )],
+                view_model: Some(CoreViewModel {
+                    conversations: vec![self.conversation_summary(&conversation_id)?],
+                    ..CoreViewModel::default()
+                }),
+            });
+        }
+
         if !reconcile.changed && !needs_rebootstrap {
             let device_id = self
                 .state
@@ -238,7 +270,33 @@ impl CoreEngine {
             &peer_active_device_ids,
             &artifacts,
         )?;
-        generated.extend(self.welcome_envelopes_for_artifacts(&conversation_id, &artifacts)?);
+        let mut welcomes = self.welcome_envelopes_for_artifacts(&conversation_id, &artifacts)?;
+        let wrap_out = self
+            .state
+            .conversations
+            .get_mut(&conversation_id)
+            .and_then(|state| {
+                let wrap_out = state.rebuild.wrap_out;
+                state.rebuild.bootstrapped();
+                wrap_out
+            });
+        // After a lost race the Welcome rides under the losing commit's key,
+        // which is what lets the winner tell it from a forgery.
+        if let Some(key) = wrap_out {
+            for (envelope, welcome) in welcomes.iter_mut().zip(&artifacts.welcomes) {
+                envelope.bytes = Some(self.wrap_outbound_frame_with_key(
+                    &conversation_id,
+                    MessageType::MlsWelcome,
+                    &welcome.payload_b64,
+                    &key,
+                )?);
+            }
+        }
+        let welcome_ids: BTreeSet<String> = welcomes
+            .iter()
+            .map(|envelope| envelope.mid.clone())
+            .collect();
+        generated.extend(welcomes);
         self.enqueue_envelopes(peer_user_id, generated.clone());
         self.mark_recovery_needed(&conversation_id, RecoveryReason::MembershipChanged);
         self.merge_with_transport_flush(CoreOutput {
@@ -267,9 +325,7 @@ impl CoreEngine {
                     .map(|envelope| MessageSummary {
                         conversation_id: conversation_id.clone(),
                         message_id: envelope.mid.clone(),
-                        message_type: if crate::mls_adapter::MlsAdapter::payload_is_welcome(
-                            envelope.payload_b64().unwrap_or_default(),
-                        ) {
+                        message_type: if welcome_ids.contains(&envelope.mid) {
                             MessageType::MlsWelcome
                         } else {
                             MessageType::MlsCommit
@@ -418,7 +474,6 @@ impl CoreEngine {
                 .ok_or_else(|| CoreError::invalid_input("conversation does not exist"))?;
             conversation_state.conversation.state = ConversationState::NeedsRebuild;
             conversation_state.recovery_status = RecoveryStatus::NeedsRebuild;
-            conversation_state.fork.clear_witnesses();
             (
                 conversation_state
                     .conversation
@@ -600,6 +655,13 @@ impl CoreEngine {
     ) -> CoreResult<CoreOutput> {
         if self.conversation_is_compromised(conversation_id) {
             return Ok(CoreOutput::default());
+        }
+        // A local MLS fault leaves nothing to authenticate a rebuild with, so
+        // the peer's plain Welcome is what this side waits for.
+        if escalation_reason == RecoveryEscalationReason::MlsMarkedUnrecoverable {
+            if let Some(state) = self.state.conversations.get_mut(conversation_id) {
+                state.rebuild.awaits_peer_welcome = true;
+            }
         }
         let message = message.into();
         if let Some(context) = self.state.recovery_contexts.get_mut(conversation_id) {

@@ -58,6 +58,7 @@
           "src/local_store.rs",
           "src/direct_fork.rs",
           "src/direct_pcs.rs",
+          "src/direct_rebuild.rs",
           "src/group_pcs.rs",
           "src/profile_crypto.rs",
           "src/attachment_crypto.rs",

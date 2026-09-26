@@ -248,6 +248,7 @@ impl CoreEngine {
                 pcs: Default::default(),
                 lanes: None,
                 fork: Default::default(),
+                rebuild: Default::default(),
             },
         );
 

@@ -67,6 +67,8 @@ pub(crate) struct AuthenticatedDirectCommit {
     pub commit_hash: String,
     /// The device whose key produced the signature.
     pub device_id: String,
+    /// The wrap key the frame opened under.
+    pub wrap_key: [u8; crate::lane_wrap::WRAP_KEY_LEN],
 }
 
 pub(crate) fn encode(

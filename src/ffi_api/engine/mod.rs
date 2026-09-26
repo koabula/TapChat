@@ -784,6 +784,7 @@ impl CoreEngine {
                 }
                 conversation.conversation.state = ConversationState::NeedsRebuild;
                 conversation.recovery_status = RecoveryStatus::NeedsRebuild;
+                conversation.rebuild.awaits_peer_welcome = true;
             }
             if let Some(summary) = engine.state.mls_summaries.get_mut(&conversation_id) {
                 summary.status = MlsStateStatus::NeedsRebuild;
@@ -1351,7 +1352,12 @@ impl CoreEngine {
                 status,
             } => self.update_local_device_status(target_device_id, status),
             CoreCommand::RotateContactShareLink => self.rotate_contact_share_link(),
+            // The user's own request is what authorises a rebuild its peer
+            // has no session key to check (`direct_rebuild`).
             CoreCommand::RebuildConversation { conversation_id } => {
+                if let Some(state) = self.state.conversations.get_mut(&conversation_id) {
+                    state.rebuild.reset_requested = true;
+                }
                 self.rebuild_conversation(conversation_id)
             }
             CoreCommand::SetLocalDisplayName { display_name } => {
@@ -3555,6 +3561,7 @@ mod protected_application_message_tests {
                     wrap_prev: None,
                 }),
                 fork: Default::default(),
+                rebuild: Default::default(),
             },
         );
         engine

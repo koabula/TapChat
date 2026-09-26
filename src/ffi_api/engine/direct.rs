@@ -3325,6 +3325,7 @@ impl CoreEngine {
                     base_epoch: rotated.base_epoch,
                     commit_hash: rotated.commit_hash,
                     won_arbitration: is_designated,
+                    wrap_key: Some(outbound_prev),
                 },
                 now_ms,
             );
@@ -3569,14 +3570,32 @@ impl CoreEngine {
             });
         match verdict {
             None => Ok(None),
-            // We won. The peer will find our commit, lose, and repair itself.
-            // Ack and discard, with no state transition of any kind.
+            // We won. The peer will find our commit, lose, and rebuild; its
+            // Welcome will come wrapped under the key its losing commit came
+            // under, which is the only thing that tells it from a Welcome a
+            // stolen device key signed. Remember that key, and nothing else.
             Some(true) => {
                 log::warn!(
                     "direct_pcs_arbitration: discarding a commit that lost to ours in conversation {}",
                     redact_id("conversation", conversation_id)
                 );
-                Ok(Some(CoreOutput::default()))
+                let now_ms = current_unix_millis(self.state.message_nonce);
+                if let Some(state) = self.state.conversations.get_mut(conversation_id) {
+                    state.rebuild.expected = Some(crate::direct_rebuild::ExpectedRebuild {
+                        device_id: incoming.device_id.clone(),
+                        key: incoming.wrap_key,
+                        at_ms: now_ms,
+                    });
+                }
+                Ok(Some(CoreOutput {
+                    effects: vec![persist_effect(
+                        &self.state,
+                        vec![PersistOp::SaveConversation {
+                            conversation_id: conversation_id.to_string(),
+                        }],
+                    )],
+                    ..CoreOutput::default()
+                }))
             }
             // We lost. Our own commit for this epoch is already merged and
             // openmls cannot un-merge, so the only route back to a shared
@@ -3589,6 +3608,10 @@ impl CoreEngine {
                     "direct_pcs_arbitration: lost a same-epoch commit race, rebuilding conversation {}",
                     redact_id("conversation", conversation_id)
                 );
+                if let Some(state) = self.state.conversations.get_mut(conversation_id) {
+                    state.rebuild.wrap_out =
+                        state.pcs.own_commit.as_ref().and_then(|own| own.wrap_key);
+                }
                 let torn_down = self.escalate_conversation_to_rebuild(
                     conversation_id,
                     RecoveryEscalationReason::PcsCommitRace,

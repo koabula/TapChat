@@ -5363,6 +5363,9 @@ pub(crate) mod tests {
             .expect("persisted conversation");
         persisted_conversation.state.conversation.state = ConversationState::NeedsRebuild;
         persisted_conversation.state.recovery_status = RecoveryStatus::NeedsRebuild;
+        // The user asked for it: the peer has no session key to check this
+        // rebuild against (`direct_rebuild`).
+        persisted_conversation.state.rebuild.reset_requested = true;
         let mut alice = CoreEngine::try_from_restored_state(snapshot).expect("restore snapshot");
 
         let output = alice
@@ -6869,6 +6872,7 @@ pub(crate) mod tests {
                 pcs: Default::default(),
                 lanes: None,
                 fork: Default::default(),
+                rebuild: Default::default(),
             },
         );
 
@@ -6938,6 +6942,7 @@ pub(crate) mod tests {
                 pcs: Default::default(),
                 lanes: None,
                 fork: Default::default(),
+                rebuild: Default::default(),
             },
         );
 
@@ -9699,6 +9704,7 @@ pub(crate) mod tests {
                 pcs: Default::default(),
                 lanes: None,
                 fork: Default::default(),
+                rebuild: Default::default(),
             },
         );
         engine
@@ -10779,6 +10785,28 @@ pub(crate) mod tests {
             crate::conversation::RecoveryStatus::NeedsRebuild;
         let mut restored = CoreEngine::try_from_restored_state(snapshot).expect("restore snapshot");
         let pending_before = restored.state.pending_outbox.len();
+
+        // On its own, a lost group waits for the peer: a Welcome from here
+        // would be one the peer has no session key to authenticate.
+        let waiting = restored
+            .handle_command(CoreCommand::ReconcileConversationMembership {
+                conversation_id: conversation_id.clone(),
+            })
+            .expect("reconcile without a reset");
+        assert!(!waiting.effects.iter().any(|effect| matches!(
+            effect,
+            CoreEffect::ExecuteHttpRequest { request } if request.url.ends_with("/claim")
+        )));
+        assert_eq!(restored.state.pending_outbox.len(), pending_before);
+
+        // The user asks for the rebuild.
+        restored
+            .state
+            .conversations
+            .get_mut(&conversation_id)
+            .expect("conversation")
+            .rebuild
+            .reset_requested = true;
 
         let output = restored
             .handle_command(CoreCommand::ReconcileConversationMembership {
@@ -13105,6 +13133,12 @@ pub(crate) mod tests {
             loser_commit,
             50_000,
         );
+        let losing_key = peer_engine(&chat, alice_is_winner).state.conversations[&conversation_id]
+            .pcs
+            .own_commit
+            .as_ref()
+            .and_then(|own| own.wrap_key)
+            .expect("the losing commit's key");
         let output = deliver_inbox_envelope(
             peer_engine_mut(&mut chat, alice_is_winner),
             &loser_device,
@@ -13125,11 +13159,7 @@ pub(crate) mod tests {
             output,
             &key_package,
         );
-        let welcome = last_pending_envelope(
-            peer_engine(&chat, alice_is_winner),
-            &winner_device,
-            MessageType::MlsWelcome,
-        );
+        let welcome = rebuild_welcome(peer_engine(&chat, alice_is_winner), &losing_key);
         deliver_inbox_envelope(
             rotator_engine_mut(&mut chat, alice_is_winner),
             &winner_device,
@@ -13162,6 +13192,35 @@ pub(crate) mod tests {
         assert_eq!(
             rebuilt_epoch,
             conversation_epoch(&chat.bob, &conversation_id)
+        );
+        // The expected rebuild is spent: the same Welcome again changes nothing.
+        let settled = rotator_engine(&chat, alice_is_winner)
+            .state
+            .mls_adapter
+            .as_ref()
+            .unwrap()
+            .state_fingerprint()
+            .unwrap();
+        let replay = under_fresh_mid(rebuild_welcome(
+            peer_engine(&chat, alice_is_winner),
+            &losing_key,
+        ));
+        deliver_inbox_envelope(
+            rotator_engine_mut(&mut chat, alice_is_winner),
+            &winner_device,
+            replay,
+            50_004,
+        );
+        assert_eq!(
+            rotator_engine(&chat, alice_is_winner)
+                .state
+                .mls_adapter
+                .as_ref()
+                .unwrap()
+                .state_fingerprint()
+                .unwrap(),
+            settled,
+            "a rebuild Welcome is accepted once"
         );
         assert!(
             rebuilt_epoch <= first_epoch,
@@ -13279,6 +13338,28 @@ pub(crate) mod tests {
         })
     }
 
+    /// A race loser's rebuild Welcome: the queued envelope that opens under the
+    /// key its losing commit travelled under and holds a Welcome.
+    fn rebuild_welcome(
+        loser: &CoreEngine,
+        losing_key: &[u8; crate::lane_wrap::WRAP_KEY_LEN],
+    ) -> Envelope {
+        loser
+            .state
+            .pending_outbox
+            .iter()
+            .rfind(|item| {
+                unwrap_envelope_payload(losing_key, &item.envelope)
+                    .and_then(|frame| crate::direct_frame::decode(&frame).ok())
+                    .is_some_and(|(mls_b64, _)| {
+                        crate::mls_adapter::MlsAdapter::payload_is_welcome(&mls_b64)
+                    })
+            })
+            .expect("a rebuild Welcome under the losing commit's key")
+            .envelope
+            .clone()
+    }
+
     /// One rotation by the designated side, merged by the peer and then
     /// replayed to it under a fresh message id. Only the rotating side carries
     /// debt, so the peer does not answer with a rotation of its own.
@@ -13325,6 +13406,322 @@ pub(crate) mod tests {
             .conversation
             .state
             == ConversationState::Compromised
+    }
+
+    /// **`Inject` is confined to `E(P,t)`, Welcome included.** The device key is
+    /// P's MLS leaf key for good, so after P heals a snapshot still signs as
+    /// P. What it no longer has is any key of the session. A Welcome is how a
+    /// leaf joins a group; for a conversation the counterparty already holds,
+    /// it has to be authenticated by that session, not by the device key.
+    ///
+    /// The thief runs the victim's own rebuild path, answering the Welcome's
+    /// KeyPackage claim with the counterparty's real KeyPackage (the claim
+    /// endpoint takes no credential), and posts it on the pairwise address
+    /// the snapshot writes to, which rotation does not change.
+    #[test]
+    fn a_stolen_device_key_cannot_replace_a_healed_session() {
+        let mut chat = paired_direct_chat();
+        let conversation_id = chat.conversation_id.clone();
+        let victim = alice_is_designated(&chat);
+        let peer_device = peer_device_id(&chat, victim).to_string();
+        let mut thief =
+            CoreEngine::try_from_restored_state(rotator_engine(&chat, victim).refresh_snapshot())
+                .expect("the snapshot restores");
+
+        // The victim heals, and the counterparty follows it.
+        set_direct_pcs_debt(
+            rotator_engine_mut(&mut chat, victim),
+            &conversation_id,
+            DIRECT_PCS_COMMIT_INTERVAL - 1,
+        );
+        assert_eq!(trigger_direct_pcs_from_designated(&mut chat), victim);
+        complete_direct_pcs_rotation(&mut chat, victim);
+        let healed_epoch = conversation_epoch(peer_engine(&chat, victim), &conversation_id);
+
+        // The thief rebuilds "its" conversation.
+        thief
+            .handle_command(CoreCommand::RebuildConversation {
+                conversation_id: conversation_id.clone(),
+            })
+            .expect("the thief tears its copy down");
+        let output = thief
+            .handle_command(CoreCommand::ReconcileConversationMembership {
+                conversation_id: conversation_id.clone(),
+            })
+            .expect("the thief rebuilds");
+        let key_package = peer_engine(&chat, victim)
+            .state
+            .published_key_package
+            .as_ref()
+            .expect("the counterparty's KeyPackage")
+            .key_package_b64
+            .clone();
+        answer_key_package_claims(&mut thief, output, &key_package);
+        let welcome = last_pending_envelope(&thief, &peer_device, MessageType::MlsWelcome);
+
+        let fingerprint = |engine: &CoreEngine| {
+            engine
+                .state
+                .mls_adapter
+                .as_ref()
+                .expect("adapter")
+                .state_fingerprint()
+                .expect("fingerprint")
+        };
+        let before = fingerprint(peer_engine(&chat, victim));
+        deliver_inbox_envelope(
+            peer_engine_mut(&mut chat, victim),
+            &peer_device,
+            welcome,
+            500,
+        );
+        assert_eq!(
+            fingerprint(peer_engine(&chat, victim)),
+            before,
+            "a Welcome signed with a stolen device key must not replace the session"
+        );
+        assert_eq!(
+            conversation_epoch(peer_engine(&chat, victim), &conversation_id),
+            healed_epoch
+        );
+
+        // And the victim is still the one it talks to.
+        rotator_engine_mut(&mut chat, victim)
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "still me".into(),
+            })
+            .expect("victim sends");
+        let genuine =
+            last_pending_application_envelope(rotator_engine(&chat, victim), &peer_device);
+        deliver_inbox_envelope(
+            peer_engine_mut(&mut chat, victim),
+            &peer_device,
+            genuine,
+            501,
+        );
+        assert!(conversation_has_plaintext(
+            peer_engine(&chat, victim),
+            &conversation_id,
+            "still me"
+        ));
+    }
+
+    /// A Welcome speaks only for the conversation whose pairwise address it
+    /// came on, and only from that conversation's peer. Both checks are
+    /// isolated here by putting the counterparty in the one state where a
+    /// plain Welcome is otherwise admitted: its group lost to a local fault.
+    #[test]
+    fn a_welcome_speaks_only_for_its_own_conversation_and_peer() {
+        let mut chat = paired_direct_chat();
+        let conversation_id = chat.conversation_id.clone();
+        let bob_device = chat.bob_device_id.clone();
+        let carol = local_engine(CAROL_MNEMONIC, "phone");
+        let carol_bundle = carol.local_bundle().expect("carol bundle").clone();
+        chat.bob
+            .handle_command(CoreCommand::ImportIdentityBundle {
+                bundle: carol_bundle.clone(),
+            })
+            .expect("bob trusts carol");
+        let carol_conversation = create_direct_conversation(&mut chat.bob, carol_bundle.user_id);
+        chat.bob
+            .state
+            .conversations
+            .get_mut(&conversation_id)
+            .expect("conversation")
+            .rebuild
+            .awaits_peer_welcome = true;
+        let bob_key_package = {
+            let identity = chat
+                .bob
+                .state
+                .local_identity
+                .as_ref()
+                .expect("bob identity");
+            crate::mls_adapter::PeerDeviceKeyPackage {
+                user_id: identity.user_identity.user_id.clone(),
+                device_id: identity.device_identity.device_id.clone(),
+                device_public_key: identity.device_identity.device_public_key.clone(),
+                key_package_b64: chat
+                    .bob
+                    .state
+                    .published_key_package
+                    .as_ref()
+                    .expect("bob key package")
+                    .key_package_b64
+                    .clone(),
+            }
+        };
+        // On a copy of the author's adapter, so an author that already holds
+        // the conversation can mint a fresh group under its id.
+        let welcome_for = |author: &CoreEngine| {
+            let mut adapter = author
+                .state
+                .mls_adapter
+                .as_ref()
+                .expect("adapter")
+                .fork()
+                .expect("copy");
+            adapter.clear_conversation(&conversation_id);
+            adapter
+                .create_conversation(&conversation_id, &[bob_key_package.clone()])
+                .expect("group")
+                .welcomes[0]
+                .payload_b64
+                .clone()
+        };
+        let inbound_lane = |engine: &CoreEngine, conversation: &str| {
+            engine.state.conversations[conversation]
+                .lanes
+                .as_ref()
+                .expect("lanes")
+                .inbound_lane
+                .clone()
+        };
+        let fingerprint = |engine: &CoreEngine| {
+            engine
+                .state
+                .mls_adapter
+                .as_ref()
+                .expect("adapter")
+                .state_fingerprint()
+                .expect("fingerprint")
+        };
+        let before = fingerprint(&chat.bob);
+
+        // Carol, a trusted contact, names the conversation with Alice.
+        let forged = welcome_for(&carol);
+        let envelope = Envelope::with_bytes(
+            bob_device.clone(),
+            inbound_lane(&chat.bob, &conversation_id),
+            crate::model::random_opaque_id(),
+            forged,
+        );
+        deliver_inbox_envelope(&mut chat.bob, &bob_device, envelope, 600);
+        assert_eq!(
+            fingerprint(&chat.bob),
+            before,
+            "only the conversation's peer may rebuild it"
+        );
+
+        // Alice's own Welcome, on the address of Bob's conversation with Carol.
+        let genuine = welcome_for(&chat.alice);
+        let envelope = Envelope::with_bytes(
+            bob_device.clone(),
+            inbound_lane(&chat.bob, &carol_conversation),
+            crate::model::random_opaque_id(),
+            genuine,
+        );
+        deliver_inbox_envelope(&mut chat.bob, &bob_device, envelope, 601);
+        assert_eq!(
+            fingerprint(&chat.bob),
+            before,
+            "a Welcome speaks only for the conversation whose address it came on"
+        );
+    }
+
+    /// A lost group waits for its peer, and the peer's user starts the
+    /// rebuild. Nothing else can: the side that lost its group has no session
+    /// key left to authenticate a Welcome of its own, and its peer would
+    /// rightly refuse one.
+    #[test]
+    fn a_lost_group_is_rebuilt_by_the_peer() {
+        let mut chat = paired_direct_chat();
+        let conversation_id = chat.conversation_id.clone();
+        let alice_device = chat.alice_device_id.clone();
+
+        // Alice's group is gone to a local fault.
+        chat.alice
+            .handle_command(CoreCommand::RebuildConversation {
+                conversation_id: conversation_id.clone(),
+            })
+            .expect("tear down");
+        {
+            let rebuild = &mut chat
+                .alice
+                .state
+                .conversations
+                .get_mut(&conversation_id)
+                .expect("conversation")
+                .rebuild;
+            rebuild.reset_requested = false;
+            rebuild.awaits_peer_welcome = true;
+        }
+        let output = chat
+            .alice
+            .handle_command(CoreCommand::ReconcileConversationMembership {
+                conversation_id: conversation_id.clone(),
+            })
+            .expect("reconcile");
+        assert!(
+            !output.effects.iter().any(|effect| matches!(
+                effect,
+                CoreEffect::ExecuteHttpRequest { request } if request.url.ends_with("/claim")
+            )),
+            "the side that lost its group does not start a rebuild of its own"
+        );
+
+        // Bob's user resets the session.
+        chat.bob
+            .handle_command(CoreCommand::RebuildConversation {
+                conversation_id: conversation_id.clone(),
+            })
+            .expect("bob resets");
+        let output = chat
+            .bob
+            .handle_command(CoreCommand::ReconcileConversationMembership {
+                conversation_id: conversation_id.clone(),
+            })
+            .expect("bob rebuilds");
+        let key_package = chat
+            .alice
+            .state
+            .published_key_package
+            .as_ref()
+            .expect("alice key package")
+            .key_package_b64
+            .clone();
+        answer_key_package_claims(&mut chat.bob, output, &key_package);
+        let welcome = last_pending_envelope(&chat.bob, &alice_device, MessageType::MlsWelcome);
+        deliver_inbox_envelope(&mut chat.alice, &alice_device, welcome, 700);
+        assert_eq!(
+            conversation_epoch(&chat.alice, &conversation_id),
+            conversation_epoch(&chat.bob, &conversation_id),
+            "the side that waited joins the rebuilt group"
+        );
+        assert!(chat.alice.state.conversations[&conversation_id]
+            .rebuild
+            .is_empty());
+
+        // Both sides talk again: Alice first, since the side that reset stays
+        // fail-closed until it hears from its peer.
+        chat.alice
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "back".into(),
+            })
+            .expect("alice sends");
+        let message = last_pending_application_envelope(&chat.alice, &chat.bob_device_id);
+        let bob_device = chat.bob_device_id.clone();
+        deliver_inbox_envelope(&mut chat.bob, &bob_device, message, 701);
+        assert!(conversation_has_plaintext(
+            &chat.bob,
+            &conversation_id,
+            "back"
+        ));
+        chat.bob
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "after the reset".into(),
+            })
+            .expect("bob sends");
+        let message = last_pending_application_envelope(&chat.bob, &alice_device);
+        deliver_inbox_envelope(&mut chat.alice, &alice_device, message, 702);
+        assert!(conversation_has_plaintext(
+            &chat.alice,
+            &conversation_id,
+            "after the reset"
+        ));
     }
 
     /// The designated side waits one interval, everyone else waits two. This
@@ -13508,6 +13905,13 @@ pub(crate) mod tests {
             ConversationState::Active
         );
 
+        let losing_key = peer_engine(&chat, alice_is_winner).state.conversations[&conversation_id]
+            .pcs
+            .own_commit
+            .as_ref()
+            .and_then(|own| own.wrap_key)
+            .expect("the losing commit's key");
+
         // The loser sees the winning commit: it forked, so it rebuilds — and
         // the rebuild is driven to completion in the same turn.
         let output = deliver_inbox_envelope(
@@ -13539,11 +13943,13 @@ pub(crate) mod tests {
         );
         assert!(
             loser.state.pending_outbox.iter().any(|item| {
-                true && crate::mls_adapter::MlsAdapter::payload_is_welcome(
-                    item.envelope.payload_b64().unwrap_or_default(),
-                )
+                unwrap_envelope_payload(&losing_key, &item.envelope)
+                    .and_then(|frame| crate::direct_frame::decode(&frame).ok())
+                    .is_some_and(|(mls_b64, _)| {
+                        crate::mls_adapter::MlsAdapter::payload_is_welcome(&mls_b64)
+                    })
             }),
-            "the rebuild must invite the winner into the fresh group"
+            "the rebuild must invite the winner into the fresh group, under the              key the losing commit travelled under"
         );
     }
 

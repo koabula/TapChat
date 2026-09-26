@@ -8,6 +8,7 @@ pub mod desktop_app;
 pub mod direct_fork;
 pub(crate) mod direct_frame;
 pub mod direct_pcs;
+pub mod direct_rebuild;
 pub mod error;
 pub mod error_codes_generated;
 pub mod external_fetch;
