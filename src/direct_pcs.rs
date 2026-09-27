@@ -48,6 +48,13 @@ pub struct DirectPcsState {
     pub self_rotated_at_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub own_commit: Option<OwnCommit>,
+    /// Our leaf came from a KeyPackage, whose keys were generated when the
+    /// package was published. A snapshot taken at any time since holds them,
+    /// and only our own commit removes them. Set when a Welcome replaces a
+    /// session we had: we had healed there, so a leaf this old must not
+    /// outlive the join.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub leaf_from_key_package: bool,
 }
 
 impl DirectPcsState {
@@ -64,6 +71,9 @@ impl DirectPcsState {
     /// the 2× party only fires when the designated one is absent, and an
     /// absent peer cannot race.
     pub fn should_rotate(&self, is_designated: bool, now_ms: u64) -> bool {
+        if self.leaf_from_key_package {
+            return true;
+        }
         let factor = if is_designated { 1 } else { 2 };
         self.self_debt >= DIRECT_PCS_COMMIT_INTERVAL.saturating_mul(factor)
             || self.rotation_overdue(now_ms, DIRECT_PCS_MAX_AGE_MS.saturating_mul(factor as u64))
@@ -80,6 +90,7 @@ impl DirectPcsState {
         self.self_debt = 0;
         self.self_rotated_at_ms = Some(now_ms);
         self.own_commit = Some(own_commit);
+        self.leaf_from_key_package = false;
     }
 
     /// Close the race window.

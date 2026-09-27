@@ -3499,7 +3499,9 @@ impl CoreEngine {
                         }
                         IngestResult::AppliedProposal => {}
                         IngestResult::AppliedWelcome { epoch } => {
-                            self.initialize_direct_pcs_from_mls(&conversation_id)?;
+                            // Unexpected on this path, so assume the worst of
+                            // the leaf it admitted.
+                            self.initialize_direct_pcs_after_join(&conversation_id, true)?;
                             log::info!(
                                 "handle_inbox_records: unexpected AppliedWelcome for application message {} in conversation {}, epoch={}",
                                 record.message_id,
@@ -3812,7 +3814,9 @@ impl CoreEngine {
                                 }
                                 IngestResult::AppliedWelcome { epoch } => {
                                     touched_conversation_ids.insert(conversation_id.clone());
-                                    if !self.state.conversations.contains_key(&conversation_id) {
+                                    let replaces_session =
+                                        self.state.conversations.contains_key(&conversation_id);
+                                    if !replaces_session {
                                         let author_device_id = welcome_author
                                             .as_ref()
                                             .map(|author| author.device_id.clone())
@@ -3867,7 +3871,10 @@ impl CoreEngine {
                                             state.recovery_status = RecoveryStatus::Healthy;
                                         }
                                     }
-                                    self.initialize_direct_pcs_from_mls(&conversation_id)?;
+                                    self.initialize_direct_pcs_after_join(
+                                        &conversation_id,
+                                        replaces_session,
+                                    )?;
                                     self.record_authenticated_inbound(
                                         &conversation_id,
                                         &inbound_peer_user_id,

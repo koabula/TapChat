@@ -302,7 +302,7 @@ impl CoreEngine {
             .as_mut()
             .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
             .create_conversation(&conversation_id, &resolved_key_packages)?;
-        self.initialize_direct_pcs_from_mls(&conversation_id)?;
+        self.initialize_direct_pcs_after_create(&conversation_id)?;
         let summary = self
             .state
             .mls_adapter

@@ -13152,6 +13152,20 @@ pub(crate) mod tests {
             welcome,
             50_002,
         );
+        // Joining replaced the winner's session, so it replaced the leaf the
+        // Welcome admitted at once. An honest commit like this must not look
+        // like a fork either.
+        let joined_commit = last_pending_envelope(
+            rotator_engine(&chat, alice_is_winner),
+            &loser_device,
+            MessageType::MlsCommit,
+        );
+        deliver_inbox_envelope(
+            peer_engine_mut(&mut chat, alice_is_winner),
+            &loser_device,
+            joined_commit,
+            50_002,
+        );
         // The rebuilder stays fail-closed until it hears from the peer.
         rotator_engine_mut(&mut chat, alice_is_winner)
             .handle_command(CoreCommand::SendTextMessage {
@@ -13208,8 +13222,12 @@ pub(crate) mod tests {
             settled,
             "a rebuild Welcome is accepted once"
         );
+        // The first group's three rotations left witnesses at base epochs
+        // `first_epoch..first_epoch + 3`. The rebuilt group counts from the
+        // start again (plus the joiner's immediate commit), so the rotations
+        // below revisit epoch numbers those witnesses were recorded at.
         assert!(
-            rebuilt_epoch <= first_epoch,
+            rebuilt_epoch < first_epoch + 3,
             "the rebuilt group counts epochs from the start again"
         );
 
@@ -13670,6 +13688,11 @@ pub(crate) mod tests {
         answer_key_package_claims(&mut chat.bob, output, &key_package);
         let welcome = last_pending_envelope(&chat.bob, &alice_device, MessageType::MlsWelcome);
         deliver_inbox_envelope(&mut chat.alice, &alice_device, welcome, 700);
+        // The Welcome replaced a session Alice had, so she replaced the leaf it
+        // admitted her with before doing anything else.
+        let bob_device = chat.bob_device_id.clone();
+        let commit = last_pending_envelope(&chat.alice, &bob_device, MessageType::MlsCommit);
+        deliver_inbox_envelope(&mut chat.bob, &bob_device, commit, 700);
         assert_eq!(
             conversation_epoch(&chat.alice, &conversation_id),
             conversation_epoch(&chat.bob, &conversation_id),
@@ -13688,7 +13711,6 @@ pub(crate) mod tests {
             })
             .expect("alice sends");
         let message = last_pending_application_envelope(&chat.alice, &chat.bob_device_id);
-        let bob_device = chat.bob_device_id.clone();
         deliver_inbox_envelope(&mut chat.bob, &bob_device, message, 701);
         assert!(conversation_has_plaintext(
             &chat.bob,
@@ -13974,16 +13996,23 @@ pub(crate) mod tests {
             .clone();
         answer_key_package_claims(&mut thief, output, &key_package);
         let welcome = rebuild_welcome(&thief, &losing_key);
-        let old_epoch = conversation_epoch(peer_engine(&chat, victim), &conversation_id);
         deliver_inbox_envelope(
             peer_engine_mut(&mut chat, victim),
             &peer_device,
             welcome,
             901,
         );
-        assert_ne!(
-            conversation_epoch(peer_engine(&chat, victim), &conversation_id),
-            old_epoch,
+        // Joining replaced the counterparty's session, so it replaced the leaf
+        // it was admitted with at once; that commit builds on the thief's
+        // group, not on the session it left.
+        assert_eq!(
+            peer_engine(&chat, victim).state.conversations[&conversation_id]
+                .pcs
+                .own_commit
+                .as_ref()
+                .expect("the counterparty's commit after joining")
+                .base_epoch,
+            conversation_epoch(&thief, &conversation_id),
             "the counterparty moved into the thief's group"
         );
         assert!(!conversation_is_compromised(
@@ -14360,6 +14389,205 @@ pub(crate) mod tests {
             }),
             "the rebuild must invite the winner into the fresh group, under the \
              key the losing commit travelled under"
+        );
+    }
+
+    /// A rebuilt group admits the winner from a KeyPackage it published at some
+    /// earlier time, and a snapshot taken since then holds that package's
+    /// private keys. The winner had already healed in the session the rebuild
+    /// replaced, so it must replace that leaf at once, not at the next
+    /// threshold; otherwise the rebuild re-keys a healed session to a key the
+    /// snapshot holds.
+    #[test]
+    fn a_rebuilt_session_does_not_keep_its_key_package_leaf() {
+        let mut chat = paired_direct_chat();
+        let conversation_id = chat.conversation_id.clone();
+        let alice_is_winner = alice_is_designated(&chat);
+        let winner_device = rotator_device_id(&chat, alice_is_winner).to_string();
+        let loser_device = peer_device_id(&chat, alice_is_winner).to_string();
+
+        set_direct_pcs_debt(
+            peer_engine_mut(&mut chat, alice_is_winner),
+            &conversation_id,
+            DIRECT_PCS_COMMIT_INTERVAL * 2 - 1,
+        );
+        peer_engine_mut(&mut chat, alice_is_winner)
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "loser rotation".into(),
+            })
+            .expect("loser send");
+        let loser_commit = last_pending_envelope(
+            peer_engine(&chat, alice_is_winner),
+            &winner_device,
+            MessageType::MlsCommit,
+        );
+        set_direct_pcs_debt(
+            rotator_engine_mut(&mut chat, alice_is_winner),
+            &conversation_id,
+            DIRECT_PCS_COMMIT_INTERVAL - 1,
+        );
+        rotator_engine_mut(&mut chat, alice_is_winner)
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "winner rotation".into(),
+            })
+            .expect("winner send");
+        let winner_commit = last_pending_envelope(
+            rotator_engine(&chat, alice_is_winner),
+            &loser_device,
+            MessageType::MlsCommit,
+        );
+        let losing_key = peer_engine(&chat, alice_is_winner).state.conversations[&conversation_id]
+            .pcs
+            .own_commit
+            .as_ref()
+            .and_then(|own| own.wrap_key)
+            .expect("the losing commit's key");
+        deliver_inbox_envelope(
+            rotator_engine_mut(&mut chat, alice_is_winner),
+            &winner_device,
+            loser_commit,
+            60_000,
+        );
+
+        // The loser rebuilds, and admits the winner from the KeyPackage the
+        // winner has been advertising all along.
+        let key_package = rotator_engine(&chat, alice_is_winner)
+            .state
+            .published_key_package
+            .as_ref()
+            .expect("the winner's KeyPackage")
+            .key_package_b64
+            .clone();
+        let output = deliver_inbox_envelope(
+            peer_engine_mut(&mut chat, alice_is_winner),
+            &loser_device,
+            winner_commit,
+            60_001,
+        );
+        answer_key_package_claims(
+            peer_engine_mut(&mut chat, alice_is_winner),
+            output,
+            &key_package,
+        );
+        let welcome = rebuild_welcome(peer_engine(&chat, alice_is_winner), &losing_key);
+        deliver_inbox_envelope(
+            rotator_engine_mut(&mut chat, alice_is_winner),
+            &winner_device,
+            welcome,
+            60_002,
+        );
+
+        let winner = rotator_engine(&chat, alice_is_winner);
+        let joined_epoch = conversation_epoch(winner, &conversation_id);
+        let own_commit = winner.state.conversations[&conversation_id]
+            .pcs
+            .own_commit
+            .as_ref()
+            .expect("the winner commits in the rebuilt group in the same turn");
+        assert_eq!(
+            own_commit.base_epoch + 1,
+            joined_epoch,
+            "the commit replaces the leaf the Welcome admitted"
+        );
+        assert!(
+            !winner
+                .state
+                .mls_adapter
+                .as_ref()
+                .expect("winner adapter")
+                .own_leaf_is_from_key_package(&conversation_id, &key_package)
+                .expect("winner leaf"),
+            "the rebuilt session must not run on the KeyPackage's leaf"
+        );
+    }
+
+    /// A KeyPackage past its lifetime cannot be used for a Welcome any more,
+    /// because MLS refuses expired packages, so its private keys serve only a
+    /// snapshot. They are deleted once the lifetime and the clock-skew margin
+    /// have passed, and not before.
+    #[test]
+    fn an_expired_key_package_leaves_no_private_key() {
+        let mut engine = local_engine(ALICE_MNEMONIC, "phone");
+        let now_ms = engine
+            .state
+            .published_key_package
+            .as_ref()
+            .expect("published key package")
+            .created_at;
+        let output = engine
+            .handle_event(CoreEvent::CredentialMaintenanceRequested { now_ms })
+            .expect("credential maintenance");
+        let count_request_id = first_http_request_id_containing(&output, "/keypackage-pool/");
+        let replenished = engine
+            .handle_event(CoreEvent::HttpResponseReceived {
+                request_id: count_request_id,
+                status: 200,
+                body: Some(r#"{"count":0}"#.into()),
+            })
+            .expect("an empty pool is topped up");
+        let body: serde_json::Value = replenished
+            .effects
+            .iter()
+            .find_map(|effect| match effect {
+                CoreEffect::ExecuteHttpRequest { request }
+                    if request.method == crate::ffi_api::HttpMethod::Put
+                        && request.url.contains("/keypackage-pool/") =>
+                {
+                    request
+                        .body
+                        .as_deref()
+                        .map(|body| serde_json::from_str(body).expect("replenish body json"))
+                }
+                _ => None,
+            })
+            .expect("replenish request");
+        let entry = &body["keyPackages"][0];
+        let pooled = entry["keyPackage"]
+            .as_str()
+            .expect("pooled key package")
+            .to_string();
+        let expires_at = entry["expiresAt"].as_u64().expect("expiry");
+        let holds = |engine: &CoreEngine| {
+            engine
+                .state
+                .mls_adapter
+                .as_ref()
+                .expect("mls adapter")
+                .holds_key_package(&pooled)
+                .expect("key package lookup")
+        };
+        assert!(holds(&engine), "a pooled KeyPackage keeps its private keys");
+
+        let deadline = expires_at + crate::mls_adapter::KEY_PACKAGE_CLOCK_SKEW_MS;
+        engine
+            .handle_event(CoreEvent::CredentialMaintenanceRequested {
+                now_ms: deadline - 1,
+            })
+            .expect("maintenance before the deadline");
+        assert!(
+            holds(&engine),
+            "a peer whose clock lags may still use it inside the skew margin"
+        );
+
+        engine
+            .handle_event(CoreEvent::CredentialMaintenanceRequested { now_ms: deadline })
+            .expect("maintenance at the deadline");
+        assert!(
+            !holds(&engine),
+            "an expired KeyPackage keeps no private key"
+        );
+        assert!(!engine
+            .state
+            .key_package_inventory
+            .iter()
+            .any(|item| item.key_package_b64 == pooled));
+        let restored = CoreEngine::try_from_restored_state(engine.refresh_snapshot())
+            .expect("the snapshot restores");
+        assert!(
+            !holds(&restored),
+            "the persisted store must not keep it either"
         );
     }
 

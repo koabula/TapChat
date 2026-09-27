@@ -37,6 +37,9 @@ pub enum PublishedKeyPackageState {
     Advertised,
     Consumed,
     Retired,
+    /// Uploaded to the one-time pool. The runtime does not report which
+    /// entries were claimed, so the local copy lives until it expires.
+    Pooled,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -1212,6 +1215,43 @@ impl MlsAdapter {
             return Ok(0);
         }
         Ok(state.pcs_updates.len())
+    }
+
+    /// Delete a KeyPackage's private keys from the provider store. Only for
+    /// packages past their lifetime: MLS refuses those, so no Welcome can
+    /// need the keys, and all that is left for them to serve is a snapshot.
+    pub fn delete_key_package(&self, key_package_b64: &str) -> CoreResult<()> {
+        let hash_ref = key_package_hash_ref(&self.provider, key_package_b64)?;
+        delete_stored_key_package(self.provider.storage(), &hash_ref)
+    }
+
+    /// Whether this device's leaf in the group is still the one the
+    /// KeyPackage carried, i.e. whether it joined from that package and has
+    /// not replaced the leaf since.
+    #[cfg(test)]
+    pub fn own_leaf_is_from_key_package(
+        &self,
+        conversation_id: &str,
+        key_package_b64: &str,
+    ) -> CoreResult<bool> {
+        let state = self
+            .groups
+            .get(conversation_id)
+            .ok_or_else(|| CoreError::invalid_input("conversation MLS state does not exist"))?;
+        let own_leaf = state
+            .group
+            .own_leaf_node()
+            .ok_or_else(|| CoreError::invalid_state("own MLS leaf is missing"))?;
+        let key_package = decode_key_package(key_package_b64)?;
+        Ok(own_leaf.encryption_key() == key_package.leaf_node().encryption_key())
+    }
+
+    /// Whether the provider store still holds the private half of this
+    /// KeyPackage.
+    #[cfg(test)]
+    pub fn holds_key_package(&self, key_package_b64: &str) -> CoreResult<bool> {
+        let hash_ref = key_package_hash_ref(&self.provider, key_package_b64)?;
+        Ok(stored_key_package_bundle(self.provider.storage(), &hash_ref)?.is_some())
     }
 
     pub fn own_leaf_key_b64(&self, conversation_id: &str) -> CoreResult<String> {
@@ -2851,6 +2891,39 @@ fn credential_device_id(identity: &str) -> Option<String> {
         return None;
     }
     parts.get(1).map(|device_id| device_id.to_string())
+}
+
+fn key_package_hash_ref(
+    provider: &OpenMlsRustCrypto,
+    key_package_b64: &str,
+) -> CoreResult<KeyPackageRef> {
+    decode_key_package(key_package_b64)?
+        .hash_ref(provider.crypto())
+        .map_err(|error| CoreError::invalid_state(format!("key package hash: {error}")))
+}
+
+/// Generic over the store for the reason given at
+/// [`stored_key_package_bundle`].
+fn delete_stored_key_package<S: openmls::storage::StorageProvider>(
+    storage: &S,
+    hash_ref: &KeyPackageRef,
+) -> CoreResult<()> {
+    storage
+        .delete_key_package(hash_ref)
+        .map_err(|_| CoreError::invalid_state("failed to delete a key package from MLS storage"))
+}
+
+/// Generic over the store so that the storage trait's methods resolve
+/// through `openmls::storage::StorageProvider`, which is all this crate
+/// imports of it.
+#[cfg(test)]
+fn stored_key_package_bundle<S: openmls::storage::StorageProvider>(
+    storage: &S,
+    hash_ref: &KeyPackageRef,
+) -> CoreResult<Option<KeyPackageBundle>> {
+    storage
+        .key_package(hash_ref)
+        .map_err(|_| CoreError::invalid_state("failed to read a key package from MLS storage"))
 }
 
 fn decode_key_package(payload_b64: &str) -> CoreResult<KeyPackage> {

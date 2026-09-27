@@ -397,6 +397,78 @@ impl CoreEngine {
     }
 
     pub(super) fn maintain_local_credentials(&mut self, now_ms: u64) -> CoreResult<CoreOutput> {
+        let swept = self.sweep_expired_key_packages(now_ms)?;
+        let mut output = self.maintain_local_credentials_after_sweep(now_ms)?;
+        if !swept.is_empty() {
+            output.effects.push(persist_effect(&self.state, swept));
+        }
+        Ok(output)
+    }
+
+    /// Delete the private keys of every inventoried KeyPackage that has
+    /// passed its lifetime and the clock-skew margin, and return what must be
+    /// persisted for the deletion to reach disk.
+    ///
+    /// Expiry is the earliest safe moment. MLS refuses an expired package, so
+    /// no Welcome can need its keys any more. Before that, a claimed package
+    /// may still be waiting for its Welcome, and a retired last-resort one is
+    /// still named in contacts' cached bundles; the runtime reports only how
+    /// many pool entries remain, not which.
+    pub(super) fn sweep_expired_key_packages(&mut self, now_ms: u64) -> CoreResult<Vec<PersistOp>> {
+        let Some(adapter) = self.state.mls_adapter.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let advertised = self
+            .state
+            .published_key_package
+            .as_ref()
+            .map(|package| package.key_package_ref.clone());
+        let expired: Vec<String> = self
+            .state
+            .key_package_inventory
+            .iter()
+            .filter(|item| {
+                Some(&item.key_package_ref) != advertised.as_ref()
+                    && now_ms
+                        >= item
+                            .expires_at
+                            .saturating_add(crate::mls_adapter::KEY_PACKAGE_CLOCK_SKEW_MS)
+            })
+            .map(|item| item.key_package_ref.clone())
+            .collect();
+        if expired.is_empty() {
+            return Ok(Vec::new());
+        }
+        for key_package_ref in &expired {
+            let item = self
+                .state
+                .key_package_inventory
+                .iter()
+                .find(|item| &item.key_package_ref == key_package_ref)
+                .ok_or_else(|| CoreError::invalid_state("inventoried key package vanished"))?;
+            adapter.delete_key_package(&item.key_package_b64)?;
+        }
+        self.state
+            .key_package_inventory
+            .retain(|item| !expired.contains(&item.key_package_ref));
+        Ok(self.provider_store_persist_ops())
+    }
+
+    /// What to persist after the provider store changed outside any one
+    /// conversation. The deployment carries the KeyPackage inventory, and the
+    /// store itself while there are no conversations; otherwise one MLS row
+    /// is enough, because a restore takes the newest dump.
+    pub(super) fn provider_store_persist_ops(&self) -> Vec<PersistOp> {
+        let mut ops = vec![PersistOp::SaveDeployment];
+        if let Some(conversation_id) = self.state.mls_summaries.keys().next() {
+            ops.push(PersistOp::SaveMlsState {
+                conversation_id: conversation_id.clone(),
+            });
+        }
+        ops
+    }
+
+    fn maintain_local_credentials_after_sweep(&mut self, now_ms: u64) -> CoreResult<CoreOutput> {
         let timer = CoreEffect::ScheduleTimer {
             timer: TimerEffect {
                 timer_id: "credential_maintenance".into(),
@@ -1048,7 +1120,7 @@ impl CoreEngine {
             .conversations
             .insert(conversation_id.clone(), local_conversation);
         self.assign_initiator_lanes(&conversation_id, c1, c2.clone());
-        self.initialize_direct_pcs_from_mls(&conversation_id)?;
+        self.initialize_direct_pcs_after_create(&conversation_id)?;
         let register_c2 = self.register_accepted_lane(c2)?;
 
         let mut generated = Vec::new();
@@ -3219,12 +3291,37 @@ impl CoreEngine {
             .is_some_and(|state| state.conversation.kind == ConversationKind::Direct)
     }
 
-    /// Called only after locally creating a group or successfully joining a
-    /// Welcome. Either way this device's leaf key is brand new, so the
-    /// rotation clock starts now with no debt.
-    pub(super) fn initialize_direct_pcs_from_mls(
+    /// Called after this device created the group itself. Its leaf key was
+    /// generated for the group, so the rotation clock starts now with no debt.
+    pub(super) fn initialize_direct_pcs_after_create(
         &mut self,
         conversation_id: &str,
+    ) -> CoreResult<()> {
+        self.reset_direct_pcs(conversation_id, false)
+    }
+
+    /// Called after this device joined the group from a Welcome. Its leaf is
+    /// then the one its KeyPackage carried, generated when the package was
+    /// published.
+    ///
+    /// A first join may keep it until the ordinary schedule: exposure up to a
+    /// party's own next rotation is what the ideal allows. A Welcome that
+    /// replaces a session we had is different. We had healed there, and a
+    /// leaf from before a snapshot would re-key the healed session to a key
+    /// the snapshot holds; so the leaf is replaced at once, on the settled
+    /// state of the same turn.
+    pub(super) fn initialize_direct_pcs_after_join(
+        &mut self,
+        conversation_id: &str,
+        replaces_session: bool,
+    ) -> CoreResult<()> {
+        self.reset_direct_pcs(conversation_id, replaces_session)
+    }
+
+    fn reset_direct_pcs(
+        &mut self,
+        conversation_id: &str,
+        leaf_from_key_package: bool,
     ) -> CoreResult<()> {
         if !self.conversation_is_direct(conversation_id) {
             return Ok(());
@@ -3237,6 +3334,7 @@ impl CoreEngine {
             .ok_or_else(|| CoreError::invalid_input("conversation does not exist"))?;
         state.pcs = crate::direct_pcs::DirectPcsState {
             self_rotated_at_ms: Some(now_ms),
+            leaf_from_key_package,
             ..Default::default()
         };
         Ok(())

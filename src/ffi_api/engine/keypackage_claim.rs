@@ -479,9 +479,19 @@ impl CoreEngine {
             .as_ref()
             .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
             .generate_one_time_key_packages(deficit, now_ms)?;
+        // Inventoried so that their private keys can be deleted once they
+        // expire, and persisted so that a restart does not lose the keys the
+        // pool's Welcomes will need.
+        self.state
+            .key_package_inventory
+            .extend(packages.iter().cloned().map(|mut package| {
+                package.state = crate::mls_adapter::PublishedKeyPackageState::Pooled;
+                package
+            }));
+        let persist = persist_effect(&self.state, self.provider_store_persist_ops());
         let effect = self.replenish_key_package_pool_effect(packages)?;
         Ok(CoreOutput {
-            effects: vec![effect],
+            effects: vec![persist, effect],
             ..CoreOutput::default()
         })
     }
