@@ -8686,7 +8686,7 @@ pub(crate) mod tests {
 
     /// The ideal functionality has no interface through which an adversary can
     /// supply a message, so a receiver that reacts observably to one it cannot
-    /// authenticate is distinguishable from it (§1 Remark 1(a)).
+    /// authenticate is distinguishable from it (`rem:integrity` (a)).
     ///
     /// Every vector below is something anyone holding the inbox append
     /// capability can construct. For each, the receiver must: return `Ok`,
@@ -12761,7 +12761,7 @@ pub(crate) mod tests {
         assert_eq!(error.code(), "invalid_state");
     }
 
-    /// **Remark 2 / R1.** The decision test: a party completes a rotation with
+    /// **Unilateral healing, the ideal premise of `sec:corruption` / R1.** The decision test: a party completes a rotation with
     /// the counterparty contributing nothing at all.
     ///
     /// Run from the *non*-designated side, which is the hard case — it is the

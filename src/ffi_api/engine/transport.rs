@@ -3241,7 +3241,7 @@ impl CoreEngine {
                     continue;
                 }
                 // Authenticated evidence, not a rejection: acting on it is not
-                // the trace Remark 1(a) forbids.
+                // the trace `rem:integrity` (a) forbids.
                 InboundFrameResolution::Forked {
                     conversation_id,
                     forked_since_ms,

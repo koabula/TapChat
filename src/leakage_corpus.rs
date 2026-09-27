@@ -1679,7 +1679,7 @@ mod tests {
             Some("3")
         );
 
-        // And nothing at all once it is wrapped, which is the claim tab:inbox
+        // And nothing at all once it is wrapped, which is the claim tab:leak
         // makes about `bytes`.
         let wrapped = crate::lane_wrap::wrap_frame(&[0xA5; 32], &frame).expect("wrap");
         let view = json!({ "bytes": base64::engine::general_purpose::STANDARD.encode(&wrapped) });
