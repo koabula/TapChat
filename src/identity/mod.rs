@@ -297,7 +297,9 @@ impl IdentityManager {
         let unsigned = IdentityBundle {
             version: CURRENT_MODEL_VERSION.to_string(),
             publication_version: 1,
-            publication_revision: local_identity.device_status.updated_at.max(1),
+            // Strictly increasing in `updated_at`, so that every bump of it is
+            // a new revision: a peer takes a bundle only at a higher one.
+            publication_revision: local_identity.device_status.updated_at.saturating_add(1),
             user_id: local_identity.user_identity.user_id.clone(),
             user_public_key: local_identity.user_identity.user_public_key.clone(),
             devices,

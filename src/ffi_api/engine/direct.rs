@@ -1,5 +1,12 @@
 use super::*;
 
+/// See [`CoreEngine::peer_bundle_revision`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PeerBundleRevision {
+    Newer,
+    Held,
+}
+
 impl CoreEngine {
     pub(super) fn import_deployment_bundle(
         &mut self,
@@ -15,7 +22,25 @@ impl CoreEngine {
             .as_ref()
             .is_some_and(|endpoint| endpoint != &bundle.inbox_http_endpoint);
         self.state.deployment_bundle = Some(bundle);
-        self.refresh_local_bundle()?;
+        // A new deployment is new content for a bundle already published, and
+        // a peer accepts a bundle only at a higher revision: at the one it
+        // holds it keeps what it has, so an unchanged revision would leave it
+        // appending to the host this device just left.
+        match self
+            .state
+            .local_bundle
+            .as_ref()
+            .map(|bundle| bundle.updated_at)
+        {
+            Some(previous) => {
+                let updated_at = previous.saturating_add(1);
+                if let Some(identity) = self.state.local_identity.as_mut() {
+                    identity.device_status.updated_at = updated_at;
+                }
+                self.refresh_local_bundle_with_updated_at(updated_at)?;
+            }
+            None => self.refresh_local_bundle()?,
+        }
         let mut output = CoreOutput {
             state_update: CoreStateUpdate {
                 contacts_changed: self.state.local_bundle.is_some(),
@@ -58,10 +83,12 @@ impl CoreEngine {
         relationship_status: ContactRelationshipStatus,
     ) -> CoreResult<CoreOutput> {
         IdentityManager::verify_identity_bundle(&bundle)?;
-        Self::ensure_peer_bundle_not_rolled_back(
-            self.state.contacts.get(&bundle.user_id),
-            &bundle,
-        )?;
+        let bundle =
+            match Self::peer_bundle_revision(self.state.contacts.get(&bundle.user_id), &bundle)? {
+                PeerBundleRevision::Newer => bundle,
+                // The contact is still imported; only the bundle stays as held.
+                PeerBundleRevision::Held => self.state.contacts[&bundle.user_id].bundle.clone(),
+            };
         let user_id = bundle.user_id.clone();
         let original_name = bundle.display_name.clone();
         let now = current_timestamp_hint(self.state.outbox.len());
@@ -127,10 +154,11 @@ impl CoreEngine {
         bundle: IdentityBundle,
     ) -> CoreResult<CoreOutput> {
         IdentityManager::verify_identity_bundle(&bundle)?;
-        Self::ensure_peer_bundle_not_rolled_back(
-            self.state.contacts.get(&bundle.user_id),
-            &bundle,
-        )?;
+        if Self::peer_bundle_revision(self.state.contacts.get(&bundle.user_id), &bundle)?
+            == PeerBundleRevision::Held
+        {
+            return self.replay_pending_and_flush(CoreOutput::default());
+        }
         let user_id = bundle.user_id.clone();
         let affected_conversations = self.affected_conversations_for_peer(&user_id);
 
@@ -197,6 +225,10 @@ impl CoreEngine {
                 self.reconcile_conversation_membership(conversation_id)?,
             );
         }
+        self.replay_pending_and_flush(output)
+    }
+
+    fn replay_pending_and_flush(&mut self, mut output: CoreOutput) -> CoreResult<CoreOutput> {
         if let Some(device_id) = self
             .state
             .local_identity
@@ -208,23 +240,34 @@ impl CoreEngine {
         self.merge_with_transport_flush(output)
     }
 
-    fn ensure_peer_bundle_not_rolled_back(
+    /// Whether a peer bundle is a publication this device has not seen yet.
+    ///
+    /// Only a higher revision is. At the revision already held the holder
+    /// keeps what it has: a host that served an earlier bundle, or anyone
+    /// replaying one signed at the held revision, cannot change it. A lower
+    /// revision is refused outright. A different root key is an identity
+    /// change, which the revision of the old identity does not govern.
+    fn peer_bundle_revision(
         existing: Option<&PersistedContact>,
         incoming: &IdentityBundle,
-    ) -> CoreResult<()> {
+    ) -> CoreResult<PeerBundleRevision> {
         let Some(existing) = existing else {
-            return Ok(());
+            return Ok(PeerBundleRevision::Newer);
         };
         if existing.bundle.user_public_key != incoming.user_public_key {
-            return Ok(());
+            return Ok(PeerBundleRevision::Newer);
         }
-        if incoming.publication_revision < existing.bundle.publication_revision {
-            return Err(CoreError::new(
+        match incoming
+            .publication_revision
+            .cmp(&existing.bundle.publication_revision)
+        {
+            std::cmp::Ordering::Greater => Ok(PeerBundleRevision::Newer),
+            std::cmp::Ordering::Equal => Ok(PeerBundleRevision::Held),
+            std::cmp::Ordering::Less => Err(CoreError::new(
                 "identity_bundle_rolled_back",
                 "identity bundle publication_revision is older than the one already held",
-            ));
+            )),
         }
-        Ok(())
     }
 
     pub(super) fn create_or_load_identity(
@@ -2125,7 +2168,10 @@ impl CoreEngine {
                                 reason: "lane rotation bundle failed verification".into(),
                             };
                         }
-                        if Self::ensure_peer_bundle_not_rolled_back(
+                        // Every rotation announces the same bundle again, so
+                        // the held revision is the ordinary case here, not an
+                        // error; only a lower one is.
+                        if Self::peer_bundle_revision(
                             self.state.contacts.get(&body.bundle.user_id),
                             &body.bundle,
                         )
@@ -3536,11 +3582,51 @@ impl CoreEngine {
             return Ok(CoreOutput::default());
         }
         IdentityManager::verify_identity_bundle(&bundle)?;
-        Self::ensure_peer_bundle_not_rolled_back(
-            self.state.contacts.get(&bundle.user_id),
-            &bundle,
-        )?;
+        let revision =
+            Self::peer_bundle_revision(self.state.contacts.get(&bundle.user_id), &bundle)?;
+        let mut persist_ops = Vec::new();
+        let mut output = CoreOutput::default();
+        // At the held revision the bundle stays as it is; the address the
+        // announcement names is still followed, since the session itself
+        // authenticated it.
+        if revision == PeerBundleRevision::Newer {
+            (persist_ops, output) = self.replace_announced_peer_bundle(bundle)?;
+        }
 
+        let current_outbound = self
+            .state
+            .conversations
+            .get(conversation_id)
+            .and_then(|conversation| conversation.lanes.as_ref())
+            .map(|lanes| lanes.outbound_lane.clone());
+        if current_outbound.as_deref() != Some(inbound_lane.as_str())
+            && self
+                .state
+                .conversations
+                .get(conversation_id)
+                .and_then(|conversation| conversation.lanes.as_ref())
+                .is_some()
+        {
+            self.switch_outbound_lane(conversation_id, inbound_lane)?;
+            output.state_update.conversations_changed = true;
+            persist_ops.push(PersistOp::SaveConversation {
+                conversation_id: conversation_id.to_string(),
+            });
+        }
+        if !persist_ops.is_empty() {
+            output
+                .effects
+                .insert(0, persist_effect(&self.state, persist_ops));
+        }
+        Ok(output)
+    }
+
+    /// Store an announced bundle of a higher revision, and reconcile the
+    /// conversations it concerns if its devices changed.
+    fn replace_announced_peer_bundle(
+        &mut self,
+        bundle: IdentityBundle,
+    ) -> CoreResult<(Vec<PersistOp>, CoreOutput)> {
         let previous_devices = self
             .state
             .contacts
@@ -3589,7 +3675,7 @@ impl CoreEngine {
             .contacts
             .insert(user_id.clone(), persisted_contact);
 
-        let mut persist_ops = vec![PersistOp::SaveContact {
+        let persist_ops = vec![PersistOp::SaveContact {
             user_id: user_id.clone(),
         }];
         let mut output = CoreOutput {
@@ -3611,31 +3697,7 @@ impl CoreEngine {
                 output = merge_outputs(output, self.reconcile_conversation_membership(affected)?);
             }
         }
-
-        let current_outbound = self
-            .state
-            .conversations
-            .get(conversation_id)
-            .and_then(|conversation| conversation.lanes.as_ref())
-            .map(|lanes| lanes.outbound_lane.clone());
-        if current_outbound.as_deref() != Some(inbound_lane.as_str())
-            && self
-                .state
-                .conversations
-                .get(conversation_id)
-                .and_then(|conversation| conversation.lanes.as_ref())
-                .is_some()
-        {
-            self.switch_outbound_lane(conversation_id, inbound_lane)?;
-            output.state_update.conversations_changed = true;
-            persist_ops.push(PersistOp::SaveConversation {
-                conversation_id: conversation_id.to_string(),
-            });
-        }
-        output
-            .effects
-            .insert(0, persist_effect(&self.state, persist_ops));
-        Ok(output)
+        Ok((persist_ops, output))
     }
 
     fn relocate_inbound_lanes(&mut self) -> CoreResult<CoreOutput> {

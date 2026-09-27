@@ -7029,8 +7029,12 @@ pub(crate) mod tests {
         )));
 
         // Bob's bundle now names a laptop instead of the phone the
-        // conversation was set up with.
-        let updated_bundle = sample_identity_bundle(BOB_MNEMONIC, "laptop");
+        // conversation was set up with, in a new publication.
+        let updated_bundle = sample_identity_bundle_at_revision(
+            BOB_MNEMONIC,
+            "laptop",
+            bob_bundle.publication_revision + 1,
+        );
         let laptop_device_id = updated_bundle.devices[0].device_id.clone();
         let response = alice
             .handle_event(CoreEvent::IdentityBundleFetched {
@@ -10480,8 +10484,10 @@ pub(crate) mod tests {
         let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
         let bob_root = IdentityManager::recover_user_root(BOB_MNEMONIC).expect("bob root");
-        let bob_laptop = IdentityManager::create_new_device_for_user(&bob_root, None)
+        let mut bob_laptop = IdentityManager::create_new_device_for_user(&bob_root, None)
             .expect("bob laptop identity");
+        // A new publication: a peer takes a bundle only at a higher revision.
+        bob_laptop.device_status.updated_at = bob_bundle.updated_at + 1;
         let bob_phone_profile = bob_bundle.devices[0].clone();
         let bob_laptop_package =
             MlsAdapter::generate_key_package(&bob_laptop, test_now_ms()).expect("laptop package");
@@ -10528,8 +10534,10 @@ pub(crate) mod tests {
         let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
 
         let bob_root = IdentityManager::recover_user_root(BOB_MNEMONIC).expect("bob root");
-        let bob_laptop = IdentityManager::create_new_device_for_user(&bob_root, None)
+        let mut bob_laptop = IdentityManager::create_new_device_for_user(&bob_root, None)
             .expect("bob laptop identity");
+        // A new publication: a peer takes a bundle only at a higher revision.
+        bob_laptop.device_status.updated_at = bob_bundle.updated_at + 1;
         let bob_phone_profile = bob_bundle.devices[0].clone();
         let bob_laptop_package =
             MlsAdapter::generate_key_package(&bob_laptop, test_now_ms()).expect("laptop package");
@@ -10614,6 +10622,9 @@ pub(crate) mod tests {
         let conversation_id = create_direct_conversation(&mut alice, active_bundle.user_id.clone());
 
         bob_phone_profile.status = crate::model::DeviceStatusKind::Revoked;
+        // A new publication: a peer takes a bundle only at a higher revision.
+        let mut bob_laptop = bob_laptop;
+        bob_laptop.device_status.updated_at += 1;
         let revoked_bundle = IdentityManager::export_identity_bundle_with_devices(
             &bob_laptop,
             &deployment,
@@ -10656,8 +10667,10 @@ pub(crate) mod tests {
         let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
 
         let bob_root = IdentityManager::recover_user_root(BOB_MNEMONIC).expect("bob root");
-        let bob_laptop = IdentityManager::create_new_device_for_user(&bob_root, None)
+        let mut bob_laptop = IdentityManager::create_new_device_for_user(&bob_root, None)
             .expect("bob laptop identity");
+        // A new publication: a peer takes a bundle only at a higher revision.
+        bob_laptop.device_status.updated_at = bob_bundle.updated_at + 1;
         let bob_phone_profile = bob_bundle.devices[0].clone();
         let bob_laptop_package =
             MlsAdapter::generate_key_package(&bob_laptop, test_now_ms()).expect("laptop package");
@@ -10699,8 +10712,10 @@ pub(crate) mod tests {
         let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
 
         let bob_root = IdentityManager::recover_user_root(BOB_MNEMONIC).expect("bob root");
-        let bob_laptop = IdentityManager::create_new_device_for_user(&bob_root, None)
+        let mut bob_laptop = IdentityManager::create_new_device_for_user(&bob_root, None)
             .expect("bob laptop identity");
+        // A new publication: a peer takes a bundle only at a higher revision.
+        bob_laptop.device_status.updated_at = bob_bundle.updated_at + 1;
         let bob_phone_profile = bob_bundle.devices[0].clone();
         let bob_laptop_package =
             MlsAdapter::generate_key_package(&bob_laptop, test_now_ms()).expect("laptop package");
@@ -13352,6 +13367,108 @@ pub(crate) mod tests {
                 .forked_since_ms,
             None
         );
+    }
+
+    /// **An old bundle cannot undo a relocation.** The operator B moved away
+    /// from still holds B's previous bundle, validly signed by B's root key.
+    /// When A re-reads B's bundle (after a refused append, say), that operator
+    /// can serve it; A must not move back.
+    #[test]
+    fn an_old_bundle_cannot_undo_a_relocation() {
+        let mut chat = paired_direct_chat();
+        let bob_user_id = chat
+            .bob
+            .state
+            .local_identity
+            .as_ref()
+            .expect("bob identity")
+            .user_identity
+            .user_id
+            .clone();
+        let old_bundle = chat.alice.state.contacts[&bob_user_id].bundle.clone();
+
+        let mut relocated = sample_deployment();
+        relocated.inbox_http_endpoint = "https://bob-new.example.test".into();
+        relocated.inbox_websocket_endpoint = "wss://bob-new.example.test/ws".into();
+        relocated.runtime_id = "runtime:bob-new".into();
+        relocated.runtime_config.identity_bundle_ref =
+            Some("https://bob-new.example.test/state/identity.json".into());
+        relocated.storage_base_info.base_url = Some("https://bob-new-storage.example.test".into());
+        chat.bob
+            .handle_command(CoreCommand::ImportDeploymentBundle { bundle: relocated })
+            .expect("bob relocates");
+        deliver_pending_outbox_to_device(&mut chat.alice, &chat.bob, &chat.alice_device_id);
+        let bob_inbox_at_alice = |engine: &CoreEngine| {
+            engine.state.contacts[&bob_user_id]
+                .bundle
+                .devices
+                .first()
+                .and_then(|device| device.inbox_append_capability.as_ref())
+                .map(|capability| capability.endpoint.clone())
+                .expect("bob inbox endpoint")
+        };
+        assert!(
+            bob_inbox_at_alice(&chat.alice).contains("bob-new.example.test"),
+            "premise: A follows the relocation"
+        );
+        let new_revision = chat.alice.state.contacts[&bob_user_id]
+            .bundle
+            .publication_revision;
+
+        let replay = chat
+            .alice
+            .handle_command(CoreCommand::ApplyIdentityBundleUpdate {
+                bundle: old_bundle.clone(),
+            });
+        let endpoint = bob_inbox_at_alice(&chat.alice);
+        assert!(
+            endpoint.contains("bob-new.example.test"),
+            "the pre-move bundle (revision {}) moved A back to {endpoint} after the move \
+             (revision {new_revision}); replay result: {:?}",
+            old_bundle.publication_revision,
+            replay.as_ref().err().map(|error| error.code().to_string()),
+        );
+    }
+
+    /// **At the revision A holds, A keeps what it has.** A second bundle
+    /// signed by B's root at the same revision, differing in content, is not
+    /// a publication A has not seen yet, whichever way it arrives.
+    #[test]
+    fn a_bundle_at_the_held_revision_changes_nothing() {
+        let held = sample_identity_bundle_at_revision(BOB_MNEMONIC, "phone", 2);
+        let rival = sample_identity_bundle_at_revision(BOB_MNEMONIC, "phone", 2);
+        assert_eq!(held.user_public_key, rival.user_public_key);
+        assert_ne!(
+            held.devices, rival.devices,
+            "premise: same root and revision, different content"
+        );
+        let mut alice = local_engine(ALICE_MNEMONIC, "phone");
+        alice
+            .handle_command(CoreCommand::ImportIdentityBundle {
+                bundle: held.clone(),
+            })
+            .expect("import");
+        let held_bundle = |engine: &CoreEngine| engine.state.contacts[&held.user_id].bundle.clone();
+
+        alice
+            .handle_command(CoreCommand::ImportIdentityBundle {
+                bundle: rival.clone(),
+            })
+            .expect("import at the held revision");
+        assert_eq!(held_bundle(&alice), held, "contact import");
+        alice
+            .handle_command(CoreCommand::ApplyIdentityBundleUpdate {
+                bundle: rival.clone(),
+            })
+            .expect("update at the held revision");
+        assert_eq!(held_bundle(&alice), held, "bundle update");
+        alice
+            .handle_event(CoreEvent::IdentityBundleFetched {
+                user_id: held.user_id.clone(),
+                bundle: rival,
+            })
+            .expect("re-read at the held revision");
+        assert_eq!(held_bundle(&alice), held, "bundle re-read");
     }
 
     fn answer_key_package_claims(
