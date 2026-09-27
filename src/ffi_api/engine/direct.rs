@@ -2959,6 +2959,14 @@ impl CoreEngine {
             })
             .collect();
 
+        // No commit of this session can be raced any more.
+        let abandoned = self
+            .state
+            .conversations
+            .get_mut(conversation_id)
+            .map(|state| std::mem::take(&mut state.pcs.pending_commits))
+            .unwrap_or_default();
+        self.discard_pending_commits(abandoned);
         if let Some(ref mut mls_adapter) = self.state.mls_adapter {
             mls_adapter.delete_group(conversation_id)?;
         }
@@ -3355,28 +3363,29 @@ impl CoreEngine {
     }
 
     /// Called after this device joined the group from a Welcome. Its leaf is
-    /// then the one its KeyPackage carried, generated when the package was
-    /// published.
+    /// then the one the KeyPackage carried.
     ///
-    /// A first join may keep it until the ordinary schedule: exposure up to a
-    /// party's own next rotation is what the ideal allows. A Welcome that
-    /// replaces a session we had is different. We had healed there, and a
-    /// leaf from before a snapshot would re-key the healed session to a key
-    /// the snapshot holds; so the leaf is replaced at once, on the settled
-    /// state of the same turn.
+    /// Whether that leaf may stay until the ordinary schedule depends on how
+    /// old it is against our own healing, which the caller knows:
+    /// - a first join may keep it: exposure up to a party's own next rotation
+    ///   is what the ideal allows;
+    /// - a race re-entry joins us from the fresh package our winning commit
+    ///   carried, as new as that rotation, so it may keep it too, unless we
+    ///   rotated again before the rebuild arrived and joining undid that;
+    /// - a peer's reset joins us from a published package, possibly older
+    ///   than a snapshot, after we had healed in the session it replaces.
+    ///
+    /// `rotate_now` replaces the leaf at once, on the settled state of the
+    /// same turn.
     pub(super) fn initialize_direct_pcs_after_join(
         &mut self,
         conversation_id: &str,
-        replaces_session: bool,
+        rotate_now: bool,
     ) -> CoreResult<()> {
-        self.reset_direct_pcs(conversation_id, replaces_session)
+        self.reset_direct_pcs(conversation_id, rotate_now)
     }
 
-    fn reset_direct_pcs(
-        &mut self,
-        conversation_id: &str,
-        leaf_from_key_package: bool,
-    ) -> CoreResult<()> {
+    fn reset_direct_pcs(&mut self, conversation_id: &str, rotate_now: bool) -> CoreResult<()> {
         if !self.conversation_is_direct(conversation_id) {
             return Ok(());
         }
@@ -3386,12 +3395,48 @@ impl CoreEngine {
             .conversations
             .get_mut(conversation_id)
             .ok_or_else(|| CoreError::invalid_input("conversation does not exist"))?;
-        state.pcs = crate::direct_pcs::DirectPcsState {
-            self_rotated_at_ms: Some(now_ms),
-            leaf_from_key_package,
-            ..Default::default()
-        };
+        // The group those commits were pending in is gone.
+        let abandoned = std::mem::replace(
+            &mut state.pcs,
+            crate::direct_pcs::DirectPcsState {
+                self_rotated_at_ms: Some(now_ms),
+                rotate_now,
+                ..Default::default()
+            },
+        )
+        .pending_commits;
+        self.discard_pending_commits(abandoned);
         Ok(())
+    }
+
+    /// The peer was seen in `peer_epoch`: our commits that created that epoch
+    /// or an earlier one are no longer pending, and what they kept for a race
+    /// goes. The KeyPackage matters most: while its private keys exist, a
+    /// snapshot could open a re-entry to it.
+    pub(super) fn resolve_direct_pending(&mut self, conversation_id: &str, peer_epoch: u64) {
+        let resolved = self
+            .state
+            .conversations
+            .get_mut(conversation_id)
+            .map(|state| state.pcs.resolve_pending(peer_epoch))
+            .unwrap_or_default();
+        self.discard_pending_commits(resolved);
+    }
+
+    fn discard_pending_commits(&mut self, commits: Vec<PendingCommit>) {
+        let Some(adapter) = self.state.mls_adapter.as_ref() else {
+            return;
+        };
+        for key_package_b64 in commits
+            .iter()
+            .filter_map(|own| own.key_package_b64.as_deref())
+        {
+            // A package a Welcome consumed is already gone; deleting it again
+            // is a no-op.
+            if let Err(error) = adapter.delete_key_package(key_package_b64) {
+                log::warn!("discard_pending_commits: {error}");
+            }
+        }
     }
 
     /// Count one application message against this device's rotation debt.
@@ -3483,6 +3528,7 @@ impl CoreEngine {
         let recipient_device_ids = self.recipient_device_ids(conversation_id)?;
         let outbound_prev = self.export_outbound_commit_wrap_key(conversation_id)?;
         let inbound_prev = self.capture_previous_inbound_wrap(conversation_id)?;
+        let inbound_commit_key = inbound_prev.as_ref().and_then(|wrap| wrap.commit_key);
         let rotated = self
             .state
             .mls_adapter
@@ -3501,11 +3547,13 @@ impl CoreEngine {
             .insert(conversation_id.to_string(), summary);
         if let Some(state) = self.state.conversations.get_mut(conversation_id) {
             state.pcs.mark_rotated(
-                OwnCommit {
+                PendingCommit {
                     base_epoch: rotated.base_epoch,
                     commit_hash: rotated.commit_hash,
                     won_arbitration: is_designated,
                     wrap_key: Some(outbound_prev),
+                    inbound_key: inbound_commit_key,
+                    key_package_b64: Some(rotated.key_package_b64),
                 },
                 now_ms,
             );
@@ -3739,14 +3787,15 @@ impl CoreEngine {
         Ok(output)
     }
 
-    /// Arbitrate an inbound commit against our own commit for the same base
-    /// epoch. `None` means there is no collision and the caller should take
-    /// the ordinary ingest path.
+    /// Arbitrate an inbound commit against a pending commit of ours on the
+    /// same base epoch. `None` means there is no collision and the caller
+    /// should take the ordinary ingest path.
     ///
-    /// Reachable only when *we* committed at that epoch, and only for a record
-    /// the inbound gate already bound to an established contact's device key —
-    /// so it cannot be manufactured, and a replay of some older commit carries
-    /// the wrong base epoch.
+    /// Reachable only when *we* committed at that epoch and the peer has not
+    /// been seen to follow, and only for a record the inbound gate already
+    /// bound to an established contact's device key — so it cannot be
+    /// manufactured, and a replay of some older commit carries the wrong base
+    /// epoch.
     pub(super) fn direct_pcs_arbitration(
         &mut self,
         conversation_id: &str,
@@ -3756,7 +3805,7 @@ impl CoreEngine {
         if !self.conversation_is_direct(conversation_id) {
             return Ok(None);
         }
-        let verdict = self
+        let Some(own) = self
             .state
             .conversations
             .get(conversation_id)
@@ -3764,71 +3813,103 @@ impl CoreEngine {
                 state
                     .pcs
                     .arbitrate(incoming.base_epoch, &incoming.commit_hash)
-            });
-        match verdict {
-            None => Ok(None),
-            // We won. The peer will find our commit, lose, and rebuild; its
+                    .cloned()
+            })
+        else {
+            return Ok(None);
+        };
+        if own.won_arbitration {
+            // We won. The peer will find our commit, lose, and re-enter by a
+            // new group built to the KeyPackage our commit carried; its
             // Welcome will come wrapped under the key its losing commit came
             // under, which is the only thing that tells it from a Welcome a
-            // stolen device key signed. Remember that key.
+            // stolen device key signed. Remember that key and that package.
             //
             // The losing commit is also the peer's one signature on this
             // epoch, so it is witnessed like a merged one: a replay of it is
             // the same commit, and only a different one is a double sign.
-            Some(true) => {
-                log::warn!(
-                    "direct_pcs_arbitration: discarding a commit that lost to ours in conversation {}",
-                    redact_id("conversation", conversation_id)
-                );
-                self.record_peer_commit_witness(
-                    conversation_id,
-                    incoming,
-                    incoming.wrap_key,
-                    received_at_ms,
-                );
-                let now_ms = current_unix_millis(self.state.message_nonce);
-                if let Some(state) = self.state.conversations.get_mut(conversation_id) {
-                    state.rebuild.expected = Some(crate::direct_rebuild::ExpectedRebuild {
-                        device_id: incoming.device_id.clone(),
-                        key: incoming.wrap_key,
-                        at_ms: now_ms,
-                    });
-                }
-                Ok(Some(CoreOutput {
-                    effects: vec![persist_effect(
-                        &self.state,
-                        vec![PersistOp::SaveConversation {
-                            conversation_id: conversation_id.to_string(),
-                        }],
-                    )],
-                    ..CoreOutput::default()
-                }))
+            log::warn!(
+                "direct_pcs_arbitration: discarding a commit that lost to ours in conversation {}",
+                redact_id("conversation", conversation_id)
+            );
+            self.record_peer_commit_witness(
+                conversation_id,
+                incoming,
+                incoming.wrap_key,
+                received_at_ms,
+            );
+            let now_ms = current_unix_millis(self.state.message_nonce);
+            if let Some(state) = self.state.conversations.get_mut(conversation_id) {
+                state.rebuild.expected = Some(crate::direct_rebuild::ExpectedRebuild {
+                    device_id: incoming.device_id.clone(),
+                    key: incoming.wrap_key,
+                    at_ms: now_ms,
+                    key_package_b64: own.key_package_b64.clone(),
+                });
             }
-            // We lost. Our own commit for this epoch is already merged and
-            // openmls cannot un-merge, so the only route back to a shared
-            // group is to rebuild it. `rebuild_conversation` only tears down,
-            // so the re-bootstrap is driven in the same turn: a collision
-            // nobody asked for must not leave the conversation dead waiting
-            // for the user to press repair.
-            Some(false) => {
-                log::warn!(
-                    "direct_pcs_arbitration: lost a same-epoch commit race, rebuilding conversation {}",
-                    redact_id("conversation", conversation_id)
-                );
-                if let Some(state) = self.state.conversations.get_mut(conversation_id) {
-                    state.rebuild.wrap_out =
-                        state.pcs.own_commit.as_ref().and_then(|own| own.wrap_key);
-                }
-                let torn_down = self.escalate_conversation_to_rebuild(
-                    conversation_id,
-                    RecoveryEscalationReason::PcsCommitRace,
-                    "direct PCS commit lost a same-epoch race with the peer",
-                )?;
-                let rebuilt =
-                    self.reconcile_conversation_membership(conversation_id.to_string())?;
-                Ok(Some(merge_outputs(torn_down, rebuilt)))
-            }
+            return Ok(Some(CoreOutput {
+                effects: vec![persist_effect(
+                    &self.state,
+                    vec![PersistOp::SaveConversation {
+                        conversation_id: conversation_id.to_string(),
+                    }],
+                )],
+                ..CoreOutput::default()
+            }));
         }
+        // We lost. Our own commit for this epoch is already merged and
+        // openmls cannot un-merge, and we never held the winning epoch, so the
+        // only route back to a shared group is to re-enter: a new group built
+        // to the KeyPackage the winning commit carried, which is fresh and
+        // whose private keys only the winner holds. Nothing the host hands
+        // out is consulted. The package is checked before anything is torn
+        // down: a commit without a usable one cannot be re-entered to, and is
+        // dropped rather than leaving this side without a session.
+        let peer_user_id = self.peer_user_for_conversation(conversation_id)?;
+        let reentry = incoming
+            .key_package_b64
+            .clone()
+            .and_then(|key_package_b64| {
+                let device_public_key = self
+                    .trusted_device_public_key(&peer_user_id, &incoming.device_id)
+                    .ok()?;
+                let peer = crate::mls_adapter::PeerDeviceKeyPackage {
+                    user_id: peer_user_id.clone(),
+                    device_id: incoming.device_id.clone(),
+                    device_public_key,
+                    key_package_b64,
+                };
+                crate::mls_adapter::MlsAdapter::validate_peer_key_package(&peer).ok()?;
+                Some(crate::direct_rebuild::ReentryTarget {
+                    device_id: peer.device_id,
+                    key_package_b64: peer.key_package_b64,
+                })
+            });
+        let Some(reentry) = reentry else {
+            log::warn!(
+                "direct_pcs_arbitration: a winning commit without a usable KeyPackage in conversation {}; dropped",
+                redact_id("conversation", conversation_id)
+            );
+            return Ok(Some(CoreOutput::default()));
+        };
+        log::warn!(
+            "direct_pcs_arbitration: lost a same-epoch commit race, re-entering conversation {}",
+            redact_id("conversation", conversation_id)
+        );
+        if let Some(state) = self.state.conversations.get_mut(conversation_id) {
+            state.rebuild.wrap_out = own.wrap_key;
+            state.rebuild.reentry = Some(reentry);
+        }
+        // `escalate_conversation_to_rebuild` only tears down, so the re-entry
+        // is driven in the same turn: a collision nobody asked for must not
+        // leave the conversation dead waiting for the user to press repair.
+        let torn_down = self.escalate_conversation_to_rebuild(
+            conversation_id,
+            RecoveryEscalationReason::PcsCommitRace,
+            "direct PCS commit lost a same-epoch race with the peer",
+        )?;
+        let rebuilt = self.reconcile_conversation_membership(conversation_id.to_string())?;
+        Ok(Some(merge_outputs(torn_down, rebuilt)))
     }
 
     pub(super) fn conversation_is_compromised(&self, conversation_id: &str) -> bool {

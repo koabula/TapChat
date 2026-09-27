@@ -30,7 +30,7 @@ use crate::conversation::{
     direct_conversation_id, ConversationArchiveMetadata, ConversationManager,
     LocalConversationState, ReconcileMembershipInput, RecoveryStatus, StoredMessage,
 };
-use crate::direct_pcs::{designated_committer, OwnCommit};
+use crate::direct_pcs::{designated_committer, PendingCommit};
 use crate::error::{CoreError, CoreResult};
 use crate::ffi_api::types::*;
 use crate::identity::IdentityManager;

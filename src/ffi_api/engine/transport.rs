@@ -3269,6 +3269,7 @@ impl CoreEngine {
             let inbound_payload_b64 = resolved.payload_b64.clone();
             let inbound_peer_user_id = resolved.peer_user_id.clone();
             let welcome_author = resolved.welcome_author.clone();
+            let welcome_admission = resolved.welcome_admission;
             let authenticated_commit = resolved.authenticated_commit.clone();
             if self.should_ignore_closed_relationship_record(&local_user_id, &record) {
                 log::info!(
@@ -3314,6 +3315,13 @@ impl CoreEngine {
                     )? {
                         IngestResult::AppliedApplication(application) => {
                             touched_conversation_ids.insert(conversation_id.clone());
+                            // The peer wrote from this epoch, so it followed
+                            // every commit of ours that created it or an
+                            // earlier one.
+                            if let Ok(epoch) = MlsAdapter::protocol_message_epoch(inline_ciphertext)
+                            {
+                                self.resolve_direct_pending(&conversation_id, epoch);
+                            }
                             log::info!(
                                 "handle_inbox_records: AppliedApplication for message {}, plaintext len={}",
                                 redact_id("msg", &record.message_id),
@@ -3779,18 +3787,19 @@ impl CoreEngine {
                                         epoch
                                     );
                                     // To merge, this commit had to match our live
-                                    // epoch, which is already past the base epoch
-                                    // of our own commit — the peer moved on and can
+                                    // epoch, which every commit of ours created or
+                                    // passed — the peer followed them all and can
                                     // no longer race us there. Closes the
                                     // arbitration window, and deliberately leaves
                                     // our rotation debt alone: a peer commit does
                                     // not replace our leaf key, so it heals nothing
                                     // of ours.
-                                    if let Some(state) =
-                                        self.state.conversations.get_mut(&conversation_id)
-                                    {
-                                        state.pcs.clear_own_commit();
-                                    }
+                                    self.resolve_direct_pending(
+                                        &conversation_id,
+                                        authenticated_commit
+                                            .as_ref()
+                                            .map_or(u64::MAX, |commit| commit.base_epoch),
+                                    );
                                     if let Ok(summary) = self
                                         .state
                                         .mls_adapter
@@ -3897,7 +3906,9 @@ impl CoreEngine {
                                     }
                                     self.initialize_direct_pcs_after_join(
                                         &conversation_id,
-                                        replaces_session,
+                                        welcome_admission.map_or(replaces_session, |admission| {
+                                            admission.rotate_now()
+                                        }),
                                     )?;
                                     self.record_authenticated_inbound(
                                         &conversation_id,

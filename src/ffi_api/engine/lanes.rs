@@ -256,18 +256,20 @@ impl CoreEngine {
         adapter.export_commit_wrap_key(conversation_id, dir)
     }
 
-    /// The frame under one of the current or previous epoch's keys, the key
-    /// that opened it, and which of the epoch's two keys that was.
+    /// The frame under one of the current or previous epoch's keys, or the
+    /// commit key of a base epoch one of our pending commits built on; the
+    /// key that opened it; and which of an epoch's two keys that was.
+    ///
+    /// A pending commit's key reaches further back than the window: a rival
+    /// commit on its base epoch, and the loser's rebuild Welcome after it,
+    /// may arrive after this device has rotated again.
     fn open_inbound_frame(
         &self,
         conversation_id: &str,
         payload_b64: &str,
     ) -> Option<(Vec<u8>, [u8; lane_wrap::WRAP_KEY_LEN], WrapKind)> {
-        let lanes = self
-            .state
-            .conversations
-            .get(conversation_id)
-            .and_then(|conversation| conversation.lanes.as_ref())?;
+        let conversation = self.state.conversations.get(conversation_id)?;
+        let lanes = conversation.lanes.as_ref()?;
         let adapter = self.state.mls_adapter.as_ref()?;
         if !adapter.has_conversation(conversation_id) {
             return None;
@@ -276,6 +278,12 @@ impl CoreEngine {
         let current = adapter.export_lane_wrap_key(conversation_id, dir).ok()?;
         let current_commit = adapter.export_commit_wrap_key(conversation_id, dir).ok()?;
         let previous = lanes.wrap_prev.as_ref();
+        let pending = conversation
+            .pcs
+            .pending_commits
+            .iter()
+            .filter_map(|own| own.inbound_key)
+            .map(|key| Some((key, WrapKind::Commit)));
         let wrapped = STANDARD.decode(payload_b64).ok()?;
         [
             Some((current, WrapKind::Frame)),
@@ -286,6 +294,7 @@ impl CoreEngine {
                 .map(|key| (key, WrapKind::Commit)),
         ]
         .into_iter()
+        .chain(pending)
         .flatten()
         .find_map(|(key, kind)| {
             lane_wrap::unwrap_frame(&key, &wrapped).map(|frame| (frame, key, kind))
@@ -418,6 +427,7 @@ impl CoreEngine {
                     message_type,
                     payload_b64: mls_b64,
                     welcome_author: None,
+                    welcome_admission: None,
                     authenticated_commit,
                 }));
             }
@@ -473,28 +483,66 @@ impl CoreEngine {
         if lane_conversation.is_some_and(|lane| lane != inspection.conversation_id) {
             return Ok(InboundFrameResolution::Rejected);
         }
-        if let Some(existing) = self.state.conversations.get(&inspection.conversation_id) {
-            let now_ms = current_unix_millis(self.state.message_nonce);
-            let admitted = existing.peer_user_id == inspection.author_user_id
-                && existing.conversation.state != ConversationState::Compromised
-                && match wrapped_under {
-                    Some(key) => existing
-                        .rebuild
-                        .admits_wrapped(key, &author.device_id, now_ms),
-                    None => existing.rebuild.awaits_peer_welcome,
-                };
-            if !admitted {
+        let admission =
+            if let Some(existing) = self.state.conversations.get(&inspection.conversation_id) {
+                let now_ms = current_unix_millis(self.state.message_nonce);
+                if existing.peer_user_id != inspection.author_user_id
+                    || existing.conversation.state == ConversationState::Compromised
+                {
+                    return Ok(InboundFrameResolution::Rejected);
+                }
+                match wrapped_under {
+                    Some(key) => {
+                        if !existing
+                            .rebuild
+                            .admits_wrapped(key, &author.device_id, now_ms)
+                        {
+                            return Ok(InboundFrameResolution::Rejected);
+                        }
+                        // Only a rebuild built to the KeyPackage our winning
+                        // commit carried: any other package of ours may be older
+                        // than a snapshot, and joining from it would undo the
+                        // rotation we won with.
+                        let Some(key_package_b64) = existing
+                            .rebuild
+                            .expected
+                            .as_ref()
+                            .and_then(|expected| expected.key_package_b64.as_deref())
+                        else {
+                            return Ok(InboundFrameResolution::Rejected);
+                        };
+                        if !adapter
+                            .welcome_targets_key_package(payload_b64, key_package_b64)
+                            .unwrap_or(false)
+                        {
+                            return Ok(InboundFrameResolution::Rejected);
+                        }
+                        let winning_epoch = existing
+                            .pcs
+                            .pending_commits
+                            .iter()
+                            .find(|own| own.key_package_b64.as_deref() == Some(key_package_b64))
+                            .map(|own| own.base_epoch);
+                        WelcomeAdmission::RaceReentry {
+                            rotated_again: winning_epoch
+                                .is_none_or(|epoch| existing.pcs.rotated_since(epoch)),
+                        }
+                    }
+                    None if existing.rebuild.awaits_peer_welcome => WelcomeAdmission::PeerReset,
+                    None => return Ok(InboundFrameResolution::Rejected),
+                }
+            } else if wrapped_under.is_some() {
                 return Ok(InboundFrameResolution::Rejected);
-            }
-        } else if wrapped_under.is_some() {
-            return Ok(InboundFrameResolution::Rejected);
-        }
+            } else {
+                WelcomeAdmission::FirstContact
+            };
         Ok(InboundFrameResolution::Ready(ResolvedInbound {
             conversation_id: inspection.conversation_id,
             peer_user_id: inspection.author_user_id,
             message_type: MessageType::MlsWelcome,
             payload_b64: payload_b64.to_string(),
             welcome_author: Some(author),
+            welcome_admission: Some(admission),
             authenticated_commit: None,
         }))
     }
@@ -614,6 +662,7 @@ impl CoreEngine {
                     commit_hash: crate::direct_frame::commit_hash(&digest),
                     device_id,
                     wrap_key,
+                    key_package_b64: MlsAdapter::commit_key_package(payload_b64),
                 });
             }
         }
@@ -674,12 +723,39 @@ impl CoreEngine {
     }
 }
 
+/// How a Welcome was admitted, which decides how old the leaf it gives us
+/// may be; see [`CoreEngine::initialize_direct_pcs_after_join`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum WelcomeAdmission {
+    FirstContact,
+    /// A race loser's rebuild, to the KeyPackage our winning commit carried.
+    /// `rotated_again`: we committed again after that commit, and joining
+    /// abandons the later rotation.
+    RaceReentry {
+        rotated_again: bool,
+    },
+    /// The peer's rebuild while our group was gone to a local fault.
+    PeerReset,
+}
+
+impl WelcomeAdmission {
+    /// Whether the leaf this join gives us must be replaced at once.
+    pub(super) fn rotate_now(self) -> bool {
+        match self {
+            Self::FirstContact => false,
+            Self::RaceReentry { rotated_again } => rotated_again,
+            Self::PeerReset => true,
+        }
+    }
+}
+
 pub(super) struct ResolvedInbound {
     pub conversation_id: String,
     pub peer_user_id: String,
     pub message_type: MessageType,
     pub payload_b64: String,
     pub welcome_author: Option<WelcomeAuthor>,
+    pub welcome_admission: Option<WelcomeAdmission>,
     pub authenticated_commit: Option<crate::direct_frame::AuthenticatedDirectCommit>,
 }
 

@@ -12953,8 +12953,7 @@ pub(crate) mod tests {
         assert_eq!(
             rotator_engine(&chat, victim).state.conversations[&conversation_id]
                 .pcs
-                .own_commit
-                .as_ref()
+                .own_commit()
                 .expect("victim's own commit")
                 .base_epoch,
             snapshot_epoch,
@@ -13136,49 +13135,20 @@ pub(crate) mod tests {
         );
         let losing_key = peer_engine(&chat, alice_is_winner).state.conversations[&conversation_id]
             .pcs
-            .own_commit
-            .as_ref()
+            .own_commit()
             .and_then(|own| own.wrap_key)
             .expect("the losing commit's key");
-        let output = deliver_inbox_envelope(
+        deliver_inbox_envelope(
             peer_engine_mut(&mut chat, alice_is_winner),
             &loser_device,
             winner_commit,
             50_001,
-        );
-        // The winner joined the first group with its published KeyPackage and
-        // has rotated it since, so the claim is answered with the current one.
-        let key_package = rotator_engine(&chat, alice_is_winner)
-            .state
-            .published_key_package
-            .as_ref()
-            .expect("winner's current key package")
-            .key_package_b64
-            .clone();
-        answer_key_package_claims(
-            peer_engine_mut(&mut chat, alice_is_winner),
-            output,
-            &key_package,
         );
         let welcome = rebuild_welcome(peer_engine(&chat, alice_is_winner), &losing_key);
         deliver_inbox_envelope(
             rotator_engine_mut(&mut chat, alice_is_winner),
             &winner_device,
             welcome,
-            50_002,
-        );
-        // Joining replaced the winner's session, so it replaced the leaf the
-        // Welcome admitted at once. An honest commit like this must not look
-        // like a fork either.
-        let joined_commit = last_pending_envelope(
-            rotator_engine(&chat, alice_is_winner),
-            &loser_device,
-            MessageType::MlsCommit,
-        );
-        deliver_inbox_envelope(
-            peer_engine_mut(&mut chat, alice_is_winner),
-            &loser_device,
-            joined_commit,
             50_002,
         );
         // The rebuilder stays fail-closed until it hears from the peer.
@@ -13239,8 +13209,8 @@ pub(crate) mod tests {
         );
         // The first group's three rotations left witnesses at base epochs
         // `first_epoch..first_epoch + 3`. The rebuilt group counts from the
-        // start again (plus the joiner's immediate commit), so the rotations
-        // below revisit epoch numbers those witnesses were recorded at.
+        // start again, so the rotations below revisit epoch numbers those
+        // witnesses were recorded at.
         assert!(
             rebuilt_epoch < first_epoch + 3,
             "the rebuilt group counts epochs from the start again"
@@ -13316,27 +13286,14 @@ pub(crate) mod tests {
         );
         let losing_key = peer_engine(&chat, alice_is_winner).state.conversations[&conversation_id]
             .pcs
-            .own_commit
-            .as_ref()
+            .own_commit()
             .and_then(|own| own.wrap_key)
             .expect("the losing commit's key");
-        let output = deliver_inbox_envelope(
+        deliver_inbox_envelope(
             peer_engine_mut(&mut chat, alice_is_winner),
             &loser_device,
             winner_commit,
             51_001,
-        );
-        let key_package = rotator_engine(&chat, alice_is_winner)
-            .state
-            .published_key_package
-            .as_ref()
-            .expect("winner's current key package")
-            .key_package_b64
-            .clone();
-        answer_key_package_claims(
-            peer_engine_mut(&mut chat, alice_is_winner),
-            output,
-            &key_package,
         );
         let welcome = rebuild_welcome(peer_engine(&chat, alice_is_winner), &losing_key);
         deliver_inbox_envelope(
@@ -13469,6 +13426,214 @@ pub(crate) mod tests {
             })
             .expect("re-read at the held revision");
         assert_eq!(held_bundle(&alice), held, "bundle re-read");
+    }
+
+    /// **A second rotation before the race resolves does not split the
+    /// session.** P is designated at epoch `e` and commits there; Q commits on
+    /// `e` too, and the host holds Q's commit back while P rotates once more,
+    /// on `e + 1`. Everything is then delivered, in order and within `Δ`.
+    /// Under `LIVE(T, Δ)` the two sides must end up in one group again.
+    #[test]
+    fn a_second_rotation_before_the_race_resolves_does_not_split_the_session() {
+        let mut chat = paired_direct_chat();
+        let conversation_id = chat.conversation_id.clone();
+        let p_is_alice = alice_is_designated(&chat);
+        let base_epoch = conversation_epoch(rotator_engine(&chat, p_is_alice), &conversation_id);
+        let mut seen_from_p = pending_mids(rotator_engine(&chat, p_is_alice));
+        let mut seen_from_q = pending_mids(peer_engine(&chat, p_is_alice));
+
+        set_direct_pcs_debt(
+            peer_engine_mut(&mut chat, p_is_alice),
+            &conversation_id,
+            DIRECT_PCS_COMMIT_INTERVAL * 2 - 1,
+        );
+        peer_engine_mut(&mut chat, p_is_alice)
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "q rotation".into(),
+            })
+            .expect("q rotates on e");
+        set_direct_pcs_debt(
+            rotator_engine_mut(&mut chat, p_is_alice),
+            &conversation_id,
+            DIRECT_PCS_COMMIT_INTERVAL - 1,
+        );
+        rotator_engine_mut(&mut chat, p_is_alice)
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "p first rotation".into(),
+            })
+            .expect("p rotates on e");
+        // Designated at `e + 1` is Q, so P needs the 2x threshold here.
+        set_direct_pcs_debt(
+            rotator_engine_mut(&mut chat, p_is_alice),
+            &conversation_id,
+            DIRECT_PCS_COMMIT_INTERVAL * 2 - 1,
+        );
+        rotator_engine_mut(&mut chat, p_is_alice)
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "p second rotation".into(),
+            })
+            .expect("p rotates on e + 1");
+        assert_eq!(
+            conversation_epoch(rotator_engine(&chat, p_is_alice), &conversation_id),
+            base_epoch + 2,
+            "premise: P rotated twice before hearing from Q"
+        );
+
+        let mut seq = 52_000;
+        exchange_until_quiet(
+            &mut chat,
+            p_is_alice,
+            &mut seen_from_p,
+            &mut seen_from_q,
+            &mut seq,
+        );
+        let side = |engine: &CoreEngine| {
+            let state = &engine.state.conversations[&conversation_id];
+            format!(
+                "epoch {}, {:?}, {:?}",
+                conversation_epoch(engine, &conversation_id),
+                state.conversation.state,
+                state.recovery_status
+            )
+        };
+        let mut refused = Vec::new();
+        for (alice_speaks, name, text) in [
+            (p_is_alice, "P", "p after the race"),
+            (!p_is_alice, "Q", "q after the race"),
+        ] {
+            let engine = if alice_speaks {
+                &mut chat.alice
+            } else {
+                &mut chat.bob
+            };
+            if let Err(error) = engine.handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: text.into(),
+            }) {
+                refused.push(format!("{name}: {}", error.code()));
+            }
+        }
+        exchange_until_quiet(
+            &mut chat,
+            p_is_alice,
+            &mut seen_from_p,
+            &mut seen_from_q,
+            &mut seq,
+        );
+
+        let p_state = side(rotator_engine(&chat, p_is_alice));
+        let q_state = side(peer_engine(&chat, p_is_alice));
+        assert!(
+            refused.is_empty()
+                && conversation_has_plaintext(
+                    peer_engine(&chat, p_is_alice),
+                    &conversation_id,
+                    "p after the race"
+                )
+                && conversation_has_plaintext(
+                    rotator_engine(&chat, p_is_alice),
+                    &conversation_id,
+                    "q after the race"
+                ),
+            "the session split: refused sends {refused:?}; P {p_state}; Q {q_state}"
+        );
+    }
+
+    fn pending_mids(engine: &CoreEngine) -> std::collections::BTreeSet<String> {
+        engine
+            .state
+            .pending_outbox
+            .iter()
+            .map(|item| item.envelope.mid.clone())
+            .collect()
+    }
+
+    /// Deliver every envelope `sender` queued for `device_id` that has not been
+    /// delivered yet, one record at a time and in queue order. A delivered
+    /// envelope leaves the sender's outbox, as a completed append would take
+    /// it: nothing the sender still holds can stand in for a lost record.
+    fn deliver_unseen(
+        recipient: &mut CoreEngine,
+        sender: &mut CoreEngine,
+        device_id: &str,
+        seen: &mut std::collections::BTreeSet<String>,
+        seq: &mut u64,
+    ) -> usize {
+        let fresh = sender
+            .state
+            .pending_outbox
+            .iter()
+            .filter(|item| {
+                item.envelope.recipient_device_id == device_id && !seen.contains(&item.envelope.mid)
+            })
+            .map(|item| item.envelope.clone())
+            .collect::<Vec<_>>();
+        for envelope in &fresh {
+            seen.insert(envelope.mid.clone());
+            *seq += 1;
+            deliver_inbox_envelope(recipient, device_id, envelope.clone(), *seq);
+            sender
+                .state
+                .pending_outbox
+                .retain(|item| item.envelope.mid != envelope.mid);
+        }
+        fresh.len()
+    }
+
+    /// Alternate deliveries, first side first, until neither has anything new.
+    fn exchange_until_quiet(
+        chat: &mut PairedDirectChat,
+        alice_first: bool,
+        seen_from_first: &mut std::collections::BTreeSet<String>,
+        seen_from_second: &mut std::collections::BTreeSet<String>,
+        seq: &mut u64,
+    ) {
+        let (seen_from_alice, seen_from_bob) = if alice_first {
+            (seen_from_first, seen_from_second)
+        } else {
+            (seen_from_second, seen_from_first)
+        };
+        for _ in 0..8 {
+            let (to_bob, to_alice) = if alice_first {
+                let to_bob = deliver_unseen(
+                    &mut chat.bob,
+                    &mut chat.alice,
+                    &chat.bob_device_id,
+                    seen_from_alice,
+                    seq,
+                );
+                let to_alice = deliver_unseen(
+                    &mut chat.alice,
+                    &mut chat.bob,
+                    &chat.alice_device_id,
+                    seen_from_bob,
+                    seq,
+                );
+                (to_bob, to_alice)
+            } else {
+                let to_alice = deliver_unseen(
+                    &mut chat.alice,
+                    &mut chat.bob,
+                    &chat.alice_device_id,
+                    seen_from_bob,
+                    seq,
+                );
+                let to_bob = deliver_unseen(
+                    &mut chat.bob,
+                    &mut chat.alice,
+                    &chat.bob_device_id,
+                    seen_from_alice,
+                    seq,
+                );
+                (to_bob, to_alice)
+            };
+            if to_bob + to_alice == 0 {
+                return;
+            }
+        }
     }
 
     fn answer_key_package_claims(
@@ -14198,8 +14363,7 @@ pub(crate) mod tests {
         let losing = last_pending_envelope(&thief, &peer_device, MessageType::MlsCommit);
         let losing_key = thief.state.conversations[&conversation_id]
             .pcs
-            .own_commit
-            .as_ref()
+            .own_commit()
             .and_then(|own| own.wrap_key)
             .expect("the losing commit's key");
         deliver_inbox_envelope(
@@ -14209,15 +14373,9 @@ pub(crate) mod tests {
             900,
         );
 
-        let output = deliver_inbox_envelope(&mut thief, &victim_device, winning.clone(), 900);
-        let key_package = peer_engine(&chat, victim)
-            .state
-            .published_key_package
-            .as_ref()
-            .expect("the counterparty's KeyPackage")
-            .key_package_b64
-            .clone();
-        answer_key_package_claims(&mut thief, output, &key_package);
+        // The thief re-enters to the KeyPackage the winning commit carried,
+        // and the winner joins, as it would join any loser.
+        deliver_inbox_envelope(&mut thief, &victim_device, winning.clone(), 900);
         let welcome = rebuild_welcome(&thief, &losing_key);
         deliver_inbox_envelope(
             peer_engine_mut(&mut chat, victim),
@@ -14225,17 +14383,25 @@ pub(crate) mod tests {
             welcome,
             901,
         );
-        // Joining replaced the counterparty's session, so it replaced the leaf
-        // it was admitted with at once; that commit builds on the thief's
-        // group, not on the session it left.
-        assert_eq!(
-            peer_engine(&chat, victim).state.conversations[&conversation_id]
-                .pcs
-                .own_commit
-                .as_ref()
-                .expect("the counterparty's commit after joining")
-                .base_epoch,
-            conversation_epoch(&thief, &conversation_id),
+        thief
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "from the thief's group".into(),
+            })
+            .expect("thief sends");
+        let from_thief = last_pending_envelope(&thief, &peer_device, MessageType::MlsApplication);
+        deliver_inbox_envelope(
+            peer_engine_mut(&mut chat, victim),
+            &peer_device,
+            from_thief,
+            901,
+        );
+        assert!(
+            conversation_has_plaintext(
+                peer_engine(&chat, victim),
+                &conversation_id,
+                "from the thief's group"
+            ),
             "the counterparty moved into the thief's group"
         );
         assert!(!conversation_is_compromised(
@@ -14414,7 +14580,7 @@ pub(crate) mod tests {
         assert!(
             rotator_engine(&chat, alice_rotates).state.conversations[&conversation_id]
                 .pcs
-                .own_commit
+                .own_commit()
                 .is_none()
         );
     }
@@ -14516,16 +14682,14 @@ pub(crate) mod tests {
         assert!(
             rotator_engine(&chat, alice_is_winner).state.conversations[&conversation_id]
                 .pcs
-                .own_commit
-                .as_ref()
+                .own_commit()
                 .expect("winner own commit")
                 .won_arbitration
         );
         assert!(
             !peer_engine(&chat, alice_is_winner).state.conversations[&conversation_id]
                 .pcs
-                .own_commit
-                .as_ref()
+                .own_commit()
                 .expect("loser own commit")
                 .won_arbitration
         );
@@ -14568,8 +14732,7 @@ pub(crate) mod tests {
 
         let losing_key = peer_engine(&chat, alice_is_winner).state.conversations[&conversation_id]
             .pcs
-            .own_commit
-            .as_ref()
+            .own_commit()
             .and_then(|own| own.wrap_key)
             .expect("the losing commit's key");
 
@@ -14615,115 +14778,538 @@ pub(crate) mod tests {
         );
     }
 
-    /// A rebuilt group admits the winner from a KeyPackage it published at some
-    /// earlier time, and a snapshot taken since then holds that package's
-    /// private keys. The winner had already healed in the session the rebuild
-    /// replaced, so it must replace that leaf at once, not at the next
-    /// threshold; otherwise the rebuild re-keys a healed session to a key the
-    /// snapshot holds.
-    #[test]
-    fn a_rebuilt_session_does_not_keep_its_key_package_leaf() {
-        let mut chat = paired_direct_chat();
-        let conversation_id = chat.conversation_id.clone();
-        let alice_is_winner = alice_is_designated(&chat);
-        let winner_device = rotator_device_id(&chat, alice_is_winner).to_string();
-        let loser_device = peer_device_id(&chat, alice_is_winner).to_string();
+    /// Both sides commit on the same base epoch; the designated side wins.
+    /// Nothing is delivered yet.
+    struct CommitRace {
+        alice_is_winner: bool,
+        winner_device: String,
+        loser_device: String,
+        winner_commit: Envelope,
+        loser_commit: Envelope,
+        losing_key: [u8; crate::lane_wrap::WRAP_KEY_LEN],
+        /// The KeyPackage the winning commit carries.
+        carried: String,
+    }
 
+    fn start_commit_race(chat: &mut PairedDirectChat) -> CommitRace {
+        let conversation_id = chat.conversation_id.clone();
+        let alice_is_winner = alice_is_designated(chat);
+        let winner_device = rotator_device_id(chat, alice_is_winner).to_string();
+        let loser_device = peer_device_id(chat, alice_is_winner).to_string();
         set_direct_pcs_debt(
-            peer_engine_mut(&mut chat, alice_is_winner),
+            peer_engine_mut(chat, alice_is_winner),
             &conversation_id,
             DIRECT_PCS_COMMIT_INTERVAL * 2 - 1,
         );
-        peer_engine_mut(&mut chat, alice_is_winner)
+        peer_engine_mut(chat, alice_is_winner)
             .handle_command(CoreCommand::SendTextMessage {
                 conversation_id: conversation_id.clone(),
                 plaintext: "loser rotation".into(),
             })
             .expect("loser send");
         let loser_commit = last_pending_envelope(
-            peer_engine(&chat, alice_is_winner),
+            peer_engine(chat, alice_is_winner),
             &winner_device,
             MessageType::MlsCommit,
         );
         set_direct_pcs_debt(
-            rotator_engine_mut(&mut chat, alice_is_winner),
+            rotator_engine_mut(chat, alice_is_winner),
             &conversation_id,
             DIRECT_PCS_COMMIT_INTERVAL - 1,
         );
-        rotator_engine_mut(&mut chat, alice_is_winner)
+        rotator_engine_mut(chat, alice_is_winner)
             .handle_command(CoreCommand::SendTextMessage {
                 conversation_id: conversation_id.clone(),
                 plaintext: "winner rotation".into(),
             })
             .expect("winner send");
         let winner_commit = last_pending_envelope(
-            rotator_engine(&chat, alice_is_winner),
+            rotator_engine(chat, alice_is_winner),
             &loser_device,
             MessageType::MlsCommit,
         );
-        let losing_key = peer_engine(&chat, alice_is_winner).state.conversations[&conversation_id]
+        let losing_key = peer_engine(chat, alice_is_winner).state.conversations[&conversation_id]
             .pcs
-            .own_commit
-            .as_ref()
+            .own_commit()
             .and_then(|own| own.wrap_key)
             .expect("the losing commit's key");
-        deliver_inbox_envelope(
-            rotator_engine_mut(&mut chat, alice_is_winner),
-            &winner_device,
+        let carried = rotator_engine(chat, alice_is_winner).state.conversations[&conversation_id]
+            .pcs
+            .own_commit()
+            .and_then(|own| own.key_package_b64.clone())
+            .expect("the winning commit carries a KeyPackage");
+        CommitRace {
+            alice_is_winner,
+            winner_device,
+            loser_device,
+            winner_commit,
             loser_commit,
-            60_000,
-        );
+            losing_key,
+            carried,
+        }
+    }
 
-        // The loser rebuilds, and admits the winner from the KeyPackage the
-        // winner has been advertising all along.
-        let key_package = rotator_engine(&chat, alice_is_winner)
+    fn key_package_claims(output: &CoreOutput) -> usize {
+        output
+            .effects
+            .iter()
+            .filter(|effect| {
+                matches!(
+                    effect,
+                    CoreEffect::ExecuteHttpRequest { request }
+                        if request.url.contains("/keypackage-pool/")
+                            && request.url.ends_with("/claim")
+                )
+            })
+            .count()
+    }
+
+    fn welcome_mls(envelope: &Envelope, key: &[u8; crate::lane_wrap::WRAP_KEY_LEN]) -> String {
+        let frame = unwrap_envelope_payload(key, envelope).expect("the Welcome opens");
+        crate::direct_frame::decode(&frame)
+            .expect("a direct frame")
+            .0
+    }
+
+    fn holds_key_package(engine: &CoreEngine, key_package_b64: &str) -> bool {
+        engine
+            .state
+            .mls_adapter
+            .as_ref()
+            .expect("adapter")
+            .holds_key_package(key_package_b64)
+            .expect("key package lookup")
+    }
+
+    /// **The loser re-enters to the KeyPackage the winning commit carried.**
+    /// A package the host hands out may be older than a snapshot of the
+    /// winner. The one the winning commit carries was made with that commit,
+    /// and the commit's signature covers it, so the rebuild takes it and asks
+    /// the host for nothing. The winner joins with that package's leaf and,
+    /// having made no rotation since, keeps it: the leaf is as new as the
+    /// rotation it won with.
+    #[test]
+    fn a_rebuild_is_made_to_the_key_package_the_winning_commit_carried() {
+        let mut chat = paired_direct_chat();
+        let conversation_id = chat.conversation_id.clone();
+        let race = start_commit_race(&mut chat);
+        let winner_is_alice = race.alice_is_winner;
+        let published = rotator_engine(&chat, winner_is_alice)
             .state
             .published_key_package
             .as_ref()
-            .expect("the winner's KeyPackage")
+            .expect("the winner's published KeyPackage")
             .key_package_b64
             .clone();
+        assert_ne!(race.carried, published);
+        let winning_key = rotator_engine(&chat, winner_is_alice).state.conversations
+            [&conversation_id]
+            .pcs
+            .own_commit()
+            .and_then(|own| own.wrap_key)
+            .expect("the winning commit's key");
+        assert_eq!(
+            crate::mls_adapter::MlsAdapter::commit_key_package(&welcome_mls(
+                &race.winner_commit,
+                &winning_key
+            )),
+            Some(race.carried.clone()),
+            "premise: the package travels inside the winning commit"
+        );
+
+        deliver_inbox_envelope(
+            rotator_engine_mut(&mut chat, winner_is_alice),
+            &race.winner_device,
+            race.loser_commit,
+            60_000,
+        );
         let output = deliver_inbox_envelope(
-            peer_engine_mut(&mut chat, alice_is_winner),
-            &loser_device,
-            winner_commit,
+            peer_engine_mut(&mut chat, winner_is_alice),
+            &race.loser_device,
+            race.winner_commit,
             60_001,
         );
-        answer_key_package_claims(
-            peer_engine_mut(&mut chat, alice_is_winner),
-            output,
-            &key_package,
+        assert_eq!(
+            key_package_claims(&output),
+            0,
+            "a race loser asks the host for no KeyPackage"
         );
-        let welcome = rebuild_welcome(peer_engine(&chat, alice_is_winner), &losing_key);
+        let welcome = rebuild_welcome(peer_engine(&chat, winner_is_alice), &race.losing_key);
+        assert!(
+            rotator_engine(&chat, winner_is_alice)
+                .state
+                .mls_adapter
+                .as_ref()
+                .expect("winner adapter")
+                .welcome_targets_key_package(
+                    &welcome_mls(&welcome, &race.losing_key),
+                    &race.carried
+                )
+                .expect("welcome decodes"),
+            "the rebuild is built to the package the winning commit carried"
+        );
         deliver_inbox_envelope(
-            rotator_engine_mut(&mut chat, alice_is_winner),
-            &winner_device,
+            rotator_engine_mut(&mut chat, winner_is_alice),
+            &race.winner_device,
             welcome,
             60_002,
         );
 
-        let winner = rotator_engine(&chat, alice_is_winner);
-        let joined_epoch = conversation_epoch(winner, &conversation_id);
-        let own_commit = winner.state.conversations[&conversation_id]
-            .pcs
-            .own_commit
-            .as_ref()
-            .expect("the winner commits in the rebuilt group in the same turn");
-        assert_eq!(
-            own_commit.base_epoch + 1,
-            joined_epoch,
-            "the commit replaces the leaf the Welcome admitted"
+        let winner = rotator_engine(&chat, winner_is_alice);
+        assert!(
+            winner
+                .state
+                .mls_adapter
+                .as_ref()
+                .expect("winner adapter")
+                .own_leaf_is_from_key_package(&conversation_id, &race.carried)
+                .expect("winner leaf"),
+            "the winner joins with the carried package's leaf"
         );
+        assert!(
+            winner.state.conversations[&conversation_id]
+                .pcs
+                .own_commit()
+                .is_none(),
+            "and keeps it: it made no rotation after the one it won with"
+        );
+        assert!(
+            !holds_key_package(winner, &race.carried),
+            "the package's private keys went with the join"
+        );
+    }
+
+    /// **The winner admits a rebuild built to its carried KeyPackage and to
+    /// no other.** The wrap key and the loser's device are right here; only
+    /// the package is one the winner published, which a snapshot taken
+    /// before the winning commit may hold.
+    #[test]
+    fn a_rebuild_welcome_to_another_key_package_is_refused() {
+        let mut chat = paired_direct_chat();
+        let conversation_id = chat.conversation_id.clone();
+        let race = start_commit_race(&mut chat);
+        let winner_is_alice = race.alice_is_winner;
+        deliver_inbox_envelope(
+            rotator_engine_mut(&mut chat, winner_is_alice),
+            &race.winner_device,
+            race.loser_commit,
+            61_000,
+        );
+        deliver_inbox_envelope(
+            peer_engine_mut(&mut chat, winner_is_alice),
+            &race.loser_device,
+            race.winner_commit,
+            61_001,
+        );
+        let genuine = rebuild_welcome(peer_engine(&chat, winner_is_alice), &race.losing_key);
+
+        // The loser's device builds the same conversation to the winner's
+        // published package instead, and wraps it the same way.
+        let winner = rotator_engine(&chat, winner_is_alice);
+        let winner_user = winner
+            .state
+            .local_identity
+            .as_ref()
+            .expect("winner identity")
+            .user_identity
+            .user_id
+            .clone();
+        let published = winner
+            .state
+            .published_key_package
+            .as_ref()
+            .expect("the winner's published KeyPackage")
+            .key_package_b64
+            .clone();
+        let loser = peer_engine_mut(&mut chat, winner_is_alice);
+        let device_public_key = loser.state.contacts[&winner_user]
+            .bundle
+            .devices
+            .iter()
+            .find(|device| device.device_id == race.winner_device)
+            .expect("the winner's device")
+            .device_public_key
+            .clone();
+        let adapter = loser.state.mls_adapter.as_mut().expect("loser adapter");
+        adapter.delete_group(&conversation_id).expect("drop group");
+        let artifacts = adapter
+            .create_conversation(
+                &conversation_id,
+                &[crate::mls_adapter::PeerDeviceKeyPackage {
+                    user_id: winner_user,
+                    device_id: race.winner_device.clone(),
+                    device_public_key,
+                    key_package_b64: published,
+                }],
+            )
+            .expect("a group to the published package");
+        let frame =
+            crate::direct_frame::encode(&artifacts.welcomes[0].payload_b64, None).expect("frame");
+        let mut forged = genuine.clone();
+        forged.mid = crate::model::random_opaque_id();
+        forged.bytes = Some(
+            STANDARD.encode(crate::lane_wrap::wrap_frame(&race.losing_key, &frame).expect("wrap")),
+        );
+
+        let epoch_before =
+            conversation_epoch(rotator_engine(&chat, winner_is_alice), &conversation_id);
+        deliver_inbox_envelope(
+            rotator_engine_mut(&mut chat, winner_is_alice),
+            &race.winner_device,
+            forged,
+            61_002,
+        );
+        let winner = rotator_engine(&chat, winner_is_alice);
+        assert_eq!(
+            conversation_epoch(winner, &conversation_id),
+            epoch_before,
+            "a rebuild to another package is not joined"
+        );
+        assert!(
+            winner.state.conversations[&conversation_id]
+                .rebuild
+                .expected
+                .is_some(),
+            "and does not spend the expected rebuild"
+        );
+
+        deliver_inbox_envelope(
+            rotator_engine_mut(&mut chat, winner_is_alice),
+            &race.winner_device,
+            genuine,
+            61_003,
+        );
+        assert!(
+            rotator_engine(&chat, winner_is_alice).state.conversations[&conversation_id]
+                .rebuild
+                .expected
+                .is_none(),
+            "control: the rebuild to the carried package is joined"
+        );
+    }
+
+    /// **A race never undoes a party's healing.** The winner rotates twice
+    /// before the loser's commit arrives. The loser re-enters to the package
+    /// the first winning commit carried, which is fresh, so its own new leaf
+    /// is keyed to nothing a snapshot holds. The winner joins with that
+    /// package's leaf, which is older than its second rotation, so joining
+    /// would undo that rotation; it rotates again at once. The second
+    /// commit's package has no use left and is deleted.
+    #[test]
+    fn a_race_never_undoes_a_partys_healing() {
+        let mut chat = paired_direct_chat();
+        let conversation_id = chat.conversation_id.clone();
+        let race = start_commit_race(&mut chat);
+        let winner_is_alice = race.alice_is_winner;
+        // Designated at the next epoch is the loser, so the winner needs the
+        // longer threshold to rotate there.
+        set_direct_pcs_debt(
+            rotator_engine_mut(&mut chat, winner_is_alice),
+            &conversation_id,
+            DIRECT_PCS_COMMIT_INTERVAL * 2 - 1,
+        );
+        rotator_engine_mut(&mut chat, winner_is_alice)
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "winner rotates again".into(),
+            })
+            .expect("winner rotates again");
+        let second = rotator_engine(&chat, winner_is_alice).state.conversations[&conversation_id]
+            .pcs
+            .own_commit()
+            .and_then(|own| own.key_package_b64.clone())
+            .expect("the second commit's package");
+        assert_ne!(second, race.carried);
+
+        deliver_inbox_envelope(
+            rotator_engine_mut(&mut chat, winner_is_alice),
+            &race.winner_device,
+            race.loser_commit,
+            62_000,
+        );
+        assert!(
+            rotator_engine(&chat, winner_is_alice).state.conversations[&conversation_id]
+                .rebuild
+                .expected
+                .is_some(),
+            "the winner recognised the race behind its later rotation"
+        );
+        let output = deliver_inbox_envelope(
+            peer_engine_mut(&mut chat, winner_is_alice),
+            &race.loser_device,
+            race.winner_commit,
+            62_001,
+        );
+        assert_eq!(key_package_claims(&output), 0);
+        let welcome = rebuild_welcome(peer_engine(&chat, winner_is_alice), &race.losing_key);
+        deliver_inbox_envelope(
+            rotator_engine_mut(&mut chat, winner_is_alice),
+            &race.winner_device,
+            welcome,
+            62_002,
+        );
+
+        let winner = rotator_engine(&chat, winner_is_alice);
+        let joined_epoch = conversation_epoch(winner, &conversation_id);
+        let rotation = winner.state.conversations[&conversation_id]
+            .pcs
+            .own_commit()
+            .expect("the winner rotates in the rebuilt group in the same turn");
+        assert_eq!(rotation.base_epoch + 1, joined_epoch);
         assert!(
             !winner
                 .state
                 .mls_adapter
                 .as_ref()
                 .expect("winner adapter")
-                .own_leaf_is_from_key_package(&conversation_id, &key_package)
+                .own_leaf_is_from_key_package(&conversation_id, &race.carried)
                 .expect("winner leaf"),
-            "the rebuilt session must not run on the KeyPackage's leaf"
+            "the rebuilt session does not run on the leaf older than the second rotation"
         );
+        assert!(
+            !holds_key_package(winner, &second),
+            "the abandoned rotation's package is deleted"
+        );
+    }
+
+    /// **A carried KeyPackage outlives its commit only while the commit is
+    /// pending.** Its private keys are what a re-entry would be keyed to; kept
+    /// any longer, a later snapshot would reach a rotation the peer has
+    /// already followed past. A frame of the peer from the commit's base
+    /// epoch does not end it; one from the epoch the commit created does, and
+    /// the keys are gone from the persisted state too.
+    #[test]
+    fn a_carried_key_package_is_deleted_once_its_commit_is_followed() {
+        let mut chat = paired_direct_chat();
+        let conversation_id = chat.conversation_id.clone();
+        let rotating = alice_is_designated(&chat);
+        let rotator_device = rotator_device_id(&chat, rotating).to_string();
+        let peer_device = peer_device_id(&chat, rotating).to_string();
+
+        set_direct_pcs_debt(
+            rotator_engine_mut(&mut chat, rotating),
+            &conversation_id,
+            DIRECT_PCS_COMMIT_INTERVAL - 1,
+        );
+        rotator_engine_mut(&mut chat, rotating)
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "rotation".into(),
+            })
+            .expect("rotate");
+        let commit = last_pending_envelope(
+            rotator_engine(&chat, rotating),
+            &peer_device,
+            MessageType::MlsCommit,
+        );
+        let carried = rotator_engine(&chat, rotating).state.conversations[&conversation_id]
+            .pcs
+            .own_commit()
+            .and_then(|own| own.key_package_b64.clone())
+            .expect("the commit carries a KeyPackage");
+        assert!(holds_key_package(rotator_engine(&chat, rotating), &carried));
+
+        // The peer writes before it has the commit: still the base epoch.
+        peer_engine_mut(&mut chat, rotating)
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "from the base epoch".into(),
+            })
+            .expect("peer sends");
+        let early = last_pending_envelope(
+            peer_engine(&chat, rotating),
+            &rotator_device,
+            MessageType::MlsApplication,
+        );
+        deliver_inbox_envelope(
+            rotator_engine_mut(&mut chat, rotating),
+            &rotator_device,
+            early,
+            63_000,
+        );
+        assert!(
+            holds_key_package(rotator_engine(&chat, rotating), &carried),
+            "a frame from the base epoch does not show the peer followed"
+        );
+
+        deliver_inbox_envelope(
+            peer_engine_mut(&mut chat, rotating),
+            &peer_device,
+            commit,
+            63_001,
+        );
+        peer_engine_mut(&mut chat, rotating)
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "from the new epoch".into(),
+            })
+            .expect("peer sends again");
+        let late = last_pending_envelope(
+            peer_engine(&chat, rotating),
+            &rotator_device,
+            MessageType::MlsApplication,
+        );
+        deliver_inbox_envelope(
+            rotator_engine_mut(&mut chat, rotating),
+            &rotator_device,
+            late,
+            63_002,
+        );
+        let rotator = rotator_engine(&chat, rotating);
+        assert!(
+            rotator.state.conversations[&conversation_id]
+                .pcs
+                .own_commit()
+                .is_none(),
+            "the commit is no longer pending"
+        );
+        assert!(!holds_key_package(rotator, &carried));
+        let restored = CoreEngine::try_from_restored_state(rotator.refresh_snapshot())
+            .expect("the snapshot restores");
+        assert!(
+            !holds_key_package(&restored, &carried),
+            "nor does the persisted state hold them"
+        );
+    }
+
+    /// **Removing a contact ends every commit pending with it.** No rebuild
+    /// can follow, so the carried package's private keys have nothing left
+    /// to serve but a snapshot.
+    #[test]
+    fn removing_a_contact_deletes_its_pending_key_packages() {
+        let mut chat = paired_direct_chat();
+        let conversation_id = chat.conversation_id.clone();
+        let rotating = alice_is_designated(&chat);
+        set_direct_pcs_debt(
+            rotator_engine_mut(&mut chat, rotating),
+            &conversation_id,
+            DIRECT_PCS_COMMIT_INTERVAL - 1,
+        );
+        rotator_engine_mut(&mut chat, rotating)
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "rotation".into(),
+            })
+            .expect("rotate");
+        let carried = rotator_engine(&chat, rotating).state.conversations[&conversation_id]
+            .pcs
+            .own_commit()
+            .and_then(|own| own.key_package_b64.clone())
+            .expect("the commit carries a KeyPackage");
+        let peer_user_id = rotator_engine(&chat, rotating).state.conversations[&conversation_id]
+            .peer_user_id
+            .clone();
+        assert!(holds_key_package(rotator_engine(&chat, rotating), &carried));
+
+        rotator_engine_mut(&mut chat, rotating)
+            .handle_command(CoreCommand::DeleteContact {
+                user_id: peer_user_id,
+            })
+            .expect("delete contact");
+        assert!(!holds_key_package(
+            rotator_engine(&chat, rotating),
+            &carried
+        ));
     }
 
     /// A KeyPackage past its lifetime cannot be used for a Welcome any more,
@@ -15069,7 +15655,7 @@ pub(crate) mod tests {
         assert!(
             chat.alice.state.conversations[&conversation_id]
                 .pcs
-                .own_commit
+                .own_commit()
                 .is_some(),
             "the decision after sending still rotates"
         );
@@ -15124,8 +15710,7 @@ pub(crate) mod tests {
         );
         let own_commit = settled.state.conversations[&conversation_id]
             .pcs
-            .own_commit
-            .as_ref()
+            .own_commit()
             .expect("own commit");
         assert_eq!(
             own_commit.base_epoch,
@@ -15825,7 +16410,7 @@ pub(crate) mod tests {
         );
         // R1 strengthens this: a forged commit does not even reach the
         // arbitration check, so no rotation state moves either.
-        assert!(acceptor_state.pcs.own_commit.is_none());
+        assert!(acceptor_state.pcs.own_commit().is_none());
     }
 
     #[test]
@@ -15909,7 +16494,7 @@ pub(crate) mod tests {
             .get(&chat.conversation_id)
             .expect("conversation");
         assert!(
-            state.pcs.own_commit.is_some(),
+            state.pcs.own_commit().is_some(),
             "an attachment send counts toward the interval and must rotate"
         );
         assert_eq!(state.pcs.self_debt, 0, "rotating clears the debt");
@@ -15976,7 +16561,7 @@ pub(crate) mod tests {
             .get(&conversation_id)
             .expect("restored conversation")
             .pcs
-            .own_commit
+            .own_commit()
             .is_some());
     }
 

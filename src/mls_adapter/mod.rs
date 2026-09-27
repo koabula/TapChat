@@ -244,6 +244,10 @@ pub struct DirectSelfUpdate {
     pub commit_b64: String,
     pub commit_hash: String,
     pub base_epoch: u64,
+    /// The fresh KeyPackage the commit carries in its authenticated data.
+    /// Its private keys stay in the provider store until the caller deletes
+    /// them; see [`crate::direct_pcs::PendingCommit`].
+    pub key_package_b64: String,
 }
 
 #[derive(Debug)]
@@ -1227,8 +1231,9 @@ impl MlsAdapter {
     }
 
     /// Delete a KeyPackage's private keys from the provider store. Only for
-    /// packages past their lifetime: MLS refuses those, so no Welcome can
-    /// need the keys, and all that is left for them to serve is a snapshot.
+    /// packages no Welcome can still need: one past its lifetime, which MLS
+    /// refuses, or one a direct commit carried once that commit is no longer
+    /// pending. All that is left for such keys to serve is a snapshot.
     pub fn delete_key_package(&self, key_package_b64: &str) -> CoreResult<()> {
         let hash_ref = key_package_hash_ref(&self.provider, key_package_b64)?;
         delete_stored_key_package(self.provider.storage(), &hash_ref)
@@ -1407,6 +1412,20 @@ impl MlsAdapter {
             ));
         }
         let base_epoch = self.export_group_summary(conversation_id)?.epoch;
+        // The KeyPackage a peer that loses a race against this commit builds
+        // its new group to. It travels as the commit's authenticated data, so
+        // the commit's hash, and with it the arbitration signature, covers
+        // it: no holder of the wrap key can swap in another package.
+        let key_package = Self::build_published_key_package(
+            &self.provider,
+            &self.signer,
+            self.credential_with_key.clone(),
+            self.credential_identity.clone(),
+            current_unix_time_ms()?,
+        )?;
+        let key_package_bytes = BASE64
+            .decode(&key_package.key_package_b64)
+            .map_err(|_| CoreError::invalid_state("key package encoding is not base64"))?;
         let provider = &self.provider;
         let signer = &self.signer;
         let state = self
@@ -1414,14 +1433,21 @@ impl MlsAdapter {
             .get_mut(conversation_id)
             .ok_or_else(|| CoreError::invalid_input("conversation MLS state does not exist"))?;
         let members_before = state.member_device_ids.clone();
-        let bundle = state
+        state.group.set_aad(key_package_bytes);
+        let bundle = match state
             .group
             .self_update(provider, signer, LeafNodeParameters::default())
-            .map_err(|error| {
-                CoreError::invalid_state(format!(
+        {
+            Ok(bundle) => bundle,
+            Err(error) => {
+                state.group.set_aad(Vec::new());
+                let hash_ref = key_package_hash_ref(provider, &key_package.key_package_b64)?;
+                delete_stored_key_package(provider.storage(), &hash_ref)?;
+                return Err(CoreError::invalid_state(format!(
                     "failed to create direct PCS self-update: {error}"
-                ))
-            })?;
+                )));
+            }
+        };
         let commit = bundle.into_commit();
         state
             .group
@@ -1444,7 +1470,31 @@ impl MlsAdapter {
             commit_b64,
             commit_hash,
             base_epoch,
+            key_package_b64: key_package.key_package_b64,
         })
+    }
+
+    /// The KeyPackage a direct commit carries in its authenticated data, if
+    /// it carries one. Read from the clear part of the message, so it works
+    /// on a commit this device can no longer decrypt, such as a rival's on an
+    /// epoch it has left. Nothing is verified here: the commit's signature
+    /// covers these bytes, and [`Self::validate_peer_key_package`] the rest.
+    pub fn commit_key_package(commit_b64: &str) -> Option<String> {
+        let bytes = BASE64.decode(commit_b64.trim()).ok()?;
+        let message = MlsMessageIn::tls_deserialize_exact(bytes).ok()?;
+        match message.extract() {
+            MlsMessageBodyIn::PrivateMessage(private) if !private.aad().is_empty() => {
+                Some(BASE64.encode(private.aad()))
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether `peer.key_package_b64` is a valid KeyPackage of `peer`'s
+    /// device, the check a new group applies to every member it adds. Run
+    /// before a session is torn down for a rebuild to it.
+    pub fn validate_peer_key_package(peer: &PeerDeviceKeyPackage) -> CoreResult<()> {
+        decode_peer_key_packages(std::slice::from_ref(peer)).map(|_| ())
     }
 
     pub fn member_device_ids(&self, conversation_id: &str) -> CoreResult<Vec<String>> {

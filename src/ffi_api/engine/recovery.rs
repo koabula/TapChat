@@ -205,6 +205,41 @@ impl CoreEngine {
             return self.merge_with_transport_flush(output);
         }
 
+        // A race loser re-enters to the KeyPackage the winning commit carried,
+        // already checked against the winner's device key. No claim: a
+        // package the host hands out may be older than a snapshot of the
+        // winner, and the winner accepts a rebuild built to no other.
+        let reentry = self
+            .state
+            .conversations
+            .get(&conversation_id)
+            .and_then(|state| state.rebuild.reentry.clone());
+        if needs_rebootstrap {
+            if let Some(reentry) = reentry {
+                if !peer_active_device_ids.contains(&reentry.device_id) {
+                    log::warn!(
+                        "reconcile: the device that won the race is not the accepted one in conversation {}",
+                        redact_id("conversation", &conversation_id)
+                    );
+                    return self.reconcile_unchanged(&conversation_id);
+                }
+                let device_public_key =
+                    self.trusted_device_public_key(&peer_user_id, &reentry.device_id)?;
+                return self.finalize_reconcile_membership_rebootstrap(
+                    conversation_id,
+                    peer_user_id.clone(),
+                    peer_active_device_ids,
+                    reconcile.member_devices.clone(),
+                    vec![PeerDeviceKeyPackage {
+                        user_id: peer_user_id,
+                        device_id: reentry.device_id,
+                        device_public_key,
+                        key_package_b64: reentry.key_package_b64,
+                    }],
+                );
+            }
+        }
+
         if needs_rebootstrap {
             // Precondition validation already happened above via
             // `peer_active_device_ids` (only Active devices with a usable

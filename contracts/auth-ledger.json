@@ -31,12 +31,13 @@
       "input": "An MLS commit from the peer",
       "entry": "authenticate_direct_commit",
       "scope": "model",
-      "authenticatedBy": "K_c(e), MLS, and a detached signature under the committer's device key; it may refresh keys but not change the members",
+      "authenticatedBy": "K_c(e), MLS, and a detached signature under the committer's device key; it may refresh keys but not change the members. The KeyPackage it carries, which a race loser re-enters to, is in its authenticated data, so the signature covers it through the commit's hash",
       "rotatesWithP": true,
       "witness": [
         "injection_is_confined_to_the_exposure_window",
         "commits_travel_under_their_own_wrap_key",
-        "a_commit_cannot_add_a_leaf_to_a_two_party_session"
+        "a_commit_cannot_add_a_leaf_to_a_two_party_session",
+        "a_rebuild_is_made_to_the_key_package_the_winning_commit_carried"
       ]
     },
     {
@@ -60,13 +61,15 @@
       "input": "A race loser's rebuild Welcome for a conversation this device holds",
       "entry": "resolve_welcome_frame",
       "scope": "model",
-      "authenticatedBy": "K_c of the losing commit's base epoch, kept by the winner as the expected rebuild; exactly two leaves; the replaced session's commit keys are retained as fork witnesses",
+      "authenticatedBy": "K_c of the losing commit's base epoch, kept by the winner as the expected rebuild, and only for the KeyPackage the winning commit carried; exactly two leaves; the replaced session's commit keys are retained as fork witnesses",
       "rotatesWithP": true,
       "witness": [
         "a_stolen_device_key_cannot_replace_a_healed_session",
         "honest_rotations_never_look_like_a_fork",
         "a_welcome_with_a_third_leaf_is_refused",
-        "a_race_rebuild_by_a_thief_is_detected_when_the_victim_commits"
+        "a_race_rebuild_by_a_thief_is_detected_when_the_victim_commits",
+        "a_rebuild_welcome_to_another_key_package_is_refused",
+        "a_race_never_undoes_a_partys_healing"
       ]
     },
     {
@@ -279,7 +282,7 @@
       "scope": "excluded",
       "authenticatedBy": "the leaf key checked against the device key in the peer's bundle",
       "rotatesWithP": false,
-      "reason": "Consumed only by a rebuild this device authorised itself (a lost race or its user's reset), and only for the accepted device.",
+      "reason": "Consumed only by a rebuild its user asked for (a reset), and only for the accepted device. A race loser re-enters to the KeyPackage the winning commit carried and claims nothing, so no host-chosen package reaches a session this device had healed.",
       "witness": ["reconcile_membership_rebootstrap_claims_key_package_before_recreating_group"]
     },
     {

@@ -8,11 +8,13 @@
 //! authenticated by the session it replaces, or this device has to be in a
 //! state where there is no session left to do it.
 //!
-//! - **A lost commit race.** The loser rebuilds, and its Welcome travels
-//!   wrapped under the key its losing commit travelled under. The winner opened
-//!   that commit with the same key, keeps it, and accepts a Welcome under it
-//!   from that device, once. A thief that healed out of the session has
-//!   neither the commit nor the key.
+//! - **A lost commit race.** The loser rebuilds to the KeyPackage the winning
+//!   commit carried, and its Welcome travels wrapped under the key its losing
+//!   commit travelled under. The winner opened that commit with the same key,
+//!   keeps it, and accepts a Welcome under it from that device, once, and only
+//!   one built to that KeyPackage. A thief that healed out of the session has
+//!   neither the commit nor the key, and the winner joins with a leaf no
+//!   snapshot from before its commit holds.
 //! - **No session left.** A local MLS fault or a failed restore tears this
 //!   device's group down; there is nothing to authenticate with, so the peer's
 //!   plain Welcome is accepted until one arrives. The peer's user starts that
@@ -43,6 +45,19 @@ pub struct ExpectedRebuild {
     /// The key the losing commit opened under: `K_c` of the race's base epoch.
     pub key: [u8; WRAP_KEY_LEN],
     pub at_ms: u64,
+    /// The KeyPackage our winning commit carried. The rebuild must be built
+    /// to it: any other of our packages may be older than a snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_package_b64: Option<String>,
+}
+
+/// What a race loser re-enters to: the winner's device, and the KeyPackage
+/// its winning commit carried.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReentryTarget {
+    pub device_id: String,
+    pub key_package_b64: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -52,6 +67,10 @@ pub struct RebuildAuthority {
     /// key, the one the losing commit went out under.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wrap_out: Option<[u8; WRAP_KEY_LEN]>,
+    /// Lost a commit race: the new group is built to this, not to anything
+    /// the host would hand out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reentry: Option<ReentryTarget>,
     /// Won a commit race: the loser's rebuild Welcome will arrive under this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected: Option<ExpectedRebuild>,
@@ -78,7 +97,8 @@ impl RebuildAuthority {
     }
 
     /// Whether a Welcome that opened under `key` from `device_id` is the
-    /// rebuild this device expects.
+    /// rebuild this device expects, as far as the wrap tells. The caller
+    /// still checks that it was built to [`ExpectedRebuild::key_package_b64`].
     pub fn admits_wrapped(&self, key: &[u8; WRAP_KEY_LEN], device_id: &str, now_ms: u64) -> bool {
         self.expected.as_ref().is_some_and(|expected| {
             &expected.key == key
@@ -97,6 +117,7 @@ impl RebuildAuthority {
     /// A rebuild went out: what authorised it is spent.
     pub fn bootstrapped(&mut self) {
         self.wrap_out = None;
+        self.reentry = None;
         self.reset_requested = false;
     }
 
@@ -116,6 +137,7 @@ mod tests {
                 device_id: "device:bob:phone".into(),
                 key: [key; WRAP_KEY_LEN],
                 at_ms,
+                key_package_b64: None,
             }),
             ..Default::default()
         }

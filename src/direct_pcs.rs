@@ -24,11 +24,18 @@ pub const DIRECT_PCS_MAX_AGE_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 /// what the waits below cover.
 pub const DIRECT_DELIVERY_BOUND_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 
-/// Our own commit for `base_epoch`, retained only long enough to arbitrate a
-/// same-epoch race with the peer.
+/// One of our own commits that the peer has not yet been seen to follow.
+///
+/// A commit is *pending* until this device is delivered a frame of the peer
+/// from the epoch the commit created or a later one. Until then the peer may
+/// have committed on the same base epoch, and either side of that race needs
+/// what is kept here: the winner opens the rival commit and then the loser's
+/// rebuild Welcome with `inbound_key`, and joins with the private keys of
+/// `key_package_b64`; the loser wraps its Welcome under `wrap_key`. Once the
+/// peer has followed, none of it has a use left, and all of it is deleted.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct OwnCommit {
+pub struct PendingCommit {
     pub base_epoch: u64,
     pub commit_hash: String,
     /// `designated_committer(roster@base_epoch, base_epoch) == this device`,
@@ -42,6 +49,24 @@ pub struct OwnCommit {
     /// opened the commit with it, can tell that Welcome from a forgery.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wrap_key: Option<[u8; crate::lane_wrap::WRAP_KEY_LEN]>,
+    /// `K_c(base_epoch, inbound)`: what a rival commit on the same base epoch
+    /// travels under, and later the loser's rebuild Welcome. By the time
+    /// either arrives this device may have rotated again, and the current and
+    /// previous epoch's keys no longer reach back to `base_epoch`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inbound_key: Option<[u8; crate::lane_wrap::WRAP_KEY_LEN]>,
+    /// The fresh KeyPackage the commit carried, whose private keys this
+    /// device holds while the commit is pending. A peer that loses a race
+    /// against this commit re-enters by a new group built to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_package_b64: Option<String>,
+}
+
+impl PendingCommit {
+    /// The epoch this commit created.
+    pub fn created_epoch(&self) -> u64 {
+        self.base_epoch.saturating_add(1)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -60,15 +85,45 @@ pub struct DirectPcsState {
     pub self_debt: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub self_rotated_at_ms: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub own_commit: Option<OwnCommit>,
-    /// Our leaf came from a KeyPackage, whose keys were generated when the
-    /// package was published. A snapshot taken at any time since holds them,
-    /// and only our own commit removes them. Set when a Welcome replaces a
-    /// session we had: we had healed there, so a leaf this old must not
-    /// outlive the join.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub leaf_from_key_package: bool,
+    /// Oldest first. More than one only when this device rotates again before
+    /// hearing from the peer in the epoch its previous commit created.
+    #[serde(
+        default,
+        alias = "ownCommit",
+        deserialize_with = "pending_commits_or_legacy_one",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub pending_commits: Vec<PendingCommit>,
+    /// Our leaf must be replaced at the next settled decision, whatever the
+    /// schedule says. Set when a Welcome replaces a session we had and the
+    /// leaf it gives us is older than our latest rotation there: a peer's
+    /// reset, which joins us from a published KeyPackage, or a race we won
+    /// but rotated past before the loser's rebuild arrived. Either way we had
+    /// healed beyond that leaf, and it must not outlive the join.
+    #[serde(
+        default,
+        alias = "leafFromKeyPackage",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub rotate_now: bool,
+}
+
+/// Before the pending set, state kept at most one own commit, as
+/// `ownCommit`; read it as a set of one.
+fn pending_commits_or_legacy_one<'de, D>(deserializer: D) -> Result<Vec<PendingCommit>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Stored {
+        Many(Vec<PendingCommit>),
+        One(Option<PendingCommit>),
+    }
+    Ok(match Stored::deserialize(deserializer)? {
+        Stored::Many(commits) => commits,
+        Stored::One(commit) => commit.into_iter().collect(),
+    })
 }
 
 impl DirectPcsState {
@@ -85,7 +140,7 @@ impl DirectPcsState {
     /// the 2× party only fires when the designated one is absent, and an
     /// absent peer cannot race.
     pub fn should_rotate(&self, is_designated: bool, now_ms: u64) -> bool {
-        if self.leaf_from_key_package {
+        if self.rotate_now {
             return true;
         }
         let factor = if is_designated { 1 } else { 2 };
@@ -100,30 +155,44 @@ impl DirectPcsState {
 
     /// Record that our own leaf key was just replaced. The only place the
     /// rotation debt is cleared.
-    pub fn mark_rotated(&mut self, own_commit: OwnCommit, now_ms: u64) {
+    pub fn mark_rotated(&mut self, commit: PendingCommit, now_ms: u64) {
         self.self_debt = 0;
         self.self_rotated_at_ms = Some(now_ms);
-        self.own_commit = Some(own_commit);
-        self.leaf_from_key_package = false;
+        self.pending_commits.push(commit);
+        self.rotate_now = false;
     }
 
-    /// Close the race window.
-    ///
-    /// Called when a peer commit merges. To merge, its epoch had to equal our
-    /// live epoch, which is already past the base epoch of our own commit — so
-    /// the peer demonstrably moved past it and can no longer race us there.
-    /// Note this does **not** touch `self_debt`; see the field comment.
-    pub fn clear_own_commit(&mut self) {
-        self.own_commit = None;
+    /// Our latest commit that is still pending.
+    pub fn own_commit(&self) -> Option<&PendingCommit> {
+        self.pending_commits.last()
     }
 
-    /// `Some(won)` when `incoming` is a peer commit racing our own commit at
-    /// the same base epoch — `true` if we win the arbitration. `None` when
-    /// there is no race and the frame should take the ordinary ingest path.
-    pub fn arbitrate(&self, incoming_epoch: u64, incoming_hash: &str) -> Option<bool> {
-        let own = self.own_commit.as_ref()?;
-        (incoming_epoch == own.base_epoch && incoming_hash != own.commit_hash)
-            .then_some(own.won_arbitration)
+    /// The peer was seen in `peer_epoch`: every commit of ours that created
+    /// that epoch or an earlier one is no longer pending. Returns them, so
+    /// the caller can delete what they kept. Does **not** touch `self_debt`;
+    /// see the field comment.
+    pub fn resolve_pending(&mut self, peer_epoch: u64) -> Vec<PendingCommit> {
+        let (resolved, pending) = std::mem::take(&mut self.pending_commits)
+            .into_iter()
+            .partition(|commit| commit.created_epoch() <= peer_epoch);
+        self.pending_commits = pending;
+        resolved
+    }
+
+    /// The pending commit that a peer commit on `incoming_epoch` with hash
+    /// `incoming_hash` races, if any. `None` when there is no race and the
+    /// frame should take the ordinary ingest path.
+    pub fn arbitrate(&self, incoming_epoch: u64, incoming_hash: &str) -> Option<&PendingCommit> {
+        self.pending_commits
+            .iter()
+            .find(|own| own.base_epoch == incoming_epoch && own.commit_hash != incoming_hash)
+    }
+
+    /// Whether this device committed again after its commit on `base_epoch`.
+    pub fn rotated_since(&self, base_epoch: u64) -> bool {
+        self.pending_commits
+            .iter()
+            .any(|own| own.base_epoch > base_epoch)
     }
 }
 
@@ -162,12 +231,14 @@ pub fn commit_hash_from_b64(payload_b64: &str) -> CoreResult<String> {
 mod tests {
     use super::*;
 
-    fn own_commit(base_epoch: u64, hash: &str, won: bool) -> OwnCommit {
-        OwnCommit {
+    fn own_commit(base_epoch: u64, hash: &str, won: bool) -> PendingCommit {
+        PendingCommit {
             base_epoch,
             commit_hash: hash.into(),
             won_arbitration: won,
             wrap_key: None,
+            inbound_key: None,
+            key_package_b64: None,
         }
     }
 
@@ -226,12 +297,55 @@ mod tests {
         // often enough starves our own rotation.
         let mut state = DirectPcsState {
             self_debt: DIRECT_PCS_COMMIT_INTERVAL,
-            own_commit: Some(own_commit(3, "sha256:mine", false)),
+            pending_commits: vec![own_commit(3, "sha256:mine", false)],
             ..Default::default()
         };
-        state.clear_own_commit();
+        assert_eq!(state.resolve_pending(4).len(), 1);
+        assert!(state.pending_commits.is_empty());
         assert_eq!(state.self_debt, DIRECT_PCS_COMMIT_INTERVAL);
         assert!(state.should_rotate(true, 0));
+    }
+
+    #[test]
+    fn a_commit_stays_pending_until_the_peer_is_seen_in_the_epoch_it_created() {
+        let mut state = DirectPcsState {
+            pending_commits: vec![
+                own_commit(3, "sha256:first", true),
+                own_commit(4, "sha256:second", false),
+            ],
+            ..Default::default()
+        };
+        // The peer still in our commit's base epoch has not followed it.
+        assert!(state.resolve_pending(3).is_empty());
+        let resolved = state.resolve_pending(4);
+        assert_eq!(resolved, vec![own_commit(3, "sha256:first", true)]);
+        assert_eq!(
+            state.own_commit().map(|own| own.base_epoch),
+            Some(4),
+            "the later commit is still pending"
+        );
+        assert!(!state.rotated_since(4));
+        state
+            .pending_commits
+            .insert(0, own_commit(3, "sha256:first", true));
+        assert!(state.rotated_since(3));
+    }
+
+    #[test]
+    fn a_stored_single_own_commit_reads_as_a_pending_set_of_one() {
+        let legacy = r#"{"selfDebt":2,"ownCommit":{"baseEpoch":3,"commitHash":"sha256:mine","wonArbitration":true},"leafFromKeyPackage":true}"#;
+        let state: DirectPcsState = serde_json::from_str(legacy).expect("legacy state");
+        assert_eq!(
+            state.pending_commits,
+            vec![own_commit(3, "sha256:mine", true)]
+        );
+        assert!(state.rotate_now);
+        let empty: DirectPcsState =
+            serde_json::from_str(r#"{"ownCommit":null}"#).expect("no own commit");
+        assert!(empty.pending_commits.is_empty());
+        let round_trip: DirectPcsState =
+            serde_json::from_str(&serde_json::to_string(&state).expect("encode")).expect("decode");
+        assert_eq!(round_trip, state);
     }
 
     #[test]
@@ -239,16 +353,27 @@ mod tests {
         let mut state = DirectPcsState::default();
         assert_eq!(state.arbitrate(3, "sha256:theirs"), None);
 
-        state.own_commit = Some(own_commit(3, "sha256:mine", true));
+        state.pending_commits = vec![own_commit(3, "sha256:mine", true)];
+        let won = |state: &DirectPcsState, epoch, hash| {
+            state.arbitrate(epoch, hash).map(|own| own.won_arbitration)
+        };
         // Our own bytes echoed back are not a race.
-        assert_eq!(state.arbitrate(3, "sha256:mine"), None);
+        assert_eq!(won(&state, 3, "sha256:mine"), None);
         // Neither is a commit from any other epoch.
-        assert_eq!(state.arbitrate(2, "sha256:theirs"), None);
-        assert_eq!(state.arbitrate(4, "sha256:theirs"), None);
+        assert_eq!(won(&state, 2, "sha256:theirs"), None);
+        assert_eq!(won(&state, 4, "sha256:theirs"), None);
         // A different commit at our base epoch is the collision.
-        assert_eq!(state.arbitrate(3, "sha256:theirs"), Some(true));
+        assert_eq!(won(&state, 3, "sha256:theirs"), Some(true));
 
-        state.own_commit = Some(own_commit(3, "sha256:mine", false));
-        assert_eq!(state.arbitrate(3, "sha256:theirs"), Some(false));
+        state.pending_commits = vec![own_commit(3, "sha256:mine", false)];
+        assert_eq!(won(&state, 3, "sha256:theirs"), Some(false));
+
+        // A later commit of ours does not hide an earlier one still pending.
+        state.pending_commits = vec![
+            own_commit(3, "sha256:mine", true),
+            own_commit(4, "sha256:later", false),
+        ];
+        assert_eq!(won(&state, 3, "sha256:theirs"), Some(true));
+        assert_eq!(won(&state, 4, "sha256:theirs"), Some(false));
     }
 }
