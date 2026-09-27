@@ -2859,6 +2859,7 @@ mod tests {
                 lanes: None,
                 fork: Default::default(),
                 rebuild: Default::default(),
+                awaiting_peer: false,
             },
         };
         store
@@ -2995,6 +2996,7 @@ mod tests {
                 lanes: None,
                 fork: Default::default(),
                 rebuild: Default::default(),
+                awaiting_peer: false,
             },
         };
         store
@@ -3082,6 +3084,7 @@ mod tests {
                 lanes: None,
                 fork: Default::default(),
                 rebuild: Default::default(),
+                awaiting_peer: false,
             },
         };
         let snapshot = CorePersistenceSnapshot {
@@ -3304,6 +3307,7 @@ mod tests {
             lanes: None,
             fork: Default::default(),
             rebuild: Default::default(),
+            awaiting_peer: false,
         };
         store
             .save_snapshot(&CorePersistenceSnapshot {

@@ -3602,6 +3602,7 @@ mod protected_application_message_tests {
                 }),
                 fork: Default::default(),
                 rebuild: Default::default(),
+                awaiting_peer: false,
             },
         );
         engine

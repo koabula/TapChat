@@ -90,6 +90,19 @@ pub struct LocalConversationState {
     pub fork: ForkGuard,
     #[serde(default, skip_serializing_if = "RebuildAuthority::is_empty")]
     pub rebuild: RebuildAuthority,
+    /// This device created the session and sent the Welcome, and the peer
+    /// has not been heard from in it yet.
+    ///
+    /// Until the peer accepts, its host admits nothing under the session's
+    /// token and releases only the Welcome from the first-contact queue, so
+    /// anything else appended now would be dropped, and the sender, whose
+    /// append succeeded, would never know. So nothing but the Welcome leaves:
+    /// the rest waits in the persisted outbox, and no rotation is made, which
+    /// keeps what waits readable in the epoch the peer joins at and keeps the
+    /// peer's first frame readable here. The first frame of the peer's that
+    /// authenticates in the session clears it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub awaiting_peer: bool,
 }
 
 /// Per-direction admission tokens and the wrap key for the previous epoch.
@@ -219,6 +232,7 @@ impl ConversationManager {
             lanes: None,
             fork: Default::default(),
             rebuild: Default::default(),
+            awaiting_peer: false,
         })
     }
 

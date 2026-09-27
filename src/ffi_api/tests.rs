@@ -306,6 +306,7 @@ pub(crate) mod tests {
             })
             .expect("import bob");
         let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id);
+        peer_has_joined(&mut alice, &conversation_id);
 
         let output = alice
             .handle_command(CoreCommand::SendTextMessage {
@@ -352,6 +353,7 @@ pub(crate) mod tests {
             })
             .expect("import bob");
         let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id);
+        peer_has_joined(&mut alice, &conversation_id);
         let pending_before_send = alice.state.pending_outbox.len();
 
         let output = alice
@@ -3707,6 +3709,7 @@ pub(crate) mod tests {
         let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
         let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
+        peer_has_joined(&mut alice, &conversation_id);
         let output = alice
             .handle_command(CoreCommand::SendTextMessage {
                 conversation_id: conversation_id.clone(),
@@ -3749,6 +3752,7 @@ pub(crate) mod tests {
         let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
         let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
+        peer_has_joined(&mut alice, &conversation_id);
         let output = alice
             .handle_command(CoreCommand::SendTextMessage {
                 conversation_id: conversation_id.clone(),
@@ -3810,6 +3814,7 @@ pub(crate) mod tests {
         let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
         let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
+        peer_has_joined(&mut alice, &conversation_id);
         let output = alice
             .handle_command(CoreCommand::SendTextMessage {
                 conversation_id,
@@ -5974,6 +5979,7 @@ pub(crate) mod tests {
         let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
         let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
+        peer_has_joined(&mut alice, &conversation_id);
         let upload = alice
             .handle_command(CoreCommand::SendAttachmentMessage {
                 conversation_id: conversation_id.clone(),
@@ -6252,6 +6258,7 @@ pub(crate) mod tests {
         let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
         let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
+        peer_has_joined(&mut alice, &conversation_id);
         alice.state.pending_outbox.clear();
         let mut descriptor = sample_attachment_descriptor();
         descriptor.mime_type = "image/png".into();
@@ -6465,6 +6472,7 @@ pub(crate) mod tests {
         let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
         let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
+        peer_has_joined(&mut alice, &conversation_id);
         let upload = alice
             .handle_command(CoreCommand::SendAttachmentMessage {
                 conversation_id: conversation_id.clone(),
@@ -6604,6 +6612,7 @@ pub(crate) mod tests {
         let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
         let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
+        peer_has_joined(&mut alice, &conversation_id);
         let appended = complete_direct_attachment_send(&mut alice, &conversation_id);
         let request_id = find_http_request_id(&appended, "/messages");
         alice
@@ -6841,6 +6850,7 @@ pub(crate) mod tests {
                 lanes: None,
                 fork: Default::default(),
                 rebuild: Default::default(),
+                awaiting_peer: false,
             },
         );
 
@@ -6911,6 +6921,7 @@ pub(crate) mod tests {
                 lanes: None,
                 fork: Default::default(),
                 rebuild: Default::default(),
+                awaiting_peer: false,
             },
         );
 
@@ -7452,6 +7463,7 @@ pub(crate) mod tests {
         let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
         let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
+        peer_has_joined(&mut alice, &conversation_id);
         let output = alice
             .handle_command(CoreCommand::SendTextMessage {
                 conversation_id: conversation_id.clone(),
@@ -7494,6 +7506,7 @@ pub(crate) mod tests {
         let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
         let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
+        peer_has_joined(&mut alice, &conversation_id);
         let output = alice
             .handle_command(CoreCommand::SendTextMessage {
                 conversation_id,
@@ -7583,6 +7596,7 @@ pub(crate) mod tests {
         let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
         let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
+        peer_has_joined(&mut alice, &conversation_id);
         let output = alice
             .handle_command(CoreCommand::SendTextMessage {
                 conversation_id: conversation_id.clone(),
@@ -7643,6 +7657,7 @@ pub(crate) mod tests {
         let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
         let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
+        peer_has_joined(&mut alice, &conversation_id);
         let output = alice
             .handle_command(CoreCommand::SendTextMessage {
                 conversation_id,
@@ -7726,6 +7741,7 @@ pub(crate) mod tests {
         let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
         let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
+        peer_has_joined(&mut alice, &conversation_id);
         let output = alice
             .handle_command(CoreCommand::SendTextMessage {
                 conversation_id: conversation_id.clone(),
@@ -9466,6 +9482,7 @@ pub(crate) mod tests {
         let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
         let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
         let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
+        peer_has_joined(&mut alice, &conversation_id);
 
         alice
             .state
@@ -9687,6 +9704,7 @@ pub(crate) mod tests {
                 lanes: None,
                 fork: Default::default(),
                 rebuild: Default::default(),
+                awaiting_peer: false,
             },
         );
         engine
@@ -11937,6 +11955,210 @@ pub(crate) mod tests {
         }
     }
 
+    /// What the host does with records sent under a token the recipient has
+    /// not registered: they wait in the first-contact queue, and accepting the
+    /// request releases the Welcome and nothing else. Every append succeeded,
+    /// so the sender holds none of those records any more. What the sender
+    /// holds back was never appended, and stays with it.
+    fn deliver_first_contact(
+        recipient: &mut CoreEngine,
+        sender: &mut CoreEngine,
+        device_id: &str,
+        seq: &mut u64,
+    ) -> CoreOutput {
+        let appended = |sender: &CoreEngine, item: &crate::ffi_api::types::PendingOutboxItem| {
+            item.envelope.recipient_device_id == device_id && !sender.outbox_item_is_held(item)
+        };
+        let queued = sender
+            .state
+            .pending_outbox
+            .iter()
+            .filter(|item| appended(sender, item))
+            .map(|item| item.envelope.clone())
+            .collect::<Vec<_>>();
+        let welcome = queued
+            .iter()
+            .find(|envelope| {
+                MlsAdapter::payload_is_welcome(envelope.payload_b64().unwrap_or_default())
+            })
+            .cloned()
+            .expect("a first-contact Welcome");
+        let held = sender
+            .state
+            .pending_outbox
+            .iter()
+            .filter(|item| !appended(sender, item))
+            .cloned()
+            .collect::<Vec<_>>();
+        sender.state.pending_outbox = held;
+        *seq += 1;
+        deliver_inbox_envelope(recipient, device_id, welcome, *seq)
+    }
+
+    /// Deliver everything both sides queue for each other, until neither has
+    /// anything new.
+    fn exchange_direct(first: &mut HarnessUser, second: &mut HarnessUser, seq: &mut u64) {
+        let first_device = first.bundle.devices[0].device_id.clone();
+        let second_device = second.bundle.devices[0].device_id.clone();
+        let mut seen_from_first = std::collections::BTreeSet::new();
+        let mut seen_from_second = std::collections::BTreeSet::new();
+        for _ in 0..8 {
+            let to_second = deliver_unseen(
+                &mut second.engine,
+                &mut first.engine,
+                &second_device,
+                &mut seen_from_first,
+                seq,
+            );
+            let to_first = deliver_unseen(
+                &mut first.engine,
+                &mut second.engine,
+                &first_device,
+                &mut seen_from_second,
+                seq,
+            );
+            if to_first + to_second == 0 {
+                return;
+            }
+        }
+    }
+
+    fn has_group_invite(user: &HarnessUser, from_user_id: &str) -> bool {
+        user.engine
+            .state
+            .conversations
+            .values()
+            .any(|conversation| {
+                conversation.conversation.kind == ConversationKind::Direct
+                    && conversation.peer_user_id == from_user_id
+                    && conversation.messages.iter().any(|message| {
+                        message.message_type == MessageType::ControlGroupWelcomePickup
+                    })
+            })
+    }
+
+    /// **A group invite reaches a contact who has no session yet.** Inviting
+    /// sets up the 1:1 session and sends its Welcome; the invite itself waits
+    /// until the invitee has joined, because until then the invitee's host
+    /// admits nothing under the session's token and releases only the Welcome
+    /// from the first-contact queue. The invitee may take days to accept, so
+    /// the inviter restarts in between.
+    #[test]
+    fn a_group_invite_to_a_contact_without_a_session_reaches_them() {
+        let mut alice = harness_user("alice", ALICE_MNEMONIC, "phone");
+        let mut bob = harness_user("bob", BOB_MNEMONIC, "phone");
+        import_peer_bundles(&mut [&mut alice, &mut bob]);
+        let mut harness = GroupHarness::with_bundles(&[&alice, &bob].map(|user| HarnessUser {
+            name: user.name,
+            bundle: user.bundle.clone(),
+            engine: CoreEngine::new(),
+        }));
+        harness.create_group(&mut alice, "Family", vec![bob.bundle.user_id.clone()]);
+        // Through the serialized form, as the profile store keeps it.
+        let on_disk =
+            serde_json::to_string(&alice.engine.refresh_snapshot()).expect("snapshot encodes");
+        alice.engine = CoreEngine::try_from_restored_state(
+            serde_json::from_str(&on_disk).expect("snapshot decodes"),
+        )
+        .expect("the inviter restarts");
+
+        let bob_device = bob.bundle.devices[0].device_id.clone();
+        let mut seq = 70_000;
+        deliver_first_contact(&mut bob.engine, &mut alice.engine, &bob_device, &mut seq);
+        exchange_direct(&mut alice, &mut bob, &mut seq);
+        assert!(
+            has_group_invite(&bob, &alice.bundle.user_id),
+            "the invitee never received the group invite"
+        );
+    }
+
+    /// **Nothing but the Welcome leaves before the peer joins.** Here the
+    /// session already exists but the peer has not joined, and the inviter's
+    /// rotation fell due long ago. Encrypting the invite would rotate first,
+    /// and a commit dropped with the rest of the first-contact queue would
+    /// leave the joiner an epoch behind for good. So neither the invite nor
+    /// the rotation goes out until the peer has been heard from; then both
+    /// do, and the two sides share the session.
+    #[test]
+    fn nothing_but_the_welcome_leaves_before_the_peer_joins() {
+        let mut alice = harness_user("alice", ALICE_MNEMONIC, "phone");
+        let mut bob = harness_user("bob", BOB_MNEMONIC, "phone");
+        import_peer_bundles(&mut [&mut alice, &mut bob]);
+        let mut harness = GroupHarness::with_bundles(&[&alice, &bob].map(|user| HarnessUser {
+            name: user.name,
+            bundle: user.bundle.clone(),
+            engine: CoreEngine::new(),
+        }));
+        let conversation_id =
+            create_direct_conversation(&mut alice.engine, bob.bundle.user_id.clone());
+        alice
+            .engine
+            .state
+            .conversations
+            .get_mut(&conversation_id)
+            .expect("session")
+            .pcs
+            .self_rotated_at_ms = Some(0);
+        harness.create_group(&mut alice, "Family", vec![bob.bundle.user_id.clone()]);
+
+        let bob_device = bob.bundle.devices[0].device_id.clone();
+        let leaving = alice
+            .engine
+            .state
+            .pending_outbox
+            .iter()
+            .filter(|item| {
+                item.envelope.recipient_device_id == bob_device
+                    && !alice.engine.outbox_item_is_held(item)
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !leaving.is_empty()
+                && leaving.iter().all(|item| {
+                    MlsAdapter::payload_is_welcome(item.envelope.payload_b64().unwrap_or_default())
+                }),
+            "before the peer joins, only its Welcome may leave; {} records would",
+            leaving.len()
+        );
+        assert_eq!(
+            alice.engine.state.conversations[&conversation_id]
+                .pcs
+                .self_rotated_at_ms,
+            Some(0),
+            "no rotation is made before the peer joins"
+        );
+
+        let mut seq = 71_000;
+        deliver_first_contact(&mut bob.engine, &mut alice.engine, &bob_device, &mut seq);
+        exchange_direct(&mut alice, &mut bob, &mut seq);
+        assert!(has_group_invite(&bob, &alice.bundle.user_id));
+        assert_eq!(
+            conversation_epoch(&alice.engine, &conversation_id),
+            conversation_epoch(&bob.engine, &conversation_id),
+            "both sides share the session"
+        );
+        assert!(
+            alice.engine.state.conversations[&conversation_id]
+                .pcs
+                .self_rotated_at_ms
+                .is_some_and(|at| at > 0),
+            "the rotation that fell due went out once the peer had joined"
+        );
+        alice
+            .engine
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "after joining".into(),
+            })
+            .expect("alice sends");
+        exchange_direct(&mut alice, &mut bob, &mut seq);
+        assert!(conversation_has_plaintext(
+            &bob.engine,
+            &conversation_id,
+            "after joining"
+        ));
+    }
+
     fn group_plaintexts(user: &HarnessUser, conversation_id: &str) -> Vec<String> {
         user.engine
             .state
@@ -13552,9 +13774,10 @@ pub(crate) mod tests {
     }
 
     /// Deliver every envelope `sender` queued for `device_id` that has not been
-    /// delivered yet, one record at a time and in queue order. A delivered
-    /// envelope leaves the sender's outbox, as a completed append would take
-    /// it: nothing the sender still holds can stand in for a lost record.
+    /// delivered yet and that it would append now, one record at a time and in
+    /// queue order. A delivered envelope leaves the sender's outbox, as a
+    /// completed append would take it: nothing the sender still holds can
+    /// stand in for a lost record.
     fn deliver_unseen(
         recipient: &mut CoreEngine,
         sender: &mut CoreEngine,
@@ -13567,7 +13790,9 @@ pub(crate) mod tests {
             .pending_outbox
             .iter()
             .filter(|item| {
-                item.envelope.recipient_device_id == device_id && !seen.contains(&item.envelope.mid)
+                item.envelope.recipient_device_id == device_id
+                    && !seen.contains(&item.envelope.mid)
+                    && !sender.outbox_item_is_held(item)
             })
             .map(|item| item.envelope.clone())
             .collect::<Vec<_>>();
@@ -16942,10 +17167,34 @@ pub(crate) mod tests {
         pub(crate) bob_device_id: String,
     }
 
+    /// Alice created the session, Bob joined from her Welcome, and Alice has
+    /// heard Bob's `ContactAccepted`, so both sides are in the session.
     pub(crate) fn paired_direct_chat() -> PairedDirectChat {
         let mut chat = unjoined_direct_chat();
         deliver_pending_outbox_to_device(&mut chat.bob, &chat.alice, &chat.bob_device_id);
+        let accepted = last_pending_envelope(
+            &chat.bob,
+            &chat.alice_device_id,
+            MessageType::MlsApplication,
+        );
+        chat.bob
+            .state
+            .pending_outbox
+            .retain(|item| item.envelope.mid != accepted.mid);
+        deliver_inbox_envelope(&mut chat.alice, &chat.alice_device_id, accepted, 1);
         chat
+    }
+
+    /// The peer joined and has been heard from, as `paired_direct_chat` has
+    /// it happen. For tests about sending in an established session that have
+    /// no engine for the peer.
+    fn peer_has_joined(engine: &mut CoreEngine, conversation_id: &str) {
+        engine
+            .state
+            .conversations
+            .get_mut(conversation_id)
+            .expect("session")
+            .awaiting_peer = false;
     }
 
     pub(crate) fn unjoined_direct_chat() -> PairedDirectChat {

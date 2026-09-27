@@ -1170,6 +1170,9 @@ impl CoreEngine {
             .insert(conversation_id.clone(), local_conversation);
         self.assign_initiator_lanes(&conversation_id, c1, c2.clone());
         self.initialize_direct_pcs_after_create(&conversation_id)?;
+        if let Some(state) = self.state.conversations.get_mut(&conversation_id) {
+            state.awaiting_peer = true;
+        }
         let register_c2 = self.register_accepted_lane(c2)?;
 
         let mut generated = Vec::new();
@@ -3409,18 +3412,38 @@ impl CoreEngine {
         Ok(())
     }
 
-    /// The peer was seen in `peer_epoch`: our commits that created that epoch
+    /// A frame of the peer's authenticated in `peer_epoch` of the session.
+    ///
+    /// If this device was still waiting for the peer to join, it has now, and
+    /// what waited in the outbox may go. Our commits that created that epoch
     /// or an earlier one are no longer pending, and what they kept for a race
     /// goes. The KeyPackage matters most: while its private keys exist, a
     /// snapshot could open a re-entry to it.
-    pub(super) fn resolve_direct_pending(&mut self, conversation_id: &str, peer_epoch: u64) {
+    pub(super) fn peer_seen_in_session(&mut self, conversation_id: &str, peer_epoch: u64) {
         let resolved = self
             .state
             .conversations
             .get_mut(conversation_id)
-            .map(|state| state.pcs.resolve_pending(peer_epoch))
+            .map(|state| {
+                state.awaiting_peer = false;
+                state.pcs.resolve_pending(peer_epoch)
+            })
             .unwrap_or_default();
         self.discard_pending_commits(resolved);
+    }
+
+    /// Whether an outbox item waits for its session's peer to join; see
+    /// [`crate::conversation::LocalConversationState::awaiting_peer`]. Only
+    /// the Welcome goes before that.
+    pub(crate) fn outbox_item_is_held(
+        &self,
+        item: &crate::ffi_api::types::PendingOutboxItem,
+    ) -> bool {
+        !MlsAdapter::payload_is_welcome(item.envelope.payload_b64().unwrap_or_default())
+            && self
+                .conversation_id_for_lane(&item.envelope.lane)
+                .and_then(|conversation_id| self.state.conversations.get(&conversation_id))
+                .is_some_and(|state| state.awaiting_peer)
     }
 
     fn discard_pending_commits(&mut self, commits: Vec<PendingCommit>) {
@@ -3491,6 +3514,16 @@ impl CoreEngine {
     pub(super) fn maybe_rotate_direct_pcs(&mut self, conversation_id: &str) -> CoreResult<bool> {
         if !self.conversation_is_direct(conversation_id)
             || self.conversation_is_compromised(conversation_id)
+        {
+            return Ok(false);
+        }
+        // A commit the peer cannot yet receive would leave it an epoch behind
+        // for good; see `LocalConversationState::awaiting_peer`.
+        if self
+            .state
+            .conversations
+            .get(conversation_id)
+            .is_some_and(|state| state.awaiting_peer)
         {
             return Ok(false);
         }

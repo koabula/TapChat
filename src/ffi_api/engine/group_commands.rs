@@ -249,6 +249,7 @@ impl CoreEngine {
                 lanes: None,
                 fork: Default::default(),
                 rebuild: Default::default(),
+                awaiting_peer: false,
             },
         );
 

@@ -951,6 +951,7 @@ impl CoreEngine {
             if self
                 .conversation_id_for_lane(&item.envelope.lane)
                 .is_some_and(|conversation_id| self.conversation_is_compromised(&conversation_id))
+                || self.outbox_item_is_held(&item)
             {
                 continue;
             }
@@ -3320,7 +3321,7 @@ impl CoreEngine {
                             // earlier one.
                             if let Ok(epoch) = MlsAdapter::protocol_message_epoch(inline_ciphertext)
                             {
-                                self.resolve_direct_pending(&conversation_id, epoch);
+                                self.peer_seen_in_session(&conversation_id, epoch);
                             }
                             log::info!(
                                 "handle_inbox_records: AppliedApplication for message {}, plaintext len={}",
@@ -3794,7 +3795,7 @@ impl CoreEngine {
                                     // our rotation debt alone: a peer commit does
                                     // not replace our leaf key, so it heals nothing
                                     // of ours.
-                                    self.resolve_direct_pending(
+                                    self.peer_seen_in_session(
                                         &conversation_id,
                                         authenticated_commit
                                             .as_ref()

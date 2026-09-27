@@ -145,7 +145,10 @@
       "scope": "model",
       "authenticatedBy": "the application frame's keys",
       "rotatesWithP": true,
-      "witness": ["group_invite_rides_the_direct_session"]
+      "witness": [
+        "group_invite_rides_the_direct_session",
+        "a_group_invite_to_a_contact_without_a_session_reaches_them"
+      ]
     },
     {
       "id": "attachment-bytes",
