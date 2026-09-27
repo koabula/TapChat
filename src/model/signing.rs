@@ -359,6 +359,39 @@ mod tests {
     /// the domain is length-prefixed a prefix relation cannot actually cause a
     /// collision, but a domain that is a prefix of another is a sign someone
     /// versioned by appending, so reject it too.
+    /// The device key signs MLS content under `SignWithLabel` and every
+    /// payload of this module, and the host picks part of what one of them
+    /// signs (the nonce of `DeviceRuntimeAuth`). The two message spaces must
+    /// therefore be disjoint, or a signature obtained here would also be an
+    /// MLS signature. A payload opens with the `u32` length of its domain,
+    /// whose first byte is 0; an MLS `SignContent` opens with the
+    /// variable-length size of `"MLS 1.0 " + label`, which is never 0.
+    #[test]
+    fn no_payload_is_an_mls_sign_content() {
+        use openmls::prelude::tls_codec::{Serialize as _, VLBytes};
+
+        for domain in SignatureDomain::ALL {
+            let payload = SigningPayload::new(*domain);
+            assert_eq!(
+                payload.bytes.first(),
+                Some(&0),
+                "{domain:?} does not open with a zero byte"
+            );
+        }
+        // Every label RFC 9420 signs under (§5.1.2).
+        for label in [
+            "FramedContentTBS",
+            "LeafNodeTBS",
+            "KeyPackageTBS",
+            "GroupInfoTBS",
+        ] {
+            let encoded = VLBytes::new(format!("MLS 1.0 {label}").into_bytes())
+                .tls_serialize_detached()
+                .expect("encode label");
+            assert_ne!(encoded[0], 0, "an MLS SignContent for {label} opens with 0");
+        }
+    }
+
     #[test]
     fn every_signature_domain_is_distinct() {
         for (index, left) in SignatureDomain::ALL.iter().enumerate() {
