@@ -31,17 +31,17 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::direct_pcs::DIRECT_PCS_MAX_AGE_MS;
+use crate::direct_pcs::{DIRECT_DELIVERY_BOUND_MS, DIRECT_PCS_MAX_AGE_MS};
 use crate::lane_wrap::WRAP_KEY_LEN;
 
-/// How long a witness is kept after its commit merged.
+/// How long a witness is kept after its commit merged: `τ ≥ T + Δ`.
 ///
-/// An honest device rotates at least once every `2 × DIRECT_PCS_MAX_AGE_MS`
+/// An honest device rotates at least once every `T = 2 × DIRECT_PCS_MAX_AGE_MS`
 /// (the non-designated party's deadline in `DirectPcsState::should_rotate`),
-/// so its first commit after a fork is made within that bound; the third
-/// interval is slack for delivery. A commit arriving later than this falls
-/// outside the liveness premise the detection is claimed under.
-pub const FORK_WITNESS_TTL_MS: u64 = 3 * DIRECT_PCS_MAX_AGE_MS;
+/// so its first commit after a fork is made within `T`, and it arrives within
+/// the delivery bound `Δ`. A commit arriving later than this falls outside the
+/// liveness premise the detection is claimed under.
+pub const FORK_WITNESS_TTL_MS: u64 = 2 * DIRECT_PCS_MAX_AGE_MS + DIRECT_DELIVERY_BOUND_MS;
 
 /// A peer commit this device merged, kept so a second commit on the same base
 /// epoch can be recognised.

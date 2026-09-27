@@ -1228,6 +1228,7 @@ impl CoreEngine {
             sent_at,
         )?;
         let protected_bytes = protected_message.to_json_bytes()?;
+        self.rotate_direct_pcs_before_encrypting(&conversation_id)?;
         let payload = self
             .state
             .mls_adapter
@@ -1851,6 +1852,7 @@ impl CoreEngine {
         body: String,
         storage_refs: Vec<StorageRef>,
     ) -> CoreResult<(Vec<Envelope>, String)> {
+        self.rotate_direct_pcs_before_encrypting(conversation_id)?;
         let peer_user_id = self.peer_user_for_conversation(conversation_id)?;
         let known_devices = self
             .direct_peer_contact_bundle(&peer_user_id)
@@ -3357,6 +3359,30 @@ impl CoreEngine {
         if let Some(state) = self.state.conversations.get_mut(conversation_id) {
             state.pcs.note_application_message();
         }
+    }
+
+    /// Called just before a direct application message is encrypted. A
+    /// rotation that is already due happens first, so the message goes out in
+    /// the new epoch. The time bound heals a quiet conversation only this way:
+    /// decided after encrypting, the first message once the bound had passed
+    /// would still travel in the epoch a snapshot exposed. The decision after
+    /// sending stays, since it is the one that counts the message itself.
+    ///
+    /// Inside a rotation the announcement it sends comes through here too; by
+    /// then the rotation has been recorded, so nothing is due.
+    ///
+    /// Not while an inbound batch is open: rotation is decided on its settled
+    /// end (see [`Self::maybe_rotate_direct_pcs`]). The one direct frame sent
+    /// part-way through a batch is the empty `ContactAccepted`, which carries
+    /// nothing of the user's.
+    pub(super) fn rotate_direct_pcs_before_encrypting(
+        &mut self,
+        conversation_id: &str,
+    ) -> CoreResult<()> {
+        if self.state.inbound_batch_depth > 0 {
+            return Ok(());
+        }
+        self.maybe_rotate_direct_pcs(conversation_id).map(|_| ())
     }
 
     /// Replace this device's leaf key if the rotation schedule says it is due,

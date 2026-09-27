@@ -8,7 +8,21 @@ pub const DIRECT_PCS_COMMIT_INTERVAL: u32 = 32;
 /// Time-based fallback for `should_rotate`: a low-traffic conversation may
 /// never reach `DIRECT_PCS_COMMIT_INTERVAL` messages, which would otherwise
 /// let post-compromise healing stall indefinitely.
-pub const DIRECT_PCS_MAX_AGE_MS: u64 = 30 * 24 * 60 * 60 * 1000;
+///
+/// The non-designated party waits twice this, so an honest device's leaf is
+/// never older than `2 × DIRECT_PCS_MAX_AGE_MS` when it next sends: that is
+/// the `T` of `LIVE(T, Δ)`, and it also bounds how long a counterparty's stale
+/// leaf can reach back when it is later corrupted. A week costs at most one
+/// commit a week in a quiet conversation.
+pub const DIRECT_PCS_MAX_AGE_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+
+/// The longest a record is taken to wait for delivery: the `Δ` of
+/// `LIVE(T, Δ)`. An inbox drops records older than its retention period
+/// (`RETENTION_DAYS`, 30 in the reference deployment), so a record that has
+/// not been fetched by then is gone, and nothing that waits for one needs to
+/// wait longer. A deployment that keeps records longer lengthens `Δ` beyond
+/// what the waits below cover.
+pub const DIRECT_DELIVERY_BOUND_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 
 /// Our own commit for `base_epoch`, retained only long enough to arbitrate a
 /// same-epoch race with the peer.

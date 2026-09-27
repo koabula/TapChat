@@ -26,12 +26,13 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::direct_pcs::DIRECT_PCS_MAX_AGE_MS;
+use crate::direct_pcs::DIRECT_DELIVERY_BOUND_MS;
 use crate::lane_wrap::WRAP_KEY_LEN;
 
 /// How long a race winner waits for the loser's rebuild. The loser rebuilds
-/// the moment it sees the winning commit, so this only has to cover delivery.
-pub const EXPECTED_REBUILD_TTL_MS: u64 = DIRECT_PCS_MAX_AGE_MS;
+/// the moment it sees the winning commit, so this only has to cover delivery:
+/// the winning commit's and then the Welcome's, each within `Δ`.
+pub const EXPECTED_REBUILD_TTL_MS: u64 = 2 * DIRECT_DELIVERY_BOUND_MS;
 
 /// A rebuild this device agreed to when it won a commit race.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

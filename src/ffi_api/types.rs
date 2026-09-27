@@ -1360,6 +1360,9 @@ pub(crate) struct CoreState {
     /// Not persisted: the first output after restore writes every row again
     /// without one, and clears it.
     pub(crate) mls_rows_carry_store: bool,
+    /// Inbound batches being processed; rotation decisions wait for the
+    /// settled end of the outermost one. Not persisted.
+    pub(crate) inbound_batch_depth: u32,
     pub(crate) published_key_package: Option<PublishedKeyPackage>,
     pub(crate) key_package_inventory: Vec<PublishedKeyPackage>,
     pub(crate) pending_identity_publication: Option<crate::persistence::PendingIdentityPublication>,
@@ -1619,6 +1622,7 @@ impl Default for CoreState {
             mls_adapter: None,
             mls_summaries: BTreeMap::new(),
             mls_rows_carry_store: false,
+            inbound_batch_depth: 0,
             published_key_package: None,
             key_package_inventory: Vec::new(),
             pending_identity_publication: None,

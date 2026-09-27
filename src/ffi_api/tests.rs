@@ -14775,6 +14775,89 @@ pub(crate) mod tests {
         }
     }
 
+    /// A rotation that is overdue happens before the next message is encrypted,
+    /// not after. The time bound is what heals a quiet conversation: if the
+    /// decision came only after encrypting, the first message sent once the
+    /// bound had passed would still go out in the epoch a snapshot exposed.
+    #[test]
+    fn an_overdue_rotation_happens_before_the_next_message() {
+        let mut chat = paired_direct_chat();
+        let conversation_id = chat.conversation_id.clone();
+        let bob_device = chat.bob_device_id.clone();
+        chat.alice
+            .state
+            .conversations
+            .get_mut(&conversation_id)
+            .expect("conversation")
+            .pcs
+            .self_rotated_at_ms = Some(0);
+
+        chat.alice
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "after a long silence".into(),
+            })
+            .expect("send");
+        let message = last_pending_application_envelope(&chat.alice, &bob_device);
+        let commit = last_pending_envelope(&chat.alice, &bob_device, MessageType::MlsCommit);
+
+        // Without the commit, the peer cannot read it: it is not in the old epoch.
+        deliver_inbox_envelope(&mut chat.bob, &bob_device, message.clone(), 80_000);
+        assert!(
+            !conversation_has_plaintext(&chat.bob, &conversation_id, "after a long silence"),
+            "the first message after the bound must not be in the overdue epoch"
+        );
+        // With it, the message opens.
+        deliver_inbox_envelope(&mut chat.bob, &bob_device, commit, 80_001);
+        deliver_inbox_envelope(&mut chat.bob, &bob_device, under_fresh_mid(message), 80_002);
+        assert!(conversation_has_plaintext(
+            &chat.bob,
+            &conversation_id,
+            "after a long silence"
+        ));
+    }
+
+    /// The rotation made before encrypting is not decided while an inbound
+    /// batch is open: rotation waits for the batch's settled end, so that a
+    /// commit later in the same backlog is read before we commit ourselves.
+    /// No honest path sends user content part-way through a batch, so the
+    /// batch is opened by hand here; the frame then stays in the current
+    /// epoch, and the decision after sending still rotates.
+    #[test]
+    fn the_rotation_before_encrypting_waits_for_an_open_batch() {
+        let mut chat = paired_direct_chat();
+        let conversation_id = chat.conversation_id.clone();
+        let bob_device = chat.bob_device_id.clone();
+        chat.alice
+            .state
+            .conversations
+            .get_mut(&conversation_id)
+            .expect("conversation")
+            .pcs
+            .self_rotated_at_ms = Some(0);
+        chat.alice.state.inbound_batch_depth = 1;
+        chat.alice
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "inside an open batch".into(),
+            })
+            .expect("send");
+        chat.alice.state.inbound_batch_depth = 0;
+        assert!(
+            chat.alice.state.conversations[&conversation_id]
+                .pcs
+                .own_commit
+                .is_some(),
+            "the decision after sending still rotates"
+        );
+        let message = last_pending_application_envelope(&chat.alice, &bob_device);
+        deliver_inbox_envelope(&mut chat.bob, &bob_device, message, 81_000);
+        assert!(
+            conversation_has_plaintext(&chat.bob, &conversation_id, "inside an open batch"),
+            "no rotation is decided before encrypting while the batch is open"
+        );
+    }
+
     /// The rotation decision runs once the inbound batch has settled, never
     /// per record. A device returning from an absence drains a backlog whose
     /// tail carries the peer's own commit; deciding mid-batch would cross the

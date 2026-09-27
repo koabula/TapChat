@@ -723,6 +723,7 @@ impl CoreEngine {
                 mls_adapter: restored_mls.adapter,
                 mls_summaries,
                 mls_rows_carry_store: restored_mls.legacy_row_stores,
+                inbound_batch_depth: 0,
                 published_key_package: persisted_deployment
                     .as_ref()
                     .and_then(|deployment| deployment.published_key_package.clone()),

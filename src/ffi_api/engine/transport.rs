@@ -3082,6 +3082,28 @@ impl CoreEngine {
         allow_pending_replay: bool,
         source: InboxRecordSource,
     ) -> CoreResult<CoreOutput> {
+        // While a batch is open, rotation waits for its settled end; see
+        // `rotate_direct_pcs_before_encrypting`.
+        self.state.inbound_batch_depth += 1;
+        let result = self.handle_inbox_records_batch(
+            device_id,
+            records,
+            to_seq,
+            allow_pending_replay,
+            source,
+        );
+        self.state.inbound_batch_depth -= 1;
+        result
+    }
+
+    fn handle_inbox_records_batch(
+        &mut self,
+        device_id: String,
+        records: Vec<InboxRecord>,
+        to_seq: u64,
+        allow_pending_replay: bool,
+        source: InboxRecordSource,
+    ) -> CoreResult<CoreOutput> {
         // Validate the shape of the transport *frame* before touching
         // conversation, MLS, seen-message, or checkpoint state. A malformed
         // frame must be safely retryable and must never consume a delivery.
