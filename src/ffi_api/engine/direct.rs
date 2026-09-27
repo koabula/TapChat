@@ -3689,6 +3689,7 @@ impl CoreEngine {
         &mut self,
         conversation_id: &str,
         incoming: &crate::direct_frame::AuthenticatedDirectCommit,
+        received_at_ms: u64,
     ) -> CoreResult<Option<CoreOutput>> {
         if !self.conversation_is_direct(conversation_id) {
             return Ok(None);
@@ -3707,11 +3708,21 @@ impl CoreEngine {
             // We won. The peer will find our commit, lose, and rebuild; its
             // Welcome will come wrapped under the key its losing commit came
             // under, which is the only thing that tells it from a Welcome a
-            // stolen device key signed. Remember that key, and nothing else.
+            // stolen device key signed. Remember that key.
+            //
+            // The losing commit is also the peer's one signature on this
+            // epoch, so it is witnessed like a merged one: a replay of it is
+            // the same commit, and only a different one is a double sign.
             Some(true) => {
                 log::warn!(
                     "direct_pcs_arbitration: discarding a commit that lost to ours in conversation {}",
                     redact_id("conversation", conversation_id)
+                );
+                self.record_peer_commit_witness(
+                    conversation_id,
+                    incoming,
+                    incoming.wrap_key,
+                    received_at_ms,
                 );
                 let now_ms = current_unix_millis(self.state.message_nonce);
                 if let Some(state) = self.state.conversations.get_mut(conversation_id) {
@@ -3766,7 +3777,8 @@ impl CoreEngine {
     }
 
     /// Keep what a double sign on this commit's base epoch would be checked
-    /// against; see [`crate::direct_fork`].
+    /// against; see [`crate::direct_fork`]. For every peer commit that
+    /// authenticated, whether it merged or lost a race to ours.
     pub(super) fn record_peer_commit_witness(
         &mut self,
         conversation_id: &str,

@@ -13248,6 +13248,112 @@ pub(crate) mod tests {
         }
     }
 
+    /// **A race loser's own commit, replayed, is not a fork.** Accepting the
+    /// rebuild Welcome leaves the winner a retired-session witness for the
+    /// race's base epoch, under the key the losing commit travelled under.
+    /// That commit is the loser's one honest signature at the base epoch, and
+    /// the host still has it: redelivered under a fresh message id it must not
+    /// read as a double sign.
+    #[test]
+    fn a_replayed_losing_commit_is_not_a_fork() {
+        let mut chat = paired_direct_chat();
+        let conversation_id = chat.conversation_id.clone();
+        let alice_is_winner = alice_is_designated(&chat);
+        let winner_device = rotator_device_id(&chat, alice_is_winner).to_string();
+        let loser_device = peer_device_id(&chat, alice_is_winner).to_string();
+        set_direct_pcs_debt(
+            peer_engine_mut(&mut chat, alice_is_winner),
+            &conversation_id,
+            DIRECT_PCS_COMMIT_INTERVAL * 2 - 1,
+        );
+        peer_engine_mut(&mut chat, alice_is_winner)
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "loser rotation".into(),
+            })
+            .expect("loser send");
+        let loser_commit = last_pending_envelope(
+            peer_engine(&chat, alice_is_winner),
+            &winner_device,
+            MessageType::MlsCommit,
+        );
+        set_direct_pcs_debt(
+            rotator_engine_mut(&mut chat, alice_is_winner),
+            &conversation_id,
+            DIRECT_PCS_COMMIT_INTERVAL - 1,
+        );
+        rotator_engine_mut(&mut chat, alice_is_winner)
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "winner rotation".into(),
+            })
+            .expect("winner send");
+        let winner_commit = last_pending_envelope(
+            rotator_engine(&chat, alice_is_winner),
+            &loser_device,
+            MessageType::MlsCommit,
+        );
+        deliver_inbox_envelope(
+            rotator_engine_mut(&mut chat, alice_is_winner),
+            &winner_device,
+            loser_commit.clone(),
+            51_000,
+        );
+        let losing_key = peer_engine(&chat, alice_is_winner).state.conversations[&conversation_id]
+            .pcs
+            .own_commit
+            .as_ref()
+            .and_then(|own| own.wrap_key)
+            .expect("the losing commit's key");
+        let output = deliver_inbox_envelope(
+            peer_engine_mut(&mut chat, alice_is_winner),
+            &loser_device,
+            winner_commit,
+            51_001,
+        );
+        let key_package = rotator_engine(&chat, alice_is_winner)
+            .state
+            .published_key_package
+            .as_ref()
+            .expect("winner's current key package")
+            .key_package_b64
+            .clone();
+        answer_key_package_claims(
+            peer_engine_mut(&mut chat, alice_is_winner),
+            output,
+            &key_package,
+        );
+        let welcome = rebuild_welcome(peer_engine(&chat, alice_is_winner), &losing_key);
+        deliver_inbox_envelope(
+            rotator_engine_mut(&mut chat, alice_is_winner),
+            &winner_device,
+            welcome,
+            51_002,
+        );
+        assert!(
+            !conversation_is_compromised(rotator_engine(&chat, alice_is_winner), &conversation_id),
+            "premise: the rebuild itself is honest"
+        );
+
+        deliver_inbox_envelope(
+            rotator_engine_mut(&mut chat, alice_is_winner),
+            &winner_device,
+            under_fresh_mid(loser_commit),
+            51_003,
+        );
+        let winner = rotator_engine(&chat, alice_is_winner);
+        assert!(
+            !conversation_is_compromised(winner, &conversation_id),
+            "a replay of the loser's honest commit must not read as a double sign"
+        );
+        assert_eq!(
+            winner.state.conversations[&conversation_id]
+                .fork
+                .forked_since_ms,
+            None
+        );
+    }
+
     fn answer_key_package_claims(
         engine: &mut CoreEngine,
         mut output: CoreOutput,

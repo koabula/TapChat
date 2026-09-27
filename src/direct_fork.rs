@@ -21,9 +21,11 @@
 //!
 //! By the time that commit arrives Q may have moved several epochs on, and a
 //! frame is wrapped under its own base epoch's key, which Q has overwritten.
-//! So for each peer commit it merges, Q keeps the inbound wrap key of that
-//! commit's base epoch (`K_c`, the commit key; see `lane_wrap`) alongside its
-//! signature data. The key also scopes the comparison: a frame opens under it
+//! So for each peer commit that authenticates, whether Q merges it or wins a
+//! race against it, Q keeps the inbound wrap key of that commit's base epoch
+//! (`K_c`, the commit key; see `lane_wrap`) alongside its signature data. A
+//! beaten commit counts: it is the peer's one signature on that epoch, and
+//! the peer's later rebuild does not change that. The key also scopes the comparison: a frame opens under it
 //! only if it was wrapped at that epoch of this incarnation of the group, so a
 //! rebuild that restarts the epoch count cannot produce a false match, and
 //! witnesses survive a rebuild. They have to: a rebuild the adversary can
@@ -43,8 +45,8 @@ use crate::lane_wrap::WRAP_KEY_LEN;
 /// liveness premise the detection is claimed under.
 pub const FORK_WITNESS_TTL_MS: u64 = 2 * DIRECT_PCS_MAX_AGE_MS + DIRECT_DELIVERY_BOUND_MS;
 
-/// A peer commit this device merged, kept so a second commit on the same base
-/// epoch can be recognised.
+/// A peer commit this device merged or beat, kept so a second commit on the
+/// same base epoch can be recognised.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PeerCommitWitness {
@@ -69,9 +71,10 @@ pub struct PeerCommitWitness {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ForkGuard {
-    /// Pruned by age only. Every entry is a commit that authenticated and
-    /// merged, so the list grows with the peer's rotations the way the
-    /// transcript grows with its messages.
+    /// Pruned by age only. Every entry is a commit that authenticated, merged
+    /// or beaten, or a session this device left for the peer's rebuild, so
+    /// the list grows with the peer's rotations the way the transcript grows
+    /// with its messages. At most one entry per key.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub witnesses: Vec<PeerCommitWitness>,
     /// When the record carrying the commit that the double sign contradicts
@@ -87,9 +90,27 @@ impl ForkGuard {
         self.witnesses.is_empty() && self.forked_since_ms.is_none()
     }
 
+    /// Keep `witness`, unless its key already has one.
+    ///
+    /// A key opens one epoch of one group, and the peer signs at most one
+    /// commit there, so a second witness under the same key can only be the
+    /// empty one left when this device joins the peer's rebuild, for the epoch
+    /// of the race it won. The commit it beat there is the better record: the
+    /// empty witness would call that commit's replay a double sign, and it
+    /// outlives the commit's own witness, which was recorded first.
     pub fn record(&mut self, witness: PeerCommitWitness, now_ms: u64) {
         self.prune(now_ms);
-        self.witnesses.push(witness);
+        match self
+            .witnesses
+            .iter_mut()
+            .find(|held| held.wrap_key == witness.wrap_key)
+        {
+            Some(held) if held.commit_hash.is_empty() && !witness.commit_hash.is_empty() => {
+                *held = witness;
+            }
+            Some(_) => {}
+            None => self.witnesses.push(witness),
+        }
     }
 
     pub fn prune(&mut self, now_ms: u64) {
@@ -104,7 +125,7 @@ impl ForkGuard {
     }
 
     /// The witness whose base epoch a frame opened under `key` was wrapped at.
-    /// One merge per epoch, so at most one.
+    /// [`Self::record`] keeps one per key.
     pub fn witness_for_key(&self, key: &[u8; WRAP_KEY_LEN]) -> Option<&PeerCommitWitness> {
         self.witnesses
             .iter()
@@ -153,6 +174,23 @@ mod tests {
         assert!(!ForkGuard::contradicts(&merged, 3, "sha256:3"));
         assert!(!ForkGuard::contradicts(&merged, 4, "sha256:other"));
         assert!(ForkGuard::contradicts(&merged, 3, "sha256:other"));
+    }
+
+    #[test]
+    fn a_witnessed_commit_is_not_shadowed_by_an_empty_witness() {
+        let beaten = witness(3, 1, 0);
+        let retired = PeerCommitWitness {
+            commit_hash: String::new(),
+            merged_at_ms: 10,
+            ..beaten.clone()
+        };
+        for order in [[&beaten, &retired], [&retired, &beaten]] {
+            let mut guard = ForkGuard::default();
+            for held in order {
+                guard.record(held.clone(), 10);
+            }
+            assert_eq!(guard.witnesses, vec![beaten.clone()]);
+        }
     }
 
     #[test]

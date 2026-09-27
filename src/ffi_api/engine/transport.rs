@@ -3626,9 +3626,11 @@ impl CoreEngine {
                                     "resolved direct commit is missing authentication proof",
                                 )
                             })?;
-                            if let Some(extra) =
-                                self.direct_pcs_arbitration(&conversation_id, commit)?
-                            {
+                            if let Some(extra) = self.direct_pcs_arbitration(
+                                &conversation_id,
+                                commit,
+                                record.received_at,
+                            )? {
                                 output = merge_outputs(output, extra);
                                 self.finish_mls_apply_pending(
                                     &device_id,

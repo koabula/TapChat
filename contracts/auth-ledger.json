@@ -98,7 +98,8 @@
       "rotatesWithP": true,
       "witness": [
         "fork_is_detected_by_the_counterparty",
-        "a_race_rebuild_by_a_thief_is_detected_when_the_victim_commits"
+        "a_race_rebuild_by_a_thief_is_detected_when_the_victim_commits",
+        "a_replayed_losing_commit_is_not_a_fork"
       ]
     },
     {
