@@ -278,7 +278,7 @@ fn local_mls_state(
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, SerdeDeserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, SerdeDeserialize, Default)]
 struct SerializableStore {
     values: BTreeMap<String, String>,
 }
@@ -289,6 +289,8 @@ struct PersistedGroupState {
     local_device_id: String,
     signer: SignatureKeyPair,
     credential_with_key: CredentialWithKey,
+    /// Empty when `store_elsewhere` is set.
+    #[serde(default)]
     storage: SerializableStore,
     #[serde(default)]
     pcs_update_sidecar: BTreeMap<String, PcsUpdateSidecar>,
@@ -297,6 +299,10 @@ struct PersistedGroupState {
     /// written before it existed.
     #[serde(default)]
     store_revision: u64,
+    /// The row carries no store: the one copy is kept beside the rows (see
+    /// [`MlsAdapter::export_persisted_group_row`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    store_elsewhere: bool,
 }
 
 /// A compare-and-swap delta for the OpenMLS provider entries changed while a
@@ -338,6 +344,9 @@ pub struct RestoreMlsStateResult {
     pub summaries: BTreeMap<String, MlsStateSummary>,
     pub failed_conversation_ids: Vec<String>,
     pub failures: Vec<RestoreMlsFailure>,
+    /// Some row carried a dump of the store. Whatever wrote it last is still
+    /// on disk until every such row is written again.
+    pub legacy_row_stores: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -735,7 +744,7 @@ impl MlsAdapter {
                 current.values.remove(key);
             }
         }
-        let serialized = self.serialize_with_store(current, None)?;
+        let serialized = self.serialize_with_store(Some(current), None)?;
         Self::restore_serialized_state(&serialized, summaries)
     }
 
@@ -1786,13 +1795,36 @@ impl MlsAdapter {
         ))
     }
 
+    /// A self-contained row, carrying a dump of the whole provider store. Used
+    /// where the rows are the only copy, as in an in-memory fork; what a host
+    /// persists is [`Self::export_persisted_group_row`].
     pub fn export_persisted_group_state(&self, conversation_id: &str) -> CoreResult<String> {
         if !self.groups.contains_key(conversation_id) {
             return Err(CoreError::invalid_input(
                 "conversation MLS state does not exist",
             ));
         }
-        self.serialize_with_store(self.serializable_store()?, Some(conversation_id))
+        self.serialize_with_store(Some(self.serializable_store()?), Some(conversation_id))
+    }
+
+    /// A conversation's row without the provider store, which is kept once,
+    /// in [`Self::export_bootstrap_state`]. A row that carried the store was
+    /// written only when its own conversation changed, so it kept every other
+    /// conversation's secrets as they stood then, long after the store had
+    /// deleted them.
+    pub fn export_persisted_group_row(&self, conversation_id: &str) -> CoreResult<String> {
+        if !self.groups.contains_key(conversation_id) {
+            return Err(CoreError::invalid_input(
+                "conversation MLS state does not exist",
+            ));
+        }
+        self.serialize_with_store(None, Some(conversation_id))
+    }
+
+    /// The provider store as persisted, one base64 value per base64 key.
+    #[cfg(test)]
+    pub fn provider_store_values(&self) -> CoreResult<BTreeMap<String, String>> {
+        Ok(self.serializable_store()?.values)
     }
 
     pub fn export_bootstrap_state(&self) -> CoreResult<String> {
@@ -1847,6 +1879,7 @@ impl MlsAdapter {
             storage,
             pcs_update_sidecar: _,
             store_revision,
+            store_elsewhere: _,
         } = parsed;
         let digest = store_sha256(&storage)?;
         {
@@ -1878,7 +1911,7 @@ impl MlsAdapter {
     }
 
     fn export_serializable_state(&self) -> CoreResult<String> {
-        self.serialize_with_store(self.serializable_store()?, None)
+        self.serialize_with_store(Some(self.serializable_store()?), None)
     }
 
     fn serializable_store(&self) -> CoreResult<SerializableStore> {
@@ -1893,9 +1926,10 @@ impl MlsAdapter {
         })
     }
 
+    /// `storage: None` writes a row that points at the store kept elsewhere.
     fn serialize_with_store(
         &self,
-        storage: SerializableStore,
+        storage: Option<SerializableStore>,
         only_conversation_id: Option<&str>,
     ) -> CoreResult<String> {
         let pcs_update_sidecar = self
@@ -1915,7 +1949,14 @@ impl MlsAdapter {
                 )
             })
             .collect();
-        let store_revision = self.stamp_store_revision(&storage)?;
+        let store_elsewhere = storage.is_none();
+        let (storage, store_revision) = match storage {
+            Some(storage) => {
+                let revision = self.stamp_store_revision(&storage)?;
+                (storage, revision)
+            }
+            None => (SerializableStore::default(), 0),
+        };
         serde_json::to_string(&PersistedGroupState {
             credential_identity: self.credential_identity.clone(),
             local_device_id: self.local_device_id.clone(),
@@ -1924,24 +1965,36 @@ impl MlsAdapter {
             storage,
             pcs_update_sidecar,
             store_revision,
+            store_elsewhere,
         })
         .map_err(|error| {
             CoreError::invalid_state(format!("failed to serialize MLS group state: {error}"))
         })
     }
 
-    /// Rebuild the adapter from the per-conversation rows.
-    ///
-    /// Every row carries a dump of the **whole** provider store, taken when
-    /// that row was last saved, and a row is saved only when its own
-    /// conversation changes. Merging the dumps would let an old row roll a
-    /// sibling group back to an epoch it has left, and bring back secrets the
-    /// newer state had deleted. The store therefore comes from the single
-    /// most recent dump, which already holds every group as it stood then;
-    /// the other rows contribute only their own sidecar. Rows predating
-    /// `store_revision` cannot be ordered and are merged as before.
+    /// Rebuild the adapter from self-contained rows; see
+    /// [`Self::restore_from_persisted_rows`].
     pub fn restore_from_persisted_states(
         persisted_states: &[(String, MlsStateSummary, Option<String>)],
+    ) -> CoreResult<RestoreMlsStateResult> {
+        Self::restore_from_persisted_rows(persisted_states, None)
+    }
+
+    /// Rebuild the adapter from the per-conversation rows and, for rows that
+    /// point at it, the one copy of the provider store.
+    ///
+    /// Rows in the older format each carry a dump of the **whole** store,
+    /// taken when that row was last saved, and a row is saved only when its
+    /// own conversation changes. Merging the dumps would let an old row roll a
+    /// sibling group back to an epoch it has left, and bring back secrets the
+    /// newer state had deleted. For such rows the store therefore comes from
+    /// the single most recent dump, and the other rows contribute only their
+    /// own sidecar; rows predating `store_revision` cannot be ordered and are
+    /// merged as before. As soon as any row points at the shared store, that
+    /// store is the newest, and the dumps are ignored.
+    pub fn restore_from_persisted_rows(
+        persisted_states: &[(String, MlsStateSummary, Option<String>)],
+        shared_store: Option<&str>,
     ) -> CoreResult<RestoreMlsStateResult> {
         if persisted_states.is_empty() {
             return Ok(RestoreMlsStateResult::default());
@@ -1954,6 +2007,7 @@ impl MlsAdapter {
         let mut template: Option<(SignatureKeyPair, CredentialWithKey, String, String)> = None;
         let mut restored_sidecars: BTreeMap<String, PcsUpdateSidecar> = BTreeMap::new();
         let mut dumps: Vec<(u64, Vec<(Vec<u8>, Vec<u8>)>)> = Vec::new();
+        let mut rows_point_elsewhere = false;
 
         for (conversation_id, summary, serialized_state) in persisted_states {
             let Some(serialized_state) = serialized_state.as_ref() else {
@@ -1998,7 +2052,9 @@ impl MlsAdapter {
                 storage,
                 mut pcs_update_sidecar,
                 store_revision,
+                store_elsewhere,
             } = parsed;
+            rows_point_elsewhere |= store_elsewhere;
             restored_sidecars.insert(
                 conversation_id.clone(),
                 pcs_update_sidecar
@@ -2033,7 +2089,7 @@ impl MlsAdapter {
                 ));
             }
 
-            {
+            if !store_elsewhere {
                 let mut decoded_values = Vec::with_capacity(storage.values.len());
                 let mut storage_decode_failed = false;
                 for (key, value) in &storage.values {
@@ -2091,8 +2147,32 @@ impl MlsAdapter {
             parsed_states.push((conversation_id.clone(), summary.clone()));
         }
 
-        let newest_revision = dumps.iter().map(|(revision, _)| *revision).max();
-        {
+        let legacy_row_stores = !dumps.is_empty();
+        let mut newest_revision = dumps.iter().map(|(revision, _)| *revision).max();
+        if rows_point_elsewhere {
+            let shared_store = shared_store.ok_or_else(|| {
+                CoreError::invalid_state("MLS rows point at a provider store that is missing")
+            })?;
+            let shared: PersistedGroupState =
+                serde_json::from_str(shared_store).map_err(|error| {
+                    CoreError::invalid_state(format!(
+                        "failed to decode the persisted MLS provider store: {error}"
+                    ))
+                })?;
+            let mut values = provider.storage().values.write().map_err(|_| {
+                CoreError::invalid_state("failed to write restored MLS provider storage")
+            })?;
+            for (key, value) in &shared.storage.values {
+                let decoded_key = BASE64
+                    .decode(key)
+                    .map_err(|_| CoreError::invalid_input("invalid persisted MLS storage key"))?;
+                let decoded_value = BASE64
+                    .decode(value)
+                    .map_err(|_| CoreError::invalid_input("invalid persisted MLS storage value"))?;
+                values.insert(decoded_key, decoded_value);
+            }
+            newest_revision = Some(shared.store_revision);
+        } else {
             let mut values = provider.storage().values.write().map_err(|_| {
                 CoreError::invalid_state("failed to write restored MLS provider storage")
             })?;
@@ -2122,6 +2202,7 @@ impl MlsAdapter {
                 summaries,
                 failed_conversation_ids,
                 failures,
+                legacy_row_stores,
             });
         };
 
@@ -2241,6 +2322,7 @@ impl MlsAdapter {
             summaries,
             failed_conversation_ids,
             failures,
+            legacy_row_stores,
         })
     }
 

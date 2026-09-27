@@ -14591,6 +14591,190 @@ pub(crate) mod tests {
         );
     }
 
+    /// The rows a host holds, as the host would hold them: seeded from a full
+    /// snapshot, then changed only by the typed mutations of later outputs.
+    /// A row that no output rewrites keeps whatever it was last written with,
+    /// which is exactly what a snapshot of the device's disk reads.
+    #[derive(Default)]
+    struct SimulatedDisk {
+        rows: BTreeMap<(String, String), String>,
+    }
+
+    impl SimulatedDisk {
+        fn from_snapshot(snapshot: &crate::persistence::CorePersistenceSnapshot) -> Self {
+            let mut disk = Self::default();
+            for row in &snapshot.mls_states {
+                disk.rows.insert(
+                    ("MlsStates".into(), row.conversation_id.clone()),
+                    serde_json::to_string(row).expect("mls row"),
+                );
+            }
+            if let Some(deployment) = snapshot.deployment.as_ref() {
+                disk.rows.insert(
+                    ("Deployment".into(), "active".into()),
+                    serde_json::to_string(deployment).expect("deployment row"),
+                );
+            }
+            disk
+        }
+
+        fn apply(&mut self, output: &CoreOutput) {
+            for effect in &output.effects {
+                let CoreEffect::PersistState { persist } = effect else {
+                    continue;
+                };
+                for mutation in &persist.mutations {
+                    match mutation {
+                        crate::ffi_api::PersistenceMutation::Save {
+                            table, key, value, ..
+                        } => {
+                            self.rows.insert(
+                                (format!("{table:?}"), key.clone()),
+                                serde_json::to_string(value).expect("row value"),
+                            );
+                        }
+                        crate::ffi_api::PersistenceMutation::Delete { table, key } => {
+                            self.rows.remove(&(format!("{table:?}"), key.clone()));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        /// The rows that still hold `value` somewhere in them.
+        fn rows_holding(&self, value: &str) -> Vec<String> {
+            self.rows
+                .iter()
+                .filter(|(_, row)| row.contains(value))
+                .map(|((table, key), _)| format!("{table}/{key}"))
+                .collect()
+        }
+    }
+
+    fn provider_store(engine: &CoreEngine) -> BTreeMap<String, String> {
+        engine
+            .state
+            .mls_adapter
+            .as_ref()
+            .expect("mls adapter")
+            .provider_store_values()
+            .expect("provider store")
+    }
+
+    /// Values long enough to be key material (at least 32 bytes), so that a
+    /// short value that recurs by coincidence does not count as a copy.
+    fn secret_sized(value: &str) -> bool {
+        value.len() >= 44
+    }
+
+    fn engine_with_two_direct_conversations() -> (CoreEngine, String, String) {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let carol_bundle = sample_identity_bundle(CAROL_MNEMONIC, "phone");
+        let mut alice = local_engine(ALICE_MNEMONIC, "phone");
+        for bundle in [bob_bundle.clone(), carol_bundle.clone()] {
+            alice
+                .handle_command(CoreCommand::ImportIdentityBundle { bundle })
+                .expect("import contact");
+        }
+        let with_bob = create_direct_conversation(&mut alice, bob_bundle.user_id);
+        let with_carol = create_direct_conversation(&mut alice, carol_bundle.user_id);
+        (alice, with_bob, with_carol)
+    }
+
+    /// What the provider store deletes, the disk must not keep. Each MLS row
+    /// used to carry a dump of the whole store and was rewritten only when its
+    /// own conversation changed, so a row left alone kept every other
+    /// conversation's secrets as they stood when it was saved: a snapshot of
+    /// the disk then reached back past a rotation.
+    #[test]
+    fn a_deleted_mls_secret_leaves_no_copy_on_disk() {
+        let (mut alice, with_bob, _with_carol) = engine_with_two_direct_conversations();
+        let mut disk = SimulatedDisk::from_snapshot(&alice.refresh_snapshot());
+        let before = provider_store(&alice);
+
+        for round in 0..2 {
+            set_direct_pcs_debt(&mut alice, &with_bob, DIRECT_PCS_COMMIT_INTERVAL * 2);
+            let output = alice
+                .handle_command(CoreCommand::SendTextMessage {
+                    conversation_id: with_bob.clone(),
+                    plaintext: format!("rotate {round}"),
+                })
+                .expect("send and rotate");
+            disk.apply(&output);
+        }
+        let after = provider_store(&alice);
+        let deleted: Vec<&String> = before
+            .iter()
+            .filter(|(key, value)| after.get(*key) != Some(*value) && secret_sized(value))
+            .map(|(_, value)| value)
+            .collect();
+        assert!(
+            !deleted.is_empty(),
+            "two rotations must delete secrets from the store"
+        );
+        for value in deleted {
+            assert_eq!(
+                disk.rows_holding(value),
+                Vec::<String>::new(),
+                "a secret the store deleted is still on disk"
+            );
+        }
+    }
+
+    /// A profile written in the old format holds a store dump in every MLS
+    /// row. Restoring it must work, and the first output afterwards must
+    /// rewrite every row without one, so that the old dumps do not stay on
+    /// disk for as long as their conversations stay quiet.
+    #[test]
+    fn a_legacy_snapshot_is_rewritten_without_row_stores() {
+        let (alice, with_bob, with_carol) = engine_with_two_direct_conversations();
+        let mut legacy = alice.refresh_snapshot();
+        {
+            let adapter = alice.state.mls_adapter.as_ref().expect("mls adapter");
+            for row in &mut legacy.mls_states {
+                row.serialized_group_state = Some(
+                    adapter
+                        .export_persisted_group_state(&row.conversation_id)
+                        .expect("legacy row"),
+                );
+            }
+        }
+        if let Some(deployment) = legacy.deployment.as_mut() {
+            deployment.serialized_mls_bootstrap_state = None;
+        }
+        let mut disk = SimulatedDisk::from_snapshot(&legacy);
+
+        let mut restored =
+            CoreEngine::try_from_restored_state(legacy).expect("a legacy profile restores");
+        for conversation_id in [&with_bob, &with_carol] {
+            assert!(restored
+                .state
+                .mls_adapter
+                .as_ref()
+                .expect("restored adapter")
+                .has_conversation(conversation_id));
+        }
+        let output = restored
+            .handle_event(CoreEvent::AppForegrounded)
+            .expect("first event after restore");
+        disk.apply(&output);
+
+        let store = provider_store(&restored);
+        for (table_key, row) in disk
+            .rows
+            .iter()
+            .filter(|((table, _), _)| table == "MlsStates")
+        {
+            for value in store.values().filter(|value| secret_sized(value)) {
+                assert!(
+                    !row.contains(value.as_str()),
+                    "row {table_key:?} still carries a store dump"
+                );
+            }
+        }
+    }
+
     /// The rotation decision runs once the inbound batch has settled, never
     /// per record. A device returning from an absence drains a backlog whose
     /// tail carries the peer's own commit; deciding mid-batch would cross the

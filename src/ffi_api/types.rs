@@ -1356,6 +1356,10 @@ pub(crate) struct CoreState {
     pub(crate) group_realtime_sessions: BTreeMap<String, GroupRealtimeSessionState>,
     pub(crate) mls_adapter: Option<MlsAdapter>,
     pub(crate) mls_summaries: BTreeMap<String, MlsStateSummary>,
+    /// Restored from rows that each carried a dump of the provider store.
+    /// Not persisted: the first output after restore writes every row again
+    /// without one, and clears it.
+    pub(crate) mls_rows_carry_store: bool,
     pub(crate) published_key_package: Option<PublishedKeyPackage>,
     pub(crate) key_package_inventory: Vec<PublishedKeyPackage>,
     pub(crate) pending_identity_publication: Option<crate::persistence::PendingIdentityPublication>,
@@ -1614,6 +1618,7 @@ impl Default for CoreState {
             group_realtime_sessions: BTreeMap::new(),
             mls_adapter: None,
             mls_summaries: BTreeMap::new(),
+            mls_rows_carry_store: false,
             published_key_package: None,
             key_package_inventory: Vec::new(),
             pending_identity_publication: None,

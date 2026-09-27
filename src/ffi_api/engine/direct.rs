@@ -455,17 +455,23 @@ impl CoreEngine {
     }
 
     /// What to persist after the provider store changed outside any one
-    /// conversation. The deployment carries the KeyPackage inventory, and the
-    /// store itself while there are no conversations; otherwise one MLS row
-    /// is enough, because a restore takes the newest dump.
+    /// conversation. The deployment row carries the KeyPackage inventory and
+    /// the one copy of the store. Only without a deployment do the rows carry
+    /// the store, and then one of them is enough, because a restore takes the
+    /// newest dump.
     pub(super) fn provider_store_persist_ops(&self) -> Vec<PersistOp> {
-        let mut ops = vec![PersistOp::SaveDeployment];
-        if let Some(conversation_id) = self.state.mls_summaries.keys().next() {
-            ops.push(PersistOp::SaveMlsState {
-                conversation_id: conversation_id.clone(),
-            });
+        if self.state.deployment_bundle.is_some() {
+            return vec![PersistOp::SaveDeployment];
         }
-        ops
+        self.state
+            .mls_summaries
+            .keys()
+            .next()
+            .map(|conversation_id| PersistOp::SaveMlsState {
+                conversation_id: conversation_id.clone(),
+            })
+            .into_iter()
+            .collect()
     }
 
     fn maintain_local_credentials_after_sweep(&mut self, now_ms: u64) -> CoreResult<CoreOutput> {

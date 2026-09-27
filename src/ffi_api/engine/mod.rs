@@ -372,7 +372,7 @@ impl CoreEngine {
     }
 
     pub fn try_from_restored_state(snapshot: CorePersistenceSnapshot) -> CoreResult<Self> {
-        let restored_mls = MlsAdapter::restore_from_persisted_states(
+        let restored_mls = MlsAdapter::restore_from_persisted_rows(
             &snapshot
                 .mls_states
                 .iter()
@@ -384,6 +384,10 @@ impl CoreEngine {
                     )
                 })
                 .collect::<Vec<_>>(),
+            snapshot
+                .deployment
+                .as_ref()
+                .and_then(|deployment| deployment.serialized_mls_bootstrap_state.as_deref()),
         )?;
         if !restored_mls.failures.is_empty() {
             return Err(CoreError::restore_failed(
@@ -718,6 +722,7 @@ impl CoreEngine {
                 group_realtime_sessions,
                 mls_adapter: restored_mls.adapter,
                 mls_summaries,
+                mls_rows_carry_store: restored_mls.legacy_row_stores,
                 published_key_package: persisted_deployment
                     .as_ref()
                     .and_then(|deployment| deployment.published_key_package.clone()),
@@ -945,6 +950,19 @@ impl CoreEngine {
             if persisted.contains(&item.envelope.mid) {
                 item.durable = true;
             }
+        }
+        if self.state.mls_rows_carry_store {
+            // Restored from rows that each held a dump of the store. Until each
+            // is written again, a quiet conversation's row keeps every secret
+            // the store has deleted since, so all of them go now.
+            let mut ops = vec![PersistOp::SaveDeployment];
+            ops.extend(self.state.mls_summaries.keys().map(|conversation_id| {
+                PersistOp::SaveMlsState {
+                    conversation_id: conversation_id.clone(),
+                }
+            }));
+            output.effects.push(persist_effect(&self.state, ops));
+            self.state.mls_rows_carry_store = false;
         }
         output
     }
@@ -2782,6 +2800,21 @@ fn persistence_mutations(
     snapshot: &CorePersistenceSnapshot,
     ops: &[PersistOp],
 ) -> Vec<PersistenceMutation> {
+    // A row points at the store in the deployment row, so writing or deleting
+    // a row changes what that store must hold: both go in the same batch.
+    let mut ops = ops.to_vec();
+    if snapshot.deployment.is_some()
+        && ops.iter().any(|op| {
+            matches!(
+                op,
+                PersistOp::SaveMlsState { .. } | PersistOp::DeleteMlsState { .. }
+            )
+        })
+        && !ops.contains(&PersistOp::SaveDeployment)
+    {
+        ops.push(PersistOp::SaveDeployment);
+    }
+    let ops = ops.as_slice();
     fn positioned<T: Clone, F: Fn(&T) -> String>(
         values: &[T],
         key: &str,
@@ -3216,10 +3249,16 @@ fn build_persistence_snapshot(state: &CoreState) -> CorePersistenceSnapshot {
         .map(|(conversation_id, summary)| PersistedMlsState {
             conversation_id: conversation_id.clone(),
             summary: summary.clone(),
-            serialized_group_state: state
-                .mls_adapter
-                .as_ref()
-                .and_then(|adapter| adapter.export_persisted_group_state(conversation_id).ok()),
+            serialized_group_state: state.mls_adapter.as_ref().and_then(|adapter| {
+                // The store is kept once, in the deployment row. Without a
+                // deployment there is nowhere else to keep it, so the row
+                // carries it as before.
+                if state.deployment_bundle.is_some() {
+                    adapter.export_persisted_group_row(conversation_id).ok()
+                } else {
+                    adapter.export_persisted_group_state(conversation_id).ok()
+                }
+            }),
         })
         .collect();
     let mls_state_persistence_blocked = !persisted_mls_states.is_empty()
@@ -3243,14 +3282,11 @@ fn build_persistence_snapshot(state: &CoreState) -> CorePersistenceSnapshot {
                 published_key_package: state.published_key_package.clone(),
                 key_package_inventory: state.key_package_inventory.clone(),
                 pending_identity_publication: state.pending_identity_publication.clone(),
-                serialized_mls_bootstrap_state: if state.mls_summaries.is_empty() {
-                    state
-                        .mls_adapter
-                        .as_ref()
-                        .and_then(|adapter| adapter.export_bootstrap_state().ok())
-                } else {
-                    None
-                },
+                // The one copy of the MLS provider store; the rows point at it.
+                serialized_mls_bootstrap_state: state
+                    .mls_adapter
+                    .as_ref()
+                    .and_then(|adapter| adapter.export_bootstrap_state().ok()),
             }),
         contacts: state
             .contacts
