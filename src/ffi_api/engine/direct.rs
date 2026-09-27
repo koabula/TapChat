@@ -3446,6 +3446,28 @@ impl CoreEngine {
                 .is_some_and(|state| state.awaiting_peer)
     }
 
+    /// Drop the pending commits no race can reach any more; see
+    /// [`crate::direct_pcs::DirectPcsState::expire_pending`]. Decided on every
+    /// send and every settled receive, so how long their keys outlive their
+    /// use is bounded by time, however quiet the peer.
+    fn expire_direct_pending(&mut self, conversation_id: &str) {
+        let now_ms = current_unix_millis(self.state.message_nonce);
+        let expired = self
+            .state
+            .conversations
+            .get_mut(conversation_id)
+            .map(|state| {
+                let awaited = state
+                    .rebuild
+                    .expected
+                    .as_ref()
+                    .and_then(|expected| expected.key_package_b64.clone());
+                state.pcs.expire_pending(now_ms, awaited.as_deref())
+            })
+            .unwrap_or_default();
+        self.discard_pending_commits(expired);
+    }
+
     fn discard_pending_commits(&mut self, commits: Vec<PendingCommit>) {
         let Some(adapter) = self.state.mls_adapter.as_ref() else {
             return;
@@ -3517,6 +3539,7 @@ impl CoreEngine {
         {
             return Ok(false);
         }
+        self.expire_direct_pending(conversation_id);
         // A commit the peer cannot yet receive would leave it an epoch behind
         // for good; see `LocalConversationState::awaiting_peer`.
         if self
@@ -3587,6 +3610,7 @@ impl CoreEngine {
                     wrap_key: Some(outbound_prev),
                     inbound_key: inbound_commit_key,
                     key_package_b64: Some(rotated.key_package_b64),
+                    made_at_ms: now_ms,
                 },
                 now_ms,
             );

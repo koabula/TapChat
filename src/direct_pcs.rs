@@ -24,6 +24,19 @@ pub const DIRECT_PCS_MAX_AGE_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 /// what the waits below cover.
 pub const DIRECT_DELIVERY_BOUND_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 
+/// How long a pending commit can still matter: `2Δ`, plus clock skew.
+///
+/// A race on our commit `c`, made at `t₀`, needs what `c` keeps until the
+/// last message of the race arrives. The rival commit was made before its
+/// author had `c`, so by `t₀ + Δ`, and arrives within `Δ` of that. A loser's
+/// rebuild Welcome goes out when the loser receives `c`, again by `t₀ + Δ`,
+/// and arrives within `Δ`. So nothing that needs `c` arrives after `t₀ + 2Δ`:
+/// the bound `EXPECTED_REBUILD_TTL_MS` rests on too. The host's retention,
+/// `Δ` alone, is not enough: `c` can reach its peer just inside it, while the
+/// rival made just before is still on its way.
+pub const PENDING_COMMIT_TTL_MS: u64 =
+    2 * DIRECT_DELIVERY_BOUND_MS + crate::mls_adapter::KEY_PACKAGE_CLOCK_SKEW_MS;
+
 /// One of our own commits that the peer has not yet been seen to follow.
 ///
 /// A commit is *pending* until this device is delivered a frame of the peer
@@ -60,6 +73,10 @@ pub struct PendingCommit {
     /// against this commit re-enters by a new group built to it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_package_b64: Option<String>,
+    /// Local clock, when the commit was made; see [`PENDING_COMMIT_TTL_MS`].
+    /// Zero for a commit recorded before this was kept.
+    #[serde(default)]
+    pub made_at_ms: u64,
 }
 
 impl PendingCommit {
@@ -188,6 +205,30 @@ impl DirectPcsState {
             .find(|own| own.base_epoch == incoming_epoch && own.commit_hash != incoming_hash)
     }
 
+    /// Pending commits past [`PENDING_COMMIT_TTL_MS`], taken out and returned
+    /// so the caller can delete what they kept. Under `LIVE` no race can reach
+    /// them any more, and all their keys could still do is be read from a
+    /// snapshot.
+    ///
+    /// Two are kept whatever their age. The latest: it holds the key the ideal
+    /// lets a party keep at the latest epoch it created, one entry however
+    /// quiet the peer is, and a peer that returns late can still follow it.
+    /// And the one whose KeyPackage is `awaited`: we won its race and wait for
+    /// the loser's rebuild, which is built to that package.
+    pub fn expire_pending(&mut self, now_ms: u64, awaited: Option<&str>) -> Vec<PendingCommit> {
+        let latest = self.pending_commits.len().saturating_sub(1);
+        let (kept, expired): (Vec<_>, Vec<_>) = std::mem::take(&mut self.pending_commits)
+            .into_iter()
+            .enumerate()
+            .partition(|(index, commit)| {
+                *index == latest
+                    || (awaited.is_some() && commit.key_package_b64.as_deref() == awaited)
+                    || now_ms.saturating_sub(commit.made_at_ms) < PENDING_COMMIT_TTL_MS
+            });
+        self.pending_commits = kept.into_iter().map(|(_, commit)| commit).collect();
+        expired.into_iter().map(|(_, commit)| commit).collect()
+    }
+
     /// Whether this device committed again after its commit on `base_epoch`.
     pub fn rotated_since(&self, base_epoch: u64) -> bool {
         self.pending_commits
@@ -239,7 +280,51 @@ mod tests {
             wrap_key: None,
             inbound_key: None,
             key_package_b64: None,
+            made_at_ms: 0,
         }
+    }
+
+    fn made_at(base_epoch: u64, made_at_ms: u64, key_package: &str) -> PendingCommit {
+        PendingCommit {
+            made_at_ms,
+            key_package_b64: Some(key_package.into()),
+            ..own_commit(base_epoch, &format!("sha256:{base_epoch}"), true)
+        }
+    }
+
+    #[test]
+    fn a_pending_commit_expires_after_the_race_window_unless_it_is_still_needed() {
+        let now = 10 * PENDING_COMMIT_TTL_MS;
+        let mut state = DirectPcsState {
+            pending_commits: vec![
+                made_at(3, now - PENDING_COMMIT_TTL_MS, "expired"),
+                made_at(4, now - PENDING_COMMIT_TTL_MS + 1, "inside"),
+                made_at(5, now - PENDING_COMMIT_TTL_MS, "awaited"),
+                made_at(6, 0, "latest"),
+            ],
+            ..Default::default()
+        };
+        let expired = state.expire_pending(now, Some("awaited"));
+        let names = |commits: &[PendingCommit]| {
+            commits
+                .iter()
+                .map(|commit| commit.key_package_b64.clone().unwrap_or_default())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(&expired), ["expired"]);
+        assert_eq!(
+            names(&state.pending_commits),
+            ["inside", "awaited", "latest"]
+        );
+        // Past the host's retention but inside 2Δ is still inside.
+        let mut state = DirectPcsState {
+            pending_commits: vec![
+                made_at(3, now - DIRECT_DELIVERY_BOUND_MS - 1, "past retention"),
+                made_at(4, now, "latest"),
+            ],
+            ..Default::default()
+        };
+        assert!(state.expire_pending(now, None).is_empty());
     }
 
     #[test]

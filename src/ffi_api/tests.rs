@@ -15602,6 +15602,157 @@ pub(crate) mod tests {
         ));
     }
 
+    /// The rotating side commits twice while its peer stays silent, so both
+    /// commits are pending; returns their KeyPackages, oldest first.
+    fn two_pending_commits(chat: &mut PairedDirectChat) -> (bool, [String; 2]) {
+        let conversation_id = chat.conversation_id.clone();
+        let rotating = alice_is_designated(chat);
+        let mut packages = Vec::new();
+        // Designated at the next epoch is the peer, so the second rotation
+        // needs the longer threshold.
+        for debt in [
+            DIRECT_PCS_COMMIT_INTERVAL - 1,
+            DIRECT_PCS_COMMIT_INTERVAL * 2 - 1,
+        ] {
+            set_direct_pcs_debt(rotator_engine_mut(chat, rotating), &conversation_id, debt);
+            rotator_engine_mut(chat, rotating)
+                .handle_command(CoreCommand::SendTextMessage {
+                    conversation_id: conversation_id.clone(),
+                    plaintext: "rotation".into(),
+                })
+                .expect("rotate");
+            packages.push(
+                rotator_engine(chat, rotating).state.conversations[&conversation_id]
+                    .pcs
+                    .own_commit()
+                    .and_then(|own| own.key_package_b64.clone())
+                    .expect("the commit carries a KeyPackage"),
+            );
+        }
+        assert_eq!(
+            rotator_engine(chat, rotating).state.conversations[&conversation_id]
+                .pcs
+                .pending_commits
+                .len(),
+            2,
+            "premise: both commits are pending"
+        );
+        (rotating, [packages[0].clone(), packages[1].clone()])
+    }
+
+    /// The engine ages pending commits by the wall clock.
+    fn wall_clock_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after the epoch")
+            .as_millis() as u64
+    }
+
+    fn age_pending_commits(engine: &mut CoreEngine, conversation_id: &str, age_ms: u64) {
+        let made_at_ms = wall_clock_ms().saturating_sub(age_ms);
+        for commit in &mut engine
+            .state
+            .conversations
+            .get_mut(conversation_id)
+            .expect("session")
+            .pcs
+            .pending_commits
+        {
+            commit.made_at_ms = made_at_ms;
+        }
+    }
+
+    fn send_quietly(engine: &mut CoreEngine, conversation_id: &str) {
+        engine
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.to_string(),
+                plaintext: "while the peer is quiet".into(),
+            })
+            .expect("send");
+    }
+
+    /// **A pending commit no race can reach is dropped, KeyPackage and all.**
+    /// Past `2Δ` a rival commit and a rebuild Welcome have both had their
+    /// time, so what the commit keeps serves only a snapshot. The latest
+    /// commit stays, whatever its age: one entry, the key the ideal lets a
+    /// party hold at the latest epoch it created.
+    #[test]
+    fn a_pending_commit_is_dropped_once_no_race_can_reach_it() {
+        let mut chat = paired_direct_chat();
+        let conversation_id = chat.conversation_id.clone();
+        let (rotating, [older, latest]) = two_pending_commits(&mut chat);
+        age_pending_commits(
+            rotator_engine_mut(&mut chat, rotating),
+            &conversation_id,
+            crate::direct_pcs::PENDING_COMMIT_TTL_MS,
+        );
+        send_quietly(rotator_engine_mut(&mut chat, rotating), &conversation_id);
+
+        let rotator = rotator_engine(&chat, rotating);
+        let pending = rotator.state.conversations[&conversation_id]
+            .pcs
+            .pending_commits
+            .iter()
+            .filter_map(|commit| commit.key_package_b64.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(pending, vec![latest.clone()], "only the latest stays");
+        assert!(!holds_key_package(rotator, &older));
+        assert!(holds_key_package(rotator, &latest));
+        let on_disk = serde_json::to_string(&rotator.refresh_snapshot()).expect("encode");
+        let restored =
+            CoreEngine::try_from_restored_state(serde_json::from_str(&on_disk).expect("decode"))
+                .expect("restore");
+        assert!(
+            !holds_key_package(&restored, &older),
+            "nor does the persisted state keep it"
+        );
+    }
+
+    /// **A pending commit stays for the whole window a race can take.** Past
+    /// the host's retention `Δ` but inside `2Δ`, its rival may still be on its
+    /// way. Past `2Δ`, the commit whose rebuild we await stays too: the
+    /// rebuild is built to its KeyPackage.
+    #[test]
+    fn a_pending_commit_is_kept_for_the_whole_race_window() {
+        let mut chat = paired_direct_chat();
+        let conversation_id = chat.conversation_id.clone();
+        let (rotating, [older, _]) = two_pending_commits(&mut chat);
+        age_pending_commits(
+            rotator_engine_mut(&mut chat, rotating),
+            &conversation_id,
+            crate::direct_pcs::DIRECT_DELIVERY_BOUND_MS + 24 * 60 * 60 * 1000,
+        );
+        send_quietly(rotator_engine_mut(&mut chat, rotating), &conversation_id);
+        assert!(
+            holds_key_package(rotator_engine(&chat, rotating), &older),
+            "past the retention period, inside 2Δ, a rival may still arrive"
+        );
+
+        let rotator = rotator_engine_mut(&mut chat, rotating);
+        rotator
+            .state
+            .conversations
+            .get_mut(&conversation_id)
+            .expect("session")
+            .rebuild
+            .expected = Some(crate::direct_rebuild::ExpectedRebuild {
+            device_id: "device:peer".into(),
+            key: [0; crate::lane_wrap::WRAP_KEY_LEN],
+            at_ms: wall_clock_ms(),
+            key_package_b64: Some(older.clone()),
+        });
+        age_pending_commits(
+            rotator,
+            &conversation_id,
+            crate::direct_pcs::PENDING_COMMIT_TTL_MS,
+        );
+        send_quietly(rotator, &conversation_id);
+        assert!(
+            holds_key_package(rotator_engine(&chat, rotating), &older),
+            "the commit whose rebuild is awaited stays past 2Δ"
+        );
+    }
+
     /// A KeyPackage past its lifetime cannot be used for a Welcome any more,
     /// because MLS refuses expired packages, so its private keys serve only a
     /// snapshot. They are deleted once the lifetime and the clock-skew margin
