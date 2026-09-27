@@ -1,4 +1,4 @@
-use super::lanes::InboundFrameResolution;
+use super::lanes::{InboundFrameResolution, WelcomeAdmission};
 use super::*;
 
 impl CoreEngine {
@@ -3874,6 +3874,24 @@ impl CoreEngine {
                                         &conversation_id,
                                         &record.envelope.lane,
                                     );
+                                    // Establishment: the Welcome has passed
+                                    // its check, so this inbox may now admit
+                                    // records under the token it came with.
+                                    // Not before: the host released only this
+                                    // record, and nothing else under the token
+                                    // gets in until this device says so.
+                                    let first_contact = welcome_admission
+                                        .map_or(!replaces_session, |admission| {
+                                            admission == WelcomeAdmission::FirstContact
+                                        });
+                                    if first_contact {
+                                        output = merge_outputs(
+                                            output,
+                                            self.register_accepted_lane(
+                                                record.envelope.lane.clone(),
+                                            )?,
+                                        );
+                                    }
                                     if let Some(author) = welcome_author.as_ref() {
                                         for retired in
                                             [previous_wrap.as_ref(), retiring_prev.as_ref()]

@@ -254,17 +254,26 @@ export class InboxService {
     return items;
   }
 
+  /**
+   * Release the one record the recipient takes from a first-contact request:
+   * the welcome, the record the listing showed as `welcomeBytes`.
+   *
+   * Admission is not granted here. The recipient registers the pairwise token
+   * itself once the welcome has passed its checks, so a welcome it refuses
+   * leaves the token unadmitted; until then, nothing else under the token gets
+   * in. Whatever else was queued with the welcome goes with the request.
+   */
   async acceptMessageRequest(requestId: string, now: number): Promise<MessageRequestActionResult> {
     const entry = await this.findMessageRequest(requestId, now);
     if (!entry) {
       throw new HttpError(404, "not_found", "message request not found");
     }
-    await this.registerAcceptedLane(entry.lane, now);
 
     let promotedCount = 0;
-    for (const request of entry.pendingRequests) {
-      await this.deliverEnvelope(request, now, false);
-      promotedCount += 1;
+    const [welcome] = entry.pendingRequests;
+    if (welcome) {
+      await this.deliverEnvelope(welcome, now, false);
+      promotedCount = 1;
     }
     await this.deleteMessageRequest(entry.lane, "accepted");
     await this.scheduleNextAlarm(now);

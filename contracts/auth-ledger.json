@@ -89,8 +89,11 @@
       "scope": "excluded",
       "authenticatedBy": "the device key named by a root-pinned contact share",
       "rotatesWithP": false,
-      "reason": "Establishment is not an interface of the ideal; it is trust on first use, checked against the key package the contact share names.",
-      "witness": ["session_establishment_rejects_substituted_key_package"]
+      "reason": "Establishment is not an interface of the ideal; it is trust on first use, checked against the key package the contact share names. The token it arrives with is registered only once it is admitted.",
+      "witness": [
+        "session_establishment_rejects_substituted_key_package",
+        "a_first_contact_token_is_registered_only_after_the_welcome_is_accepted"
+      ]
     },
     {
       "id": "fork-evidence",
@@ -302,7 +305,7 @@
       "scope": "excluded",
       "authenticatedBy": "nothing",
       "rotatesWithP": false,
-      "reason": "Listing and triggering a sync; an accepted request's records go through inbox-record.",
+      "reason": "Listing and triggering a sync. Accepting releases only the request's Welcome, which goes through inbox-record to welcome-first-contact; the host admits nothing under its token until this device registers it.",
       "witness": ["list_message_requests_emits_fetch_management_effect"]
     },
     {

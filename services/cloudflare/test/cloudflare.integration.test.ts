@@ -809,6 +809,9 @@ test("runtime integration: message request changes push over realtime and inbox 
   assert.equal(acceptedEvent.requestId, requests.requests[0].requestId);
   assert.equal(acceptedEvent.change, "accepted");
 
+  // Accepting released the welcome; admitting the token is the recipient's
+  // own act, once the welcome has passed its checks.
+  await registerAcceptedLane(mf, token, deviceId, ["user:mallory"]);
   const deliveredAfterAccept = await appendEnvelope(
     mf,
     deviceId,

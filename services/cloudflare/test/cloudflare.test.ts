@@ -1785,20 +1785,22 @@ test("message requests stay out of inbox until accepted", async () => {
   );
   assert.equal(accept.status, 200);
   const acceptResult = (await accept.json()) as MessageRequestActionResult & { version: string };
-  assert.equal(acceptResult.promotedCount, 2);
+  assert.equal(acceptResult.promotedCount, 1);
 
+  // Only the welcome, the record the listing showed, is released.
   const accepted = await handleRequest(
     new Request("https://example.com/v1/inbox/device:bob:phone/messages?fromSeq=1&limit=10", { headers: authHeaders(token) }),
     env
   );
   const fetched = (await accepted.json()) as { records: Array<{ messageId: string }> };
   assert.deepEqual(fetched.records.map((record) => record.messageId), [
-    "22222222222222222222222222222222",
-    "33333333333333333333333333333333"
+    "22222222222222222222222222222222"
   ]);
 
-  // The same answer as the queued ones: nothing in it moves with what the
-  // inbox did with this record or with anyone else's.
+  // The recipient registers the token once the welcome has passed its checks.
+  // An append under it gets the same answer as the queued ones: nothing in it
+  // moves with what the inbox did with this record or with anyone else's.
+  await registerAcceptedLane(env, token, "device:bob:phone", aliceLane);
   const registeredAppend = await appendWithCapability(env, sampleAppend("device:bob:phone", "44444444444444444444444444444444", aliceLane));
   assert.deepEqual(await registeredAppend.json(), { version: CURRENT_MODEL_VERSION });
 
@@ -1823,6 +1825,50 @@ test("message requests stay out of inbox until accepted", async () => {
   // And after a rejection, still the same answer.
   const afterReject = await appendWithCapability(env, sampleAppend("device:bob:phone", "66666666666666666666666666666666", malloryLane));
   assert.deepEqual(await afterReject.json(), { version: CURRENT_MODEL_VERSION });
+});
+
+test("accepting a message request releases the welcome and admits nothing", async () => {
+  const { env } = createEnv();
+  const bundle = await issueDeviceBundle(env);
+  const token = bundle.runtimeCredential.token;
+  const lane = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+  const fetchIds = async () => {
+    const response = await handleRequest(
+      new Request("https://example.com/v1/inbox/device:bob:phone/messages?fromSeq=1&limit=10", { headers: authHeaders(token) }),
+      env
+    );
+    const fetched = (await response.json()) as { records: Array<{ messageId: string }> };
+    return fetched.records.map((record) => record.messageId);
+  };
+
+  await appendWithCapability(env, sampleAppend("device:bob:phone", "22222222222222222222222222222222", lane));
+  await appendWithCapability(env, sampleAppend("device:bob:phone", "33333333333333333333333333333333", lane));
+  const list = await handleRequest(
+    new Request("https://example.com/v1/inbox/device:bob:phone/message-requests", { headers: authHeaders(token) }),
+    env
+  );
+  const [request] = ((await list.json()) as MessageRequestListResult).requests;
+  const accept = await handleRequest(
+    new Request(`https://example.com/v1/inbox/device:bob:phone/message-requests/${encodeURIComponent(request.requestId)}/accept`, {
+      method: "POST",
+      headers: authHeaders(token)
+    }),
+    env
+  );
+  assert.equal(accept.status, 200);
+  assert.deepEqual(await fetchIds(), ["22222222222222222222222222222222"], "only the welcome is released");
+
+  // The token is not admitted by the accept: a record under it queues again.
+  await appendWithCapability(env, sampleAppend("device:bob:phone", "44444444444444444444444444444444", lane));
+  assert.deepEqual(await fetchIds(), ["22222222222222222222222222222222"], "the accept admitted no token");
+
+  // The recipient registers it once the welcome has passed its checks.
+  await registerAcceptedLane(env, token, "device:bob:phone", lane);
+  await appendWithCapability(env, sampleAppend("device:bob:phone", "55555555555555555555555555555555", lane));
+  assert.deepEqual(await fetchIds(), [
+    "22222222222222222222222222222222",
+    "55555555555555555555555555555555"
+  ]);
 });
 
 test("direct message request accept promotes only the accepted lane", async () => {
@@ -1862,7 +1908,7 @@ test("direct message request accept promotes only the accepted lane", async () =
   );
   assert.equal(accept.status, 200);
   const acceptResult = (await accept.json()) as MessageRequestActionResult & { version: string };
-  assert.equal(acceptResult.promotedCount, 2);
+  assert.equal(acceptResult.promotedCount, 1);
 
   const accepted = await handleRequest(
     new Request("https://example.com/v1/inbox/device:bob:phone/messages?fromSeq=1&limit=10", { headers: authHeaders(token) }),
@@ -1870,12 +1916,11 @@ test("direct message request accept promotes only the accepted lane", async () =
   );
   const fetched = (await accepted.json()) as { records: Array<{ messageId: string; envelope: { lane: string } }> };
   assert.deepEqual(fetched.records.map((record) => record.messageId), [
-    "03030303030303030303030303030303",
-    "04040404040404040404040404040404"
+    "03030303030303030303030303030303"
   ]);
   assert.deepEqual(
     fetched.records.map((record) => record.envelope.lane),
-    [newLane, newLane]
+    [newLane]
   );
 
   const remaining = await handleRequest(

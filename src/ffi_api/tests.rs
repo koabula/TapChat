@@ -13636,6 +13636,71 @@ pub(crate) mod tests {
         }
     }
 
+    /// **The token for this inbox is registered only once the Welcome passes
+    /// its check (E2).** The host releases the Welcome from the first-contact
+    /// queue and admits nothing under its token on its own; the recipient
+    /// registers the token after accepting the Welcome, and never for one it
+    /// refused.
+    #[test]
+    fn a_first_contact_token_is_registered_only_after_the_welcome_is_accepted() {
+        let registered_lanes = |output: &CoreOutput| {
+            output
+                .effects
+                .iter()
+                .filter_map(|effect| match effect {
+                    CoreEffect::RegisterAcceptedLane { register } => Some(register.lane.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // Refused: no device key the recipient trusts vouches for the author.
+        let mut refused = unjoined_direct_chat();
+        let alice_user_id = refused
+            .alice
+            .state
+            .local_identity
+            .as_ref()
+            .expect("alice identity")
+            .user_identity
+            .user_id
+            .clone();
+        refused.bob.state.contacts.remove(&alice_user_id);
+        let output = deliver_pending_outbox_to_device(
+            &mut refused.bob,
+            &refused.alice,
+            &refused.bob_device_id,
+        );
+        assert!(
+            !refused
+                .bob
+                .state
+                .conversations
+                .contains_key(&refused.conversation_id),
+            "premise: the Welcome fails its check"
+        );
+        assert!(
+            registered_lanes(&output).is_empty(),
+            "a refused Welcome registers no token"
+        );
+
+        // Accepted: the token it arrived with is registered, and only it.
+        let mut chat = unjoined_direct_chat();
+        let welcome_lane =
+            last_pending_envelope(&chat.alice, &chat.bob_device_id, MessageType::MlsWelcome).lane;
+        let output =
+            deliver_pending_outbox_to_device(&mut chat.bob, &chat.alice, &chat.bob_device_id);
+        assert_eq!(
+            chat.bob.state.conversations[&chat.conversation_id]
+                .lanes
+                .as_ref()
+                .map(|lanes| lanes.inbound_lane.clone()),
+            Some(welcome_lane.clone()),
+            "premise: the Welcome is accepted on the token it came with"
+        );
+        assert_eq!(registered_lanes(&output), vec![welcome_lane]);
+    }
+
     fn answer_key_package_claims(
         engine: &mut CoreEngine,
         mut output: CoreOutput,
