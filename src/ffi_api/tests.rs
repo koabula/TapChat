@@ -14735,6 +14735,254 @@ pub(crate) mod tests {
         );
     }
 
+    /// **A forged race rebuild is detected when the real one arrives.** The
+    /// loser of a race is the one device that can speak for the loser at the
+    /// race's base epoch, and it speaks once: it builds one new group and
+    /// sends one Welcome, under the key its losing commit travelled under. A
+    /// holder of the loser's device key and of that epoch can build another,
+    /// and whichever of the two the winner meets first it joins. The other
+    /// one, signed by the same device for the same race, is then two holders
+    /// of one key -- in either order, and whatever group the winner is in by
+    /// then. The same Welcome again is a replay, not a second signature.
+    #[test]
+    fn a_forged_race_rebuild_is_detected_when_the_real_one_arrives() {
+        for forged_first in [true, false] {
+            let mut chat = paired_direct_chat();
+            let conversation_id = chat.conversation_id.clone();
+            let alice_is_winner = alice_is_designated(&chat);
+            let winner_device = rotator_device_id(&chat, alice_is_winner).to_string();
+            let loser_device = peer_device_id(&chat, alice_is_winner).to_string();
+
+            // The loser commits, and is copied while that commit is pending.
+            set_direct_pcs_debt(
+                peer_engine_mut(&mut chat, alice_is_winner),
+                &conversation_id,
+                DIRECT_PCS_COMMIT_INTERVAL * 2 - 1,
+            );
+            peer_engine_mut(&mut chat, alice_is_winner)
+                .handle_command(CoreCommand::SendTextMessage {
+                    conversation_id: conversation_id.clone(),
+                    plaintext: "loser rotation".into(),
+                })
+                .expect("loser send");
+            let loser_commit = last_pending_envelope(
+                peer_engine(&chat, alice_is_winner),
+                &winner_device,
+                MessageType::MlsCommit,
+            );
+            let losing_key = peer_engine(&chat, alice_is_winner).state.conversations
+                [&conversation_id]
+                .pcs
+                .own_commit()
+                .and_then(|own| own.wrap_key)
+                .expect("the losing commit's key");
+            let mut thief = CoreEngine::try_from_restored_state(
+                peer_engine(&chat, alice_is_winner).refresh_snapshot(),
+            )
+            .expect("the snapshot restores");
+
+            // The designated side commits on the same epoch and wins.
+            set_direct_pcs_debt(
+                rotator_engine_mut(&mut chat, alice_is_winner),
+                &conversation_id,
+                DIRECT_PCS_COMMIT_INTERVAL - 1,
+            );
+            rotator_engine_mut(&mut chat, alice_is_winner)
+                .handle_command(CoreCommand::SendTextMessage {
+                    conversation_id: conversation_id.clone(),
+                    plaintext: "winner rotation".into(),
+                })
+                .expect("winner send");
+            let winner_commit = last_pending_envelope(
+                rotator_engine(&chat, alice_is_winner),
+                &loser_device,
+                MessageType::MlsCommit,
+            );
+            deliver_inbox_envelope(
+                rotator_engine_mut(&mut chat, alice_is_winner),
+                &winner_device,
+                loser_commit,
+                52_000,
+            );
+
+            // Both the loser and its copy lose, and each re-enters.
+            deliver_inbox_envelope(
+                peer_engine_mut(&mut chat, alice_is_winner),
+                &loser_device,
+                winner_commit.clone(),
+                52_001,
+            );
+            deliver_inbox_envelope(&mut thief, &loser_device, winner_commit, 52_001);
+            let genuine = rebuild_welcome(peer_engine(&chat, alice_is_winner), &losing_key);
+            let forged = rebuild_welcome(&thief, &losing_key);
+            assert_ne!(
+                genuine.bytes, forged.bytes,
+                "premise: the copy built a group of its own"
+            );
+            let (first, second) = if forged_first {
+                (forged, genuine)
+            } else {
+                (genuine, forged)
+            };
+
+            deliver_inbox_envelope(
+                rotator_engine_mut(&mut chat, alice_is_winner),
+                &winner_device,
+                first.clone(),
+                52_002,
+            );
+            assert!(
+                !conversation_is_compromised(
+                    rotator_engine(&chat, alice_is_winner),
+                    &conversation_id
+                ),
+                "premise: the first rebuild is joined like any other (forged_first={forged_first})"
+            );
+            deliver_inbox_envelope(
+                rotator_engine_mut(&mut chat, alice_is_winner),
+                &winner_device,
+                under_fresh_mid(first),
+                52_003,
+            );
+            assert!(
+                !conversation_is_compromised(
+                    rotator_engine(&chat, alice_is_winner),
+                    &conversation_id
+                ),
+                "the same rebuild again is a replay, not a double sign (forged_first={forged_first})"
+            );
+
+            deliver_inbox_envelope(
+                rotator_engine_mut(&mut chat, alice_is_winner),
+                &winner_device,
+                second,
+                52_004,
+            );
+            let winner = rotator_engine(&chat, alice_is_winner);
+            assert!(
+                conversation_is_compromised(winner, &conversation_id),
+                "a second rebuild signed by the loser's device for the same race is two holders \
+                 of one key (forged_first={forged_first})"
+            );
+            assert_eq!(
+                winner.state.conversations[&conversation_id]
+                    .fork
+                    .forked_since_ms,
+                Some(52_002),
+                "the messages in doubt are those from the joined rebuild on"
+            );
+        }
+    }
+
+    /// **A rebuild speaks for its race only with the loser's signature.** The
+    /// winner compares a later rebuild against the digest of the one it joined,
+    /// so what it joins must itself be signed for the race: the same Welcome
+    /// under the right key, with its signature replaced, is refused and leaves
+    /// the rebuild still expected.
+    #[test]
+    fn a_rebuild_without_the_losers_signature_is_refused() {
+        let mut chat = paired_direct_chat();
+        let conversation_id = chat.conversation_id.clone();
+        let alice_is_winner = alice_is_designated(&chat);
+        let winner_device = rotator_device_id(&chat, alice_is_winner).to_string();
+        let loser_device = peer_device_id(&chat, alice_is_winner).to_string();
+        set_direct_pcs_debt(
+            peer_engine_mut(&mut chat, alice_is_winner),
+            &conversation_id,
+            DIRECT_PCS_COMMIT_INTERVAL * 2 - 1,
+        );
+        peer_engine_mut(&mut chat, alice_is_winner)
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "loser rotation".into(),
+            })
+            .expect("loser send");
+        let loser_commit = last_pending_envelope(
+            peer_engine(&chat, alice_is_winner),
+            &winner_device,
+            MessageType::MlsCommit,
+        );
+        let losing_key = peer_engine(&chat, alice_is_winner).state.conversations[&conversation_id]
+            .pcs
+            .own_commit()
+            .and_then(|own| own.wrap_key)
+            .expect("the losing commit's key");
+        set_direct_pcs_debt(
+            rotator_engine_mut(&mut chat, alice_is_winner),
+            &conversation_id,
+            DIRECT_PCS_COMMIT_INTERVAL - 1,
+        );
+        rotator_engine_mut(&mut chat, alice_is_winner)
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "winner rotation".into(),
+            })
+            .expect("winner send");
+        let winner_commit = last_pending_envelope(
+            rotator_engine(&chat, alice_is_winner),
+            &loser_device,
+            MessageType::MlsCommit,
+        );
+        deliver_inbox_envelope(
+            rotator_engine_mut(&mut chat, alice_is_winner),
+            &winner_device,
+            loser_commit,
+            53_000,
+        );
+        deliver_inbox_envelope(
+            peer_engine_mut(&mut chat, alice_is_winner),
+            &loser_device,
+            winner_commit,
+            53_001,
+        );
+        let genuine = rebuild_welcome(peer_engine(&chat, alice_is_winner), &losing_key);
+        let (welcome_b64, signature) = unwrap_envelope_payload(&losing_key, &genuine)
+            .and_then(|frame| crate::direct_frame::decode(&frame).ok())
+            .expect("the rebuild opens under the losing commit's key");
+        assert!(signature.is_some(), "premise: the loser signs its rebuild");
+        let mut unsigned = under_fresh_mid(genuine.clone());
+        unsigned.bytes = Some(
+            STANDARD.encode(
+                crate::lane_wrap::wrap_frame(
+                    &losing_key,
+                    &crate::direct_frame::encode(
+                        &welcome_b64,
+                        Some(&[0_u8; crate::direct_frame::COMMIT_SIGNATURE_LEN]),
+                    )
+                    .expect("encode"),
+                )
+                .expect("wrap"),
+            ),
+        );
+        let expects_rebuild = |engine: &CoreEngine| {
+            engine.state.conversations[&conversation_id]
+                .rebuild
+                .expected
+                .is_some()
+        };
+
+        deliver_inbox_envelope(
+            rotator_engine_mut(&mut chat, alice_is_winner),
+            &winner_device,
+            unsigned,
+            53_002,
+        );
+        assert!(
+            expects_rebuild(rotator_engine(&chat, alice_is_winner)),
+            "a rebuild whose signature is not the loser's is not joined"
+        );
+        deliver_inbox_envelope(
+            rotator_engine_mut(&mut chat, alice_is_winner),
+            &winner_device,
+            genuine,
+            53_003,
+        );
+        assert!(
+            !expects_rebuild(rotator_engine(&chat, alice_is_winner)),
+            "the signed rebuild still is"
+        );
+    }
+
     /// **Remote input cannot tear a session down.** The only unauthenticated
     /// way into the waiting state a Welcome can then exploit is a local fault,
     /// and that exception rests on nothing remote being able to cause one.
@@ -15739,6 +15987,7 @@ pub(crate) mod tests {
             device_id: "device:peer".into(),
             key: [0; crate::lane_wrap::WRAP_KEY_LEN],
             at_ms: wall_clock_ms(),
+            base_epoch: 0,
             key_package_b64: Some(older.clone()),
         });
         age_pending_commits(

@@ -59,6 +59,7 @@ use super::{GroupEnvelope, GroupEnvelopeVisibility, GroupMessageType, MessageTyp
 pub enum SignatureDomain {
     // Signed by the device key.
     DirectCommitArbitration,
+    DirectRebuildWelcome,
     GroupEnvelopeSenderProof,
     GroupManifest,
     GroupMembershipProof,
@@ -83,6 +84,7 @@ impl SignatureDomain {
     pub fn as_str(&self) -> &'static str {
         match self {
             SignatureDomain::DirectCommitArbitration => "tapchat.direct_commit_arbitration.v1",
+            SignatureDomain::DirectRebuildWelcome => "tapchat.direct_rebuild_welcome.v1",
             SignatureDomain::GroupEnvelopeSenderProof => "tapchat.group_envelope.sender_proof.v1",
             SignatureDomain::GroupManifest => "tapchat.group_manifest.v1",
             SignatureDomain::GroupMembershipProof => "tapchat.group.membership.v1",
@@ -106,6 +108,7 @@ impl SignatureDomain {
     #[cfg(test)]
     pub(crate) const ALL: &'static [SignatureDomain] = &[
         SignatureDomain::DirectCommitArbitration,
+        SignatureDomain::DirectRebuildWelcome,
         SignatureDomain::GroupEnvelopeSenderProof,
         SignatureDomain::GroupManifest,
         SignatureDomain::GroupMembershipProof,
@@ -142,6 +145,30 @@ pub(crate) fn direct_commit_arbitration_payload(
     payload.push_str(sender_device_id);
     payload.push_u64(base_epoch);
     payload.push_bytes(commit_sha256);
+    payload
+}
+
+/// The detached author proof carried inside a race loser's rebuild Welcome.
+///
+/// A loser rebuilds once per lost race, so this is its one signature for the
+/// race at `base_epoch`, the epoch both commits built on. The winner keeps the
+/// digest of the one it joined; a second, different Welcome signed for the
+/// same race is two holders of one device key (see `direct_fork`). MLS cannot
+/// say so by itself: the Welcome's own signature sits inside a GroupInfo that
+/// only the KeyPackage it consumed can open.
+pub(crate) fn direct_rebuild_welcome_payload(
+    conversation_id: &str,
+    sender_user_id: &str,
+    sender_device_id: &str,
+    base_epoch: u64,
+    welcome_sha256: &[u8; 32],
+) -> SigningPayload {
+    let mut payload = SigningPayload::new(SignatureDomain::DirectRebuildWelcome);
+    payload.push_str(conversation_id);
+    payload.push_str(sender_user_id);
+    payload.push_str(sender_device_id);
+    payload.push_u64(base_epoch);
+    payload.push_bytes(welcome_sha256);
     payload
 }
 

@@ -14,7 +14,11 @@
 //!   keeps it, and accepts a Welcome under it from that device, once, and only
 //!   one built to that KeyPackage. A thief that healed out of the session has
 //!   neither the commit nor the key, and the winner joins with a leaf no
-//!   snapshot from before its commit holds.
+//!   snapshot from before its commit holds. The Welcome also carries the
+//!   loser's signature for the race, and the winner keeps the digest of the
+//!   one it joined: a holder of the loser's device key and of the race's epoch
+//!   can build a rebuild too, and whichever of the two arrives second is the
+//!   evidence (`direct_fork`).
 //! - **No session left.** A local MLS fault or a failed restore tears this
 //!   device's group down; there is nothing to authenticate with, so the peer's
 //!   plain Welcome is accepted until one arrives. The peer's user starts that
@@ -45,6 +49,10 @@ pub struct ExpectedRebuild {
     /// The key the losing commit opened under: `K_c` of the race's base epoch.
     pub key: [u8; WRAP_KEY_LEN],
     pub at_ms: u64,
+    /// The epoch both commits built on: what the loser's rebuild signature
+    /// names.
+    #[serde(default)]
+    pub base_epoch: u64,
     /// The KeyPackage our winning commit carried. The rebuild must be built
     /// to it: any other of our packages may be older than a snapshot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -58,6 +66,9 @@ pub struct ExpectedRebuild {
 pub struct ReentryTarget {
     pub device_id: String,
     pub key_package_b64: String,
+    /// The epoch the race was on, which the rebuild Welcome's signature names.
+    #[serde(default)]
+    pub base_epoch: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -137,6 +148,7 @@ mod tests {
                 device_id: "device:bob:phone".into(),
                 key: [key; WRAP_KEY_LEN],
                 at_ms,
+                base_epoch: 0,
                 key_package_b64: None,
             }),
             ..Default::default()

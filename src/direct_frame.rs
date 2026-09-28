@@ -3,8 +3,8 @@
 //! A tag, and then the MLS message:
 //!
 //! ```text
-//! 0x00 || MLS bytes                    every frame but a commit
-//! 0x01 || signature(64) || MLS bytes   a commit
+//! 0x00 || MLS bytes                    every other frame
+//! 0x01 || signature(64) || MLS bytes   a commit, or a race loser's rebuild Welcome
 //! ```
 //!
 //! This replaces a JSON object carrying the same two things. That object held
@@ -38,6 +38,16 @@
 //! can be validated at its own epoch — retains the leaf private key the
 //! rotation exists to destroy, for exactly as long as the race window. That
 //! trades a security parameter for frame overhead.
+//!
+//! # Why a rebuild Welcome carries one too
+//!
+//! The loser of a race rebuilds once, and its Welcome is the one thing it
+//! signs for that race after the commit it lost with. The winner joins the
+//! first rebuild it meets; a second, different one signed by the same device
+//! for the same race is proof that someone else holds that device's key. MLS
+//! signs a Welcome only inside its GroupInfo, which is encrypted to the
+//! KeyPackage the join consumed, so after the join nothing could check a
+//! second Welcome's author. The detached signature is what can be checked.
 //!
 //! # What the signature does not carry
 //!
@@ -98,7 +108,8 @@ pub(crate) fn encode(
     Ok(out)
 }
 
-/// The MLS payload and, for a commit, the signature that came with it.
+/// The MLS payload and, for a commit or a rebuild Welcome, the signature that
+/// came with it.
 ///
 /// Total and failing closed: an empty plaintext, an unknown tag, or a commit
 /// shorter than its own signature is a rejection rather than a partial parse.
@@ -142,6 +153,15 @@ pub(crate) fn commit_sha256(payload_b64: &str) -> CoreResult<[u8; 32]> {
     let bytes = STANDARD
         .decode(payload_b64.trim())
         .map_err(|_| CoreError::invalid_input("invalid base64 MLS commit payload"))?;
+    Ok(Sha256::digest(bytes).into())
+}
+
+/// The digest a rebuild Welcome's signature binds, over the same bytes the
+/// frame carries.
+pub(crate) fn welcome_sha256(payload_b64: &str) -> CoreResult<[u8; 32]> {
+    let bytes = STANDARD
+        .decode(payload_b64.trim())
+        .map_err(|_| CoreError::invalid_input("invalid base64 MLS Welcome payload"))?;
     Ok(Sha256::digest(bytes).into())
 }
 

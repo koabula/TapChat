@@ -378,16 +378,17 @@ impl CoreEngine {
                 let Some(message_type) = MlsAdapter::classify_mls_payload(&mls_b64) else {
                     return Ok(InboundFrameResolution::Rejected);
                 };
-                // A Welcome inside the wrap is a race loser's rebuild; whether
-                // this is the one expected is decided by the key alone.
+                // A Welcome inside the wrap is a race loser's rebuild. It
+                // carries the loser's signature for the race; whether it is
+                // the one expected is decided by the key and that signature.
                 if message_type == MessageType::MlsWelcome {
-                    if commit_signature.is_some() {
+                    let Some(signature) = commit_signature else {
                         return Ok(InboundFrameResolution::Rejected);
-                    }
+                    };
                     return self.resolve_welcome_frame(
                         Some(&conversation_id),
                         &mls_b64,
-                        Some(&key),
+                        Some((&key, &signature)),
                     );
                 }
                 // The key a frame opened under is part of what it claims to
@@ -463,12 +464,15 @@ impl CoreEngine {
     /// [`crate::direct_rebuild`]: the author's device key is not enough, since
     /// it outlives the peer's healing. `lane_conversation` is the conversation
     /// of the pairwise address the record arrived on, and `wrapped_under` the
-    /// key a wrapped Welcome opened under.
+    /// key a wrapped Welcome opened under, with the signature it carried.
     fn resolve_welcome_frame(
         &self,
         lane_conversation: Option<&str>,
         payload_b64: &str,
-        wrapped_under: Option<&[u8; lane_wrap::WRAP_KEY_LEN]>,
+        wrapped_under: Option<(
+            &[u8; lane_wrap::WRAP_KEY_LEN],
+            &[u8; crate::direct_frame::COMMIT_SIGNATURE_LEN],
+        )>,
     ) -> CoreResult<InboundFrameResolution> {
         let Some(adapter) = self.state.mls_adapter.as_ref() else {
             return Ok(InboundFrameResolution::Rejected);
@@ -492,7 +496,7 @@ impl CoreEngine {
                     return Ok(InboundFrameResolution::Rejected);
                 }
                 match wrapped_under {
-                    Some(key) => {
+                    Some((key, signature)) => {
                         if !existing
                             .rebuild
                             .admits_wrapped(key, &author.device_id, now_ms)
@@ -503,18 +507,28 @@ impl CoreEngine {
                         // commit carried: any other package of ours may be older
                         // than a snapshot, and joining from it would undo the
                         // rotation we won with.
-                        let Some(key_package_b64) = existing
-                            .rebuild
-                            .expected
-                            .as_ref()
-                            .and_then(|expected| expected.key_package_b64.as_deref())
-                        else {
+                        let Some(expected) = existing.rebuild.expected.as_ref() else {
+                            return Ok(InboundFrameResolution::Rejected);
+                        };
+                        let Some(key_package_b64) = expected.key_package_b64.as_deref() else {
                             return Ok(InboundFrameResolution::Rejected);
                         };
                         if !adapter
                             .welcome_targets_key_package(payload_b64, key_package_b64)
                             .unwrap_or(false)
                         {
+                            return Ok(InboundFrameResolution::Rejected);
+                        }
+                        // The loser's signature for this race: what a second
+                        // rebuild for it is compared against.
+                        if !self.rebuild_welcome_signature_verifies(
+                            &inspection.conversation_id,
+                            &existing.peer_user_id,
+                            &author.device_id,
+                            expected.base_epoch,
+                            payload_b64,
+                            signature,
+                        ) {
                             return Ok(InboundFrameResolution::Rejected);
                         }
                         let winning_epoch = existing
@@ -566,13 +580,17 @@ impl CoreEngine {
         if conversation.fork.forked_since_ms.is_some() {
             return None;
         }
-        let witness = conversation.fork.witness_for_key(key)?;
         let (mls_b64, Some(signature)) = crate::direct_frame::decode(frame).ok()? else {
             return None;
         };
-        if MlsAdapter::classify_mls_payload(&mls_b64) != Some(MessageType::MlsCommit) {
-            return None;
+        match MlsAdapter::classify_mls_payload(&mls_b64) {
+            Some(MessageType::MlsCommit) => {}
+            Some(MessageType::MlsWelcome) => {
+                return self.second_rebuild_evidence(conversation_id, &mls_b64, &signature, key);
+            }
+            _ => return None,
         }
+        let witness = conversation.fork.witness_for_key(key)?;
         let base_epoch = MlsAdapter::protocol_message_epoch(&mls_b64).ok()?;
         let digest = crate::direct_frame::commit_sha256(&mls_b64).ok()?;
         let commit_hash = crate::direct_frame::commit_hash(&digest);
@@ -600,6 +618,68 @@ impl CoreEngine {
         } else {
             witness.merged_at_ms
         })
+    }
+
+    /// Whether a rebuild Welcome opened under `key` is a second one, signed by
+    /// the device whose rebuild this device joined under that key, for the
+    /// same race. A loser rebuilds once, so the two are two holders of one
+    /// device key; which of them is the forgery nobody here can tell. The
+    /// same Welcome again is a replay and proves nothing. Returns when the
+    /// joined one was received.
+    fn second_rebuild_evidence(
+        &self,
+        conversation_id: &str,
+        welcome_b64: &str,
+        signature: &[u8; crate::direct_frame::COMMIT_SIGNATURE_LEN],
+        key: &[u8; lane_wrap::WRAP_KEY_LEN],
+    ) -> Option<u64> {
+        let conversation = self.state.conversations.get(conversation_id)?;
+        let joined = conversation.fork.rebuild_welcome_for_key(key)?;
+        let digest = crate::direct_frame::welcome_sha256(welcome_b64).ok()?;
+        if crate::direct_frame::commit_hash(&digest) == joined.welcome_hash {
+            return None;
+        }
+        self.rebuild_welcome_signature_verifies(
+            conversation_id,
+            &conversation.peer_user_id,
+            &joined.device_id,
+            joined.base_epoch,
+            welcome_b64,
+            signature,
+        )
+        .then_some(joined.received_at_ms)
+    }
+
+    /// A rebuild Welcome's signature, checked against the device key the
+    /// identity chain vouches for: the leaf in any group is only what a
+    /// Welcome put there.
+    fn rebuild_welcome_signature_verifies(
+        &self,
+        conversation_id: &str,
+        peer_user_id: &str,
+        device_id: &str,
+        base_epoch: u64,
+        welcome_b64: &str,
+        signature: &[u8; crate::direct_frame::COMMIT_SIGNATURE_LEN],
+    ) -> bool {
+        let Ok(digest) = crate::direct_frame::welcome_sha256(welcome_b64) else {
+            return false;
+        };
+        let Ok(trusted_key) = self.trusted_device_public_key(peer_user_id, device_id) else {
+            return false;
+        };
+        crate::identity::verify_device_payload_signature(
+            &trusted_key,
+            crate::model::signing::direct_rebuild_welcome_payload(
+                conversation_id,
+                peer_user_id,
+                device_id,
+                base_epoch,
+                &digest,
+            ),
+            &crate::identity::encode_hex(signature),
+        )
+        .is_ok()
     }
 
     /// Establish that a rival commit really came from the counterparty.

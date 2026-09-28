@@ -3901,6 +3901,7 @@ impl CoreEngine {
                     device_id: incoming.device_id.clone(),
                     key: incoming.wrap_key,
                     at_ms: now_ms,
+                    base_epoch: incoming.base_epoch,
                     key_package_b64: own.key_package_b64.clone(),
                 });
             }
@@ -3940,6 +3941,7 @@ impl CoreEngine {
                 Some(crate::direct_rebuild::ReentryTarget {
                     device_id: peer.device_id,
                     key_package_b64: peer.key_package_b64,
+                    base_epoch: incoming.base_epoch,
                 })
             });
         let Some(reentry) = reentry else {
@@ -4028,6 +4030,35 @@ impl CoreEngine {
                 },
                 now_ms,
             );
+        }
+    }
+
+    /// Keep the race loser's rebuild this device is joining; see
+    /// [`crate::direct_fork`]. Called while the rebuild it expected is still
+    /// on record: that is what names the key, the loser and the race.
+    pub(super) fn record_joined_rebuild_welcome(
+        &mut self,
+        conversation_id: &str,
+        welcome_b64: &str,
+        received_at_ms: u64,
+    ) {
+        let Ok(digest) = crate::direct_frame::welcome_sha256(welcome_b64) else {
+            return;
+        };
+        let now_ms = current_unix_millis(self.state.message_nonce);
+        if let Some(state) = self.state.conversations.get_mut(conversation_id) {
+            let Some(expected) = state.rebuild.expected.as_ref() else {
+                return;
+            };
+            let witness = crate::direct_fork::RebuildWelcomeWitness {
+                base_epoch: expected.base_epoch,
+                device_id: expected.device_id.clone(),
+                welcome_hash: crate::direct_frame::commit_hash(&digest),
+                wrap_key: expected.key,
+                joined_at_ms: now_ms,
+                received_at_ms,
+            };
+            state.fork.record_rebuild_welcome(witness, now_ms);
         }
     }
 

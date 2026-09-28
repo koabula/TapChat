@@ -30,6 +30,16 @@
 //! rebuild that restarts the epoch count cannot produce a false match, and
 //! witnesses survive a rebuild. They have to: a rebuild the adversary can
 //! provoke from a forked branch would otherwise erase the evidence.
+//!
+//! A race has a second signature to witness. The loser rebuilds once, and
+//! its Welcome, under the key its losing commit travelled under, carries the
+//! loser's signature for the race (`direct_frame`). A holder of the loser's
+//! device key and of the race's base epoch can build a rebuild of its own,
+//! and the winner joins whichever arrives first; the real loser then sits in
+//! a group the winner will never read, and signs no commit anywhere the
+//! winner holds a key for. So when the winner joins a rebuild it keeps that
+//! Welcome's digest under the key, and a different Welcome signed by the same
+//! device for the same race is the evidence, in either order.
 
 use serde::{Deserialize, Serialize};
 
@@ -68,6 +78,27 @@ pub struct PeerCommitWitness {
     pub received_at_ms: u64,
 }
 
+/// A race loser's rebuild Welcome this device joined, kept so a second one
+/// for the same race can be recognised.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RebuildWelcomeWitness {
+    /// The race's base epoch, which the loser's signature names.
+    pub base_epoch: u64,
+    /// The loser.
+    pub device_id: String,
+    /// `sha256:` of the Welcome that was joined.
+    pub welcome_hash: String,
+    /// The key the losing commit and its rebuild travelled under.
+    pub wrap_key: [u8; WRAP_KEY_LEN],
+    /// Local clock; what the TTL runs on.
+    pub joined_at_ms: u64,
+    /// The host's `received_at` for the record that carried the joined
+    /// Welcome: from then on, what the winner reads in the loser's name is in
+    /// doubt.
+    pub received_at_ms: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ForkGuard {
@@ -77,6 +108,10 @@ pub struct ForkGuard {
     /// with its messages. At most one entry per key.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub witnesses: Vec<PeerCommitWitness>,
+    /// The rebuilds this device joined after winning a race, at most one per
+    /// key, pruned by age like `witnesses`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rebuild_welcomes: Vec<RebuildWelcomeWitness>,
     /// When the record carrying the commit that the double sign contradicts
     /// was received, by the host's clock: messages attributed to the peer and
     /// stamped from then on may not be from the peer. Set once the fork is
@@ -87,7 +122,9 @@ pub struct ForkGuard {
 
 impl ForkGuard {
     pub fn is_empty(&self) -> bool {
-        self.witnesses.is_empty() && self.forked_since_ms.is_none()
+        self.witnesses.is_empty()
+            && self.rebuild_welcomes.is_empty()
+            && self.forked_since_ms.is_none()
     }
 
     /// Keep `witness`, unless its key already has one.
@@ -113,15 +150,48 @@ impl ForkGuard {
         }
     }
 
+    /// Keep the rebuild this device joined, unless its key already has one.
+    /// A loser rebuilds once per race, so the first one joined is the one the
+    /// winner is in, and it is what a later Welcome is compared against.
+    pub fn record_rebuild_welcome(&mut self, witness: RebuildWelcomeWitness, now_ms: u64) {
+        self.prune(now_ms);
+        if !self
+            .rebuild_welcomes
+            .iter()
+            .any(|held| held.wrap_key == witness.wrap_key)
+        {
+            self.rebuild_welcomes.push(witness);
+        }
+    }
+
     pub fn prune(&mut self, now_ms: u64) {
         self.witnesses
             .retain(|witness| now_ms.saturating_sub(witness.merged_at_ms) < FORK_WITNESS_TTL_MS);
+        self.rebuild_welcomes
+            .retain(|witness| now_ms.saturating_sub(witness.joined_at_ms) < FORK_WITNESS_TTL_MS);
     }
 
     /// The keys to try on a frame that neither the current nor the previous
     /// epoch's key opens.
     pub fn wrap_keys(&self) -> impl Iterator<Item = &[u8; WRAP_KEY_LEN]> {
-        self.witnesses.iter().map(|witness| &witness.wrap_key)
+        self.witnesses
+            .iter()
+            .map(|witness| &witness.wrap_key)
+            .chain(
+                self.rebuild_welcomes
+                    .iter()
+                    .map(|witness| &witness.wrap_key),
+            )
+    }
+
+    /// The rebuild joined under `key`, if any.
+    pub fn rebuild_welcome_for_key(
+        &self,
+        key: &[u8; WRAP_KEY_LEN],
+    ) -> Option<&RebuildWelcomeWitness> {
+        self.rebuild_welcomes
+            .iter()
+            .find(|witness| &witness.wrap_key == key)
     }
 
     /// The witness whose base epoch a frame opened under `key` was wrapped at.
@@ -191,6 +261,25 @@ mod tests {
             }
             assert_eq!(guard.witnesses, vec![beaten.clone()]);
         }
+    }
+
+    #[test]
+    fn the_first_rebuild_joined_under_a_key_is_the_one_kept() {
+        let joined = |hash: &str, at: u64| RebuildWelcomeWitness {
+            base_epoch: 3,
+            device_id: "device:bob:phone".into(),
+            welcome_hash: hash.into(),
+            wrap_key: [1; WRAP_KEY_LEN],
+            joined_at_ms: at,
+            received_at_ms: at,
+        };
+        let mut guard = ForkGuard::default();
+        guard.record_rebuild_welcome(joined("sha256:first", 0), 0);
+        guard.record_rebuild_welcome(joined("sha256:second", 1), 1);
+        assert_eq!(guard.rebuild_welcomes, vec![joined("sha256:first", 0)]);
+        assert!(guard.wrap_keys().any(|key| key == &[1; WRAP_KEY_LEN]));
+        guard.prune(FORK_WITNESS_TTL_MS);
+        assert!(guard.rebuild_welcome_for_key(&[1; WRAP_KEY_LEN]).is_none());
     }
 
     #[test]

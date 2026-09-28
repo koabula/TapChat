@@ -366,19 +366,27 @@ impl CoreEngine {
             .conversations
             .get_mut(&conversation_id)
             .and_then(|state| {
-                let wrap_out = state.rebuild.wrap_out;
+                let wrap_out = state.rebuild.wrap_out.map(|key| {
+                    let base_epoch = state
+                        .rebuild
+                        .reentry
+                        .as_ref()
+                        .map_or(0, |reentry| reentry.base_epoch);
+                    (key, base_epoch)
+                });
                 state.rebuild.bootstrapped();
                 wrap_out
             });
         // After a lost race the Welcome rides under the losing commit's key,
-        // which is what lets the winner tell it from a forgery.
-        if let Some(key) = wrap_out {
+        // which is what lets the winner tell it from a forgery, and carries
+        // this device's one signature for the race.
+        if let Some((key, base_epoch)) = wrap_out {
             for (envelope, welcome) in welcomes.iter_mut().zip(&artifacts.welcomes) {
-                envelope.bytes = Some(self.wrap_outbound_frame_with_key(
+                envelope.bytes = Some(self.wrap_rebuild_welcome(
                     &conversation_id,
-                    MessageType::MlsWelcome,
                     &welcome.payload_b64,
                     &key,
+                    base_epoch,
                 )?);
             }
         }

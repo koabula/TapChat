@@ -117,6 +117,37 @@ impl CoreEngine {
         Ok(STANDARD.encode(wrapped))
     }
 
+    /// A race loser's rebuild Welcome, wrapped under the key its losing commit
+    /// travelled under and signed for the race at `base_epoch`. The loser
+    /// rebuilds once per lost race, so this is its one such signature; see
+    /// [`crate::direct_fork`] for what a second one proves.
+    pub(super) fn wrap_rebuild_welcome(
+        &self,
+        conversation_id: &str,
+        welcome_b64: &str,
+        key: &[u8; crate::lane_wrap::WRAP_KEY_LEN],
+        base_epoch: u64,
+    ) -> CoreResult<String> {
+        let identity = self
+            .state
+            .local_identity
+            .as_ref()
+            .ok_or_else(|| CoreError::invalid_state("local identity is not initialized"))?;
+        let digest = crate::direct_frame::welcome_sha256(welcome_b64)?;
+        let signature =
+            identity.sign_payload(crate::model::signing::direct_rebuild_welcome_payload(
+                conversation_id,
+                &identity.user_identity.user_id,
+                &identity.device_identity.device_id,
+                base_epoch,
+                &digest,
+            ));
+        let signature = crate::direct_frame::signature_from_hex(&signature)?;
+        let plaintext = crate::direct_frame::encode(welcome_b64, Some(&signature))?;
+        let wrapped = crate::lane_wrap::wrap_frame(key, &plaintext)?;
+        Ok(STANDARD.encode(wrapped))
+    }
+
     pub(super) fn build_group_manifest(
         &self,
         group_id: &str,

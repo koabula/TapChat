@@ -3910,6 +3910,16 @@ impl CoreEngine {
                                             }
                                         }
                                     }
+                                    if matches!(
+                                        welcome_admission,
+                                        Some(WelcomeAdmission::RaceReentry { .. })
+                                    ) {
+                                        self.record_joined_rebuild_welcome(
+                                            &conversation_id,
+                                            &inbound_payload_b64,
+                                            record.received_at,
+                                        );
+                                    }
                                     if let Some(state) =
                                         self.state.conversations.get_mut(&conversation_id)
                                     {
