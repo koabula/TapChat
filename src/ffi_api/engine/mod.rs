@@ -9,6 +9,8 @@ mod transport;
 
 #[cfg(test)]
 mod auth_ledger;
+#[cfg(test)]
+mod emission_ledger;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 

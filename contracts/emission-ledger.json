@@ -1,0 +1,83 @@
+{
+  "version": 1,
+  "invariant": "Every record a client emits in a direct session is a deterministic function of the events that concern its sessions (its sends, refresh requests, fetches and what they return, its moves), of when it is connected, of the responses of the points it writes to, and of the configuration. No message content beyond its length decides whether, when or where a record is emitted. This is the observable-schedule lemma of the note (lem:schedule).",
+  "scope": "Direct (1:1) sessions at the emitting device. Two checks. Every network effect maps to the point it reaches, by an exhaustive match, so a new kind of effect does not compile until it names one; no point outside the two parties' own components exists. Every function that queues a record for a peer's inbox is a site below with its trigger, by a scan of the engine's source, so a new site fails the test until it is entered. A retried append re-emits a queued record unchanged and adds no site.",
+  "points": {
+    "own-inbox": "ibx(P): the emitter's own inbox runtime, with its device registry, first-contact queue and realtime channel.",
+    "own-storage": "stg(P): the emitter's own storage, which holds payloads addressed to it and its published bundle.",
+    "peer-inbox": "ibx(Q): the counterparty's inbox runtime, which takes appends, key-package claims and payload-upload preparation.",
+    "peer-storage": "stg(Q): the counterparty's storage, which takes spilled payloads and serves its bundle.",
+    "local": "No network: the device's own disk, timers and user interface.",
+    "group-path": "Group conversations, outside the scope of the write-up."
+  },
+  "triggers": {
+    "own-send": "The user's own send. Its time may wait for a response of a point the user writes to, such as an upload that must finish first.",
+    "user-command": "A user command other than a send: creating a conversation, removing a contact.",
+    "refresh": "A Refresh request, which the client's policy issues (part of the environment).",
+    "reaction": "Something the protocol sends by itself on receipt. Its time follows the emitter's fetch.",
+    "move": "A Rehost of the emitter's own components.",
+    "out-of-scope": "A path outside the write-up's scope, with the reason."
+  },
+  "emitters": [
+    "enqueue_envelopes",
+    "enqueue_envelopes_with_plaintext",
+    "enqueue_protected_app",
+    "enqueue_or_create_direct_app",
+    "flush_pending_direct_app",
+    "enqueue_lane_rotation"
+  ],
+  "sites": [
+    {
+      "fn": "send_text_message",
+      "trigger": "own-send",
+      "emits": "an application frame"
+    },
+    {
+      "fn": "handle_blob_uploaded",
+      "trigger": "own-send",
+      "emits": "an application frame that refers to a spilled payload, once the payload's upload has finished"
+    },
+    {
+      "fn": "finalize_direct_conversation_creation",
+      "trigger": "user-command",
+      "emits": "the welcome that establishes a session, once the peer's key package has been claimed; then the sends the user queued before the session existed"
+    },
+    {
+      "fn": "delete_contact",
+      "trigger": "user-command",
+      "emits": "a contact-removed frame"
+    },
+    {
+      "fn": "maybe_rotate_direct_pcs",
+      "trigger": "refresh",
+      "emits": "a commit, then the announcement of the bundle and the pairwise token"
+    },
+    {
+      "fn": "relocate_inbound_lanes",
+      "trigger": "move",
+      "emits": "the announcement of the new endpoint and token, in each session"
+    },
+    {
+      "fn": "handle_inbox_records_batch",
+      "trigger": "reaction",
+      "emits": "the contact-accepted reply that ends establishment, on applying the initiator's welcome"
+    },
+    {
+      "fn": "finalize_reconcile_membership_rebootstrap",
+      "trigger": "reaction",
+      "emits": "the welcome of a re-entry, on losing a race; or of a rebuild the user confirmed"
+    },
+    {
+      "fn": "finalize_reconcile_membership_add_devices",
+      "trigger": "out-of-scope",
+      "emits": "the welcome for a contact's added device",
+      "reason": "The write-up has one device per party."
+    },
+    {
+      "fn": "handle_welcome_pickup_put",
+      "trigger": "out-of-scope",
+      "emits": "a group invitation carried in a direct session",
+      "reason": "Group conversations are outside the write-up."
+    }
+  ]
+}
