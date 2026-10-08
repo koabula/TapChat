@@ -84,11 +84,12 @@ proptest = "1.11"
 
 # hpke-rs 0.6.1 pins libcrux-sha3 0.0.8, which is affected by
 # RUSTSEC-2026-0207 and RUSTSEC-2026-0208 and pulls in the
-# RUSTSEC-2026-0212-affected libcrux-secrets 0.0.5. The four hpke-rs packages
+# RUSTSEC-2026-0212-affected libcrux-secrets 0.0.5. The three hpke-rs packages
 # must stay on one upstream commit because that commit changed their shared
-# provider API. Only package manifests are patched; Rust sources are unchanged.
+# provider API. The unused libcrux backend is dropped, which keeps its
+# libcrux-kem 0.0.9 (RUSTSEC-2026-0330, RUSTSEC-2026-0331) out of Cargo.lock.
+# Only package manifests are patched; Rust sources are unchanged.
 [patch.crates-io]
 hpke-rs = { path = "third_party/rust/hpke-rs" }
 hpke-rs-crypto = { path = "third_party/rust/hpke-rs/traits" }
 hpke-rs-rust-crypto = { path = "third_party/rust/hpke-rs/rust_crypto_provider" }
-hpke-rs-libcrux = { path = "third_party/rust/hpke-rs/libcrux_provider" }

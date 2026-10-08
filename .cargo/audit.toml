@@ -1,6 +1,4 @@
 [advisories]
-# hpke-rs-libcrux is an optional backend that TapChat does not enable; the
-# active OpenMLS provider is openmls_rust_crypto.
 # The quick-xml versions below are confined to trusted platform/build XML in
 # tauri-winrt-notification and wayland-scanner. TapChat does not pass message,
 # attachment, or network-controlled XML to either parser. Remove these entries
@@ -10,7 +8,6 @@
 # production feature graph. Remove this entry when rust_decimal no longer locks
 # the vulnerable optional version.
 ignore = [
-  "RUSTSEC-2026-0124",
   "RUSTSEC-2026-0194",
   "RUSTSEC-2026-0195",
   "RUSTSEC-2026-0235",
