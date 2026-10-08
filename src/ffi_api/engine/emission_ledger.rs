@@ -153,7 +153,9 @@ fn functions_calling(emitters: &[String]) -> BTreeMap<String, BTreeSet<String>> 
         if path.extension().is_none_or(|ext| ext != "rs") {
             continue;
         }
-        let text = std::fs::read_to_string(&path).expect("read source");
+        let text = std::fs::read_to_string(&path)
+            .expect("read source")
+            .replace("\r\n", "\n");
         let text = text
             .split("#[cfg(test)]\nmod tests")
             .next()
