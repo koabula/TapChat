@@ -68,6 +68,11 @@
       "emits": "the welcome of a re-entry, on losing a race; or of a rebuild the user confirmed"
     },
     {
+      "fn": "resend_unconfirmed_frames",
+      "trigger": "reaction",
+      "emits": "the frames sent while a commit was pending, again, in the group that replaced the one a race took: by the loser behind its rebuild welcome, by the winner once it has joined"
+    },
+    {
       "fn": "finalize_reconcile_membership_add_devices",
       "trigger": "out-of-scope",
       "emits": "the welcome for a contact's added device",

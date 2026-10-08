@@ -86,6 +86,31 @@ impl PendingCommit {
     }
 }
 
+/// A frame this device sent while one of its commits was pending, kept so it
+/// can be sent again if that commit's group is lost to a race.
+///
+/// What is sent after a commit is encrypted in the epoch the commit created.
+/// If the peer committed on the same base epoch, only one of the two epochs
+/// survives: the winner never opens the loser's frames, and the loser never
+/// holds the winning epoch. Both sides meet again in the loser's rebuilt
+/// group, and each sends these frames there. The protected payload goes
+/// unchanged, so the peer drops any it already has by its application id.
+///
+/// The price is that a snapshot reads them while they are kept. They go when
+/// the peer is seen to follow the commit, and in any case once no race can
+/// reach them any more.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnconfirmedFrame {
+    /// The protected application payload, as encrypted.
+    pub protected: String,
+    /// The references the envelope carried outside the ciphertext.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub storage_refs: Vec<crate::model::StorageRef>,
+    /// Local clock, when it was sent; see [`PENDING_COMMIT_TTL_MS`].
+    pub sent_at_ms: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct DirectPcsState {
@@ -123,6 +148,10 @@ pub struct DirectPcsState {
         skip_serializing_if = "std::ops::Not::not"
     )]
     pub rotate_now: bool,
+    /// Oldest first; see [`UnconfirmedFrame`]. Kept only while a commit is
+    /// pending, and carried into the next group when this one is replaced.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unconfirmed: Vec<UnconfirmedFrame>,
 }
 
 /// Before the pending set, state kept at most one own commit, as
@@ -184,15 +213,28 @@ impl DirectPcsState {
         self.pending_commits.last()
     }
 
+    /// Keep a frame just sent, if a race could still take it; see
+    /// [`UnconfirmedFrame`]. With no commit pending, the peer holds the epoch
+    /// it was sent in, and there is nothing to keep.
+    pub fn keep_unconfirmed(&mut self, frame: UnconfirmedFrame) {
+        if !self.pending_commits.is_empty() {
+            self.unconfirmed.push(frame);
+        }
+    }
+
     /// The peer was seen in `peer_epoch`: every commit of ours that created
     /// that epoch or an earlier one is no longer pending. Returns them, so
-    /// the caller can delete what they kept. Does **not** touch `self_debt`;
+    /// the caller can delete what they kept. Once none is pending, no race can
+    /// take a frame, and the kept ones go too. Does **not** touch `self_debt`;
     /// see the field comment.
     pub fn resolve_pending(&mut self, peer_epoch: u64) -> Vec<PendingCommit> {
         let (resolved, pending) = std::mem::take(&mut self.pending_commits)
             .into_iter()
             .partition(|commit| commit.created_epoch() <= peer_epoch);
         self.pending_commits = pending;
+        if self.pending_commits.is_empty() {
+            self.unconfirmed.clear();
+        }
         resolved
     }
 
@@ -215,7 +257,12 @@ impl DirectPcsState {
     /// quiet the peer is, and a peer that returns late can still follow it.
     /// And the one whose KeyPackage is `awaited`: we won its race and wait for
     /// the loser's rebuild, which is built to that package.
+    ///
+    /// A kept frame goes by the same bound, counted from when it was sent:
+    /// it was sent after its commit, so no race on that commit outlives it.
     pub fn expire_pending(&mut self, now_ms: u64, awaited: Option<&str>) -> Vec<PendingCommit> {
+        self.unconfirmed
+            .retain(|frame| now_ms.saturating_sub(frame.sent_at_ms) < PENDING_COMMIT_TTL_MS);
         let latest = self.pending_commits.len().saturating_sub(1);
         let (kept, expired): (Vec<_>, Vec<_>) = std::mem::take(&mut self.pending_commits)
             .into_iter()
@@ -282,6 +329,50 @@ mod tests {
             key_package_b64: None,
             made_at_ms: 0,
         }
+    }
+
+    fn frame(sent_at_ms: u64) -> UnconfirmedFrame {
+        UnconfirmedFrame {
+            protected: format!("frame at {sent_at_ms}"),
+            storage_refs: Vec::new(),
+            sent_at_ms,
+        }
+    }
+
+    #[test]
+    fn a_frame_is_kept_only_while_a_commit_is_pending_and_goes_with_it() {
+        let mut state = DirectPcsState::default();
+        state.keep_unconfirmed(frame(1));
+        assert!(state.unconfirmed.is_empty(), "no commit pending, no race");
+
+        state.mark_rotated(own_commit(4, "c", true), 2);
+        state.keep_unconfirmed(frame(3));
+        state.mark_rotated(own_commit(5, "d", true), 4);
+        state.keep_unconfirmed(frame(5));
+        assert_eq!(state.unconfirmed.len(), 2);
+
+        state.resolve_pending(5);
+        assert_eq!(state.unconfirmed.len(), 2, "a commit is still pending");
+        state.resolve_pending(6);
+        assert!(
+            state.unconfirmed.is_empty(),
+            "the peer follows every commit, so no frame can be lost"
+        );
+    }
+
+    #[test]
+    fn a_kept_frame_expires_with_the_race_window() {
+        let mut state = DirectPcsState::default();
+        state.mark_rotated(own_commit(4, "c", true), 0);
+        state.keep_unconfirmed(frame(10));
+        state.keep_unconfirmed(frame(20));
+        state.expire_pending(10 + PENDING_COMMIT_TTL_MS, None);
+        assert_eq!(state.unconfirmed, vec![frame(20)]);
+        assert_eq!(
+            state.pending_commits.len(),
+            1,
+            "the latest commit is kept whatever its age"
+        );
     }
 
     fn made_at(base_epoch: u64, made_at_ms: u64, key_package: &str) -> PendingCommit {

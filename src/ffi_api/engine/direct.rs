@@ -1281,6 +1281,7 @@ impl CoreEngine {
             .as_mut()
             .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
             .encrypt_application(&conversation_id, &protected_bytes)?;
+        self.keep_unconfirmed_frame(&conversation_id, &protected_bytes, Vec::new());
         let envelopes = recipient_device_ids
             .iter()
             .map(|device_id| {
@@ -1951,6 +1952,9 @@ impl CoreEngine {
             .as_mut()
             .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
             .encrypt_application(conversation_id, &bytes)?;
+        if resent_after_a_race(kind) {
+            self.keep_unconfirmed_frame(conversation_id, &bytes, storage_refs.clone());
+        }
         let mut envelopes = Vec::new();
         for device_id in &recipient_device_ids {
             envelopes.push(self.build_envelope_with_storage_refs(
@@ -1980,6 +1984,63 @@ impl CoreEngine {
             Some(app_message_id.clone()),
         );
         Ok(app_message_id)
+    }
+
+    /// Keep a protected payload just encrypted, in case a race takes the epoch
+    /// it went out in; see [`crate::direct_pcs::UnconfirmedFrame`].
+    fn keep_unconfirmed_frame(
+        &mut self,
+        conversation_id: &str,
+        protected: &[u8],
+        storage_refs: Vec<StorageRef>,
+    ) {
+        let sent_at_ms = current_unix_millis(self.state.message_nonce);
+        if let Some(state) = self.state.conversations.get_mut(conversation_id) {
+            state
+                .pcs
+                .keep_unconfirmed(crate::direct_pcs::UnconfirmedFrame {
+                    protected: String::from_utf8_lossy(protected).into_owned(),
+                    storage_refs,
+                    sent_at_ms,
+                });
+        }
+    }
+
+    /// Send again, in the session's current group, what was sent in a group
+    /// that a race replaced. The loser calls this once its rebuild Welcome is
+    /// queued, so the frames follow the Welcome in the peer's inbox; the
+    /// winner once it has joined. The payloads go unchanged, so the peer drops
+    /// any it already has by their application id.
+    pub(super) fn resend_unconfirmed_frames(&mut self, conversation_id: &str) -> CoreResult<()> {
+        let frames = match self.state.conversations.get_mut(conversation_id) {
+            Some(state) => std::mem::take(&mut state.pcs.unconfirmed),
+            None => return Ok(()),
+        };
+        if frames.is_empty() {
+            return Ok(());
+        }
+        let peer_user_id = self.peer_user_for_conversation(conversation_id)?;
+        let recipient_device_ids = self.recipient_device_ids(conversation_id)?;
+        let mut envelopes = Vec::new();
+        for frame in frames {
+            let payload = self
+                .state
+                .mls_adapter
+                .as_mut()
+                .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
+                .encrypt_application(conversation_id, frame.protected.as_bytes())?;
+            for device_id in &recipient_device_ids {
+                envelopes.push(self.build_envelope_with_storage_refs(
+                    conversation_id,
+                    device_id,
+                    MessageType::MlsApplication,
+                    payload.payload_b64.clone(),
+                    frame.storage_refs.clone(),
+                )?);
+            }
+        }
+        self.enqueue_envelopes(peer_user_id, envelopes);
+        Ok(())
     }
 
     pub(super) fn enqueue_or_create_direct_app(
@@ -3398,17 +3459,16 @@ impl CoreEngine {
             .conversations
             .get_mut(conversation_id)
             .ok_or_else(|| CoreError::invalid_input("conversation does not exist"))?;
-        // The group those commits were pending in is gone.
-        let abandoned = std::mem::replace(
-            &mut state.pcs,
-            crate::direct_pcs::DirectPcsState {
-                self_rotated_at_ms: Some(now_ms),
-                rotate_now,
-                ..Default::default()
-            },
-        )
-        .pending_commits;
-        self.discard_pending_commits(abandoned);
+        // The group those commits were pending in is gone. What was sent in it
+        // while they were pending waits to be sent again in the new one.
+        let abandoned = std::mem::take(&mut state.pcs);
+        state.pcs = crate::direct_pcs::DirectPcsState {
+            self_rotated_at_ms: Some(now_ms),
+            rotate_now,
+            unconfirmed: abandoned.unconfirmed,
+            ..Default::default()
+        };
+        self.discard_pending_commits(abandoned.pending_commits);
         Ok(())
     }
 
@@ -4084,6 +4144,9 @@ impl CoreEngine {
         }
         state.conversation.state = ConversationState::Compromised;
         state.fork.forked_since_ms = Some(forked_since_ms);
+        // Nothing will be sent again in this session; a snapshot should not
+        // find what was kept for that.
+        state.pcs.unconfirmed.clear();
         log::warn!(
             "fork detected: the peer's device key signed two commits on one base epoch in conversation {}",
             redact_id("conversation", conversation_id)
@@ -4195,5 +4258,21 @@ impl CoreEngine {
             }
         }));
         ops
+    }
+}
+
+/// Whether a frame of this kind, lost to a race, is sent again. What the user
+/// said is. An announcement is not: every refresh repeats it, so the next one
+/// carries what was lost. The two kinds that open and close a session are not
+/// either: the first is never sent while a commit is pending, and nothing
+/// follows the second to send it in.
+fn resent_after_a_race(kind: ProtectedPayloadKind) -> bool {
+    match kind {
+        ProtectedPayloadKind::Text
+        | ProtectedPayloadKind::Attachment
+        | ProtectedPayloadKind::GroupWelcomePickup => true,
+        ProtectedPayloadKind::LaneRotation
+        | ProtectedPayloadKind::ContactAccepted
+        | ProtectedPayloadKind::ContactRemoved => false,
     }
 }

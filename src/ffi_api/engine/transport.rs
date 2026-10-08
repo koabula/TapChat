@@ -3939,6 +3939,9 @@ impl CoreEngine {
                                             admission.rotate_now()
                                         }),
                                     )?;
+                                    // Before the peer is recorded as seen here,
+                                    // which would let the kept frames go unsent.
+                                    self.resend_unconfirmed_frames(&conversation_id)?;
                                     self.record_authenticated_inbound(
                                         &conversation_id,
                                         &inbound_peer_user_id,

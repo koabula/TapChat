@@ -15473,6 +15473,108 @@ pub(crate) mod tests {
     /// the host for nothing. The winner joins with that package's leaf and,
     /// having made no rotation since, keeps it: the leaf is as new as the
     /// rotation it won with.
+    /// **No message is lost to a commit race.** Each side's commit merges at
+    /// once, so what it sends next is encrypted in the epoch that commit
+    /// created, and only one of the two epochs survives the race: the winner
+    /// never opens the loser's frames, and the loser never holds the winning
+    /// epoch. With everything delivered, the messages sent in both epochs must
+    /// still reach the other side, once each, and nothing kept for the race may
+    /// outlive it.
+    #[test]
+    fn no_message_is_lost_to_a_commit_race() {
+        let mut chat = paired_direct_chat();
+        let conversation_id = chat.conversation_id.clone();
+        let alice_is_winner = alice_is_designated(&chat);
+        let mut seen_from_winner = pending_mids(rotator_engine(&chat, alice_is_winner));
+        let mut seen_from_loser = pending_mids(peer_engine(&chat, alice_is_winner));
+        let base_epoch = conversation_epoch(&chat.alice, &conversation_id);
+        set_direct_pcs_debt(
+            peer_engine_mut(&mut chat, alice_is_winner),
+            &conversation_id,
+            DIRECT_PCS_COMMIT_INTERVAL * 2 - 1,
+        );
+        peer_engine_mut(&mut chat, alice_is_winner)
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "loser trigger".into(),
+            })
+            .expect("loser rotates");
+        peer_engine_mut(&mut chat, alice_is_winner)
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "sent by the loser in the race".into(),
+            })
+            .expect("loser sends in its new epoch");
+        set_direct_pcs_debt(
+            rotator_engine_mut(&mut chat, alice_is_winner),
+            &conversation_id,
+            DIRECT_PCS_COMMIT_INTERVAL - 1,
+        );
+        rotator_engine_mut(&mut chat, alice_is_winner)
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "winner trigger".into(),
+            })
+            .expect("winner rotates");
+        rotator_engine_mut(&mut chat, alice_is_winner)
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "sent by the winner in the race".into(),
+            })
+            .expect("winner sends in its new epoch");
+        for engine in [&chat.alice, &chat.bob] {
+            assert_eq!(
+                conversation_epoch(engine, &conversation_id),
+                base_epoch + 1,
+                "premise: both sides committed on the same base epoch"
+            );
+        }
+
+        let mut seq = 53_000;
+        exchange_until_quiet(
+            &mut chat,
+            alice_is_winner,
+            &mut seen_from_winner,
+            &mut seen_from_loser,
+            &mut seq,
+        );
+        assert!(
+            !rotator_engine(&chat, alice_is_winner).state.conversations[&conversation_id]
+                .fork
+                .rebuild_welcomes
+                .is_empty(),
+            "premise: the race was settled by the winner joining the loser's rebuild"
+        );
+
+        let copies = |engine: &CoreEngine, plaintext: &str| {
+            engine.state.conversations[&conversation_id]
+                .messages
+                .iter()
+                .filter(|message| message.plaintext.as_deref() == Some(plaintext))
+                .count()
+        };
+        let winner = rotator_engine(&chat, alice_is_winner);
+        let loser = peer_engine(&chat, alice_is_winner);
+        assert_eq!(
+            (
+                copies(winner, "sent by the loser in the race"),
+                copies(loser, "sent by the winner in the race"),
+            ),
+            (1, 1),
+            "each side's race message reaches the other exactly once: (loser -> winner, \
+             winner -> loser)"
+        );
+        for engine in [winner, loser] {
+            assert!(
+                engine.state.conversations[&conversation_id]
+                    .pcs
+                    .unconfirmed
+                    .is_empty(),
+                "nothing kept for the race outlives it"
+            );
+        }
+    }
+
     #[test]
     fn a_rebuild_is_made_to_the_key_package_the_winning_commit_carried() {
         let mut chat = paired_direct_chat();
