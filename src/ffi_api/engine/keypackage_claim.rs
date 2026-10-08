@@ -142,17 +142,24 @@ impl CoreEngine {
         ))
     }
 
+    /// The pool is held by the peer's device registry, which runs beside its
+    /// inbox, so the claim goes to the origin of the device's signed inbox
+    /// endpoint. The bundle may be stored elsewhere: inbox and storage are
+    /// separate points, and a party may place them at different operators.
     fn peer_key_package_claim_url(
         &self,
         peer_user_id: &str,
         device_id: &str,
     ) -> CoreResult<String> {
         let bundle = self.direct_peer_contact_bundle(peer_user_id)?;
-        let reference = bundle
-            .identity_bundle_ref
-            .as_deref()
-            .ok_or_else(|| CoreError::invalid_input("peer identity bundle reference is missing"))?;
-        let origin = origin_from_url(reference)?;
+        let endpoint = bundle
+            .devices
+            .iter()
+            .find(|device| device.device_id == device_id)
+            .and_then(|device| device.inbox_append_capability.as_ref())
+            .map(|capability| capability.endpoint.as_str())
+            .ok_or_else(|| CoreError::invalid_input("peer device inbox endpoint is missing"))?;
+        let origin = origin_from_url(endpoint)?;
         Ok(format!(
             "{origin}/v1/keypackage-pool/{}/claim",
             urlencoding::encode(device_id)
@@ -543,11 +550,11 @@ impl CoreEngine {
 
 fn origin_from_url(raw: &str) -> CoreResult<String> {
     let parsed = url::Url::parse(raw)
-        .map_err(|_| CoreError::invalid_input("identity bundle reference is not a valid URL"))?;
+        .map_err(|_| CoreError::invalid_input("peer inbox endpoint is not a valid URL"))?;
     let origin = parsed.origin().ascii_serialization();
     if origin == "null" {
         return Err(CoreError::invalid_input(
-            "identity bundle reference does not have a usable origin",
+            "peer inbox endpoint does not have a usable origin",
         ));
     }
     Ok(origin)

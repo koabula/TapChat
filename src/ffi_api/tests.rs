@@ -4568,6 +4568,53 @@ pub(crate) mod tests {
         assert!(output.effects.is_empty());
     }
 
+    /// The pool sits beside the inbox. A peer whose bundle is stored at another
+    /// operator must still be claimed from at its inbox, or the claim reaches
+    /// the storage operator, which holds no pool.
+    #[test]
+    fn a_peer_key_package_is_claimed_at_its_inbox_not_where_its_bundle_is_stored() {
+        let bob = IdentityManager::create_or_recover(Some(BOB_MNEMONIC), Some("phone"))
+            .expect("identity");
+        let mut bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        bob_bundle.identity_bundle_ref = Some(
+            "https://storage.elsewhere.example/v1/shared-state/bob/identity_bundle.json"
+                .to_string(),
+        );
+        bob_bundle.signature =
+            bob.sign_payload_with_root(crate::identity::identity_bundle_payload(&bob_bundle));
+        let inbox_endpoint = bob_bundle.devices[0]
+            .inbox_append_capability
+            .as_ref()
+            .expect("bob inbox capability")
+            .endpoint
+            .clone();
+        let inbox_origin = url::Url::parse(&inbox_endpoint)
+            .expect("inbox endpoint")
+            .origin()
+            .ascii_serialization();
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+
+        let output = alice
+            .handle_command(CoreCommand::CreateConversation {
+                peer_user_id: bob_bundle.user_id.clone(),
+                conversation_kind: ConversationKind::Direct,
+            })
+            .expect("create conversation");
+
+        let request = match &output.effects[0] {
+            CoreEffect::ExecuteHttpRequest { request } => request.clone(),
+            other => panic!("expected a claim request, got {other:?}"),
+        };
+        assert_ne!(inbox_origin, "https://storage.elsewhere.example");
+        assert!(
+            request
+                .url
+                .starts_with(&format!("{inbox_origin}/v1/keypackage-pool/")),
+            "claimed at {}, not at the inbox {inbox_origin}",
+            request.url
+        );
+    }
+
     #[test]
     fn create_direct_conversation_claims_key_package_before_creating_mls_group() {
         let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
