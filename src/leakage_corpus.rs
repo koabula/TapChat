@@ -687,12 +687,7 @@ impl Recorder {
         let view = http_view(&request);
 
         if url.contains("/keypackage-pool/") {
-            self.record(
-                Surface::Deferred("key_package_claim"),
-                who.other(),
-                who,
-                view,
-            );
+            self.record(Surface::Ledger("key_package_claim"), who.other(), who, view);
             let body = harness::key_package_claim_response(self.engine(who), &url);
             return self.http_response(who, request_id, body);
         }
@@ -1484,6 +1479,7 @@ mod tests {
             "register_accepted_lane_request",
             "message_request_action_request",
             "prepare_blob_upload_request",
+            "key_package_claim",
         ] {
             assert!(
                 seen.iter().any(|(_, s)| *s == Surface::Ledger(surface)),

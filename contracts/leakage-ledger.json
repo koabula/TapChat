@@ -14,7 +14,7 @@
       },
       {
         "surface": "device_registry_do",
-        "reason": "Device registration and runtime-auth state. Host-visible and real, but the write-up models the inbox and storage components; these entries would have no table row to map to, which would hollow out the unmapped-is-a-failure rule. Enumerating it is its own work."
+        "reason": "The registry's state at rest: device registration, runtime auth and the key-package pool. The registry runs beside the inbox, so it is part of the inbox point, and what reaches it from another party is enumerated as a request (key_package_claim). Its storage layout, and the owner's own runtime-auth traffic, are not enumerated here."
       }
     ],
     "excludedRoutePrefixes": [
@@ -481,6 +481,17 @@
       "carries": [],
       "parameter": "L_ibx",
       "fate": "ideal"
+    },
+    {
+      "surface": "key_package_claim",
+      "path": "@url",
+      "bits": "inhabited",
+      "carries": [
+        "recipient_user"
+      ],
+      "parameter": "L_ibx",
+      "fate": "routing",
+      "note": "A stranger claims one of the recipient's key packages to establish a session. The route names the device whose pool it draws on, at the registry beside that device's inbox; the request carries no credential and no body, so nothing in it names the claimer. The host sees the claimer only through its address."
     },
     {
       "surface": "message_request_action_request",
