@@ -395,6 +395,14 @@ pub(crate) enum Surface {
     Deferred(&'static str),
 }
 
+/// A party's two observation points: the inbox runtime, with the registry
+/// beside it, and the storage that holds the payloads addressed to the party.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Component {
+    Inbox,
+    Storage,
+}
+
 /// One host-visible request, as the host sees it.
 #[derive(Clone, Debug)]
 pub(crate) struct Record {
@@ -405,6 +413,8 @@ pub(crate) struct Record {
     /// Whose inbox or runtime this addresses. Resolves the ledger's
     /// `recipient_*` roles and drives the cross-inbox assertion.
     pub(crate) inbox: Party,
+    /// Which of that party's two points it reaches.
+    pub(crate) component: Component,
     /// Who issued it. Resolves the ledger's `sender_*` roles.
     pub(crate) local: Party,
     pub(crate) view: Value,
@@ -458,10 +468,22 @@ impl Recorder {
     }
 
     fn record(&mut self, surface: Surface, inbox: Party, local: Party, view: Value) {
+        self.record_at(surface, inbox, Component::Inbox, local, view);
+    }
+
+    fn record_at(
+        &mut self,
+        surface: Surface,
+        inbox: Party,
+        component: Component,
+        local: Party,
+        view: Value,
+    ) {
         self.out.push(Record {
             step: self.step,
             surface,
             inbox,
+            component,
             local,
             leaves: leaves(&view),
             view,
@@ -580,15 +602,21 @@ impl Recorder {
                     who,
                     host_view(&upload),
                 );
+                // Shaped as `storage/service.ts` mints them: the inbox grants
+                // the upload, and the name it mints travels to the storage.
                 let blob_ref = format!("blobs/{}", crate::model::random_opaque_id());
-                let origin = storage_origin(self.engine(who));
+                let origin = storage_origin(self.engine(inbox));
                 self.event(
                     who,
                     CoreEvent::BlobUploadPrepared {
                         task_id,
                         result: PrepareBlobUploadResult {
                             blob_ref: blob_ref.clone(),
-                            upload_target: format!("{origin}/v1/storage/upload"),
+                            upload_target: format!(
+                                "{origin}/v1/storage/upload/{}?token={}",
+                                urlencoding::encode(&blob_ref),
+                                crate::model::random_opaque_id()
+                            ),
                             upload_headers: BTreeMap::new(),
                             read_capability: crate::model::random_opaque_id(),
                             download_target: format!(
@@ -604,8 +632,20 @@ impl Recorder {
                 )
             }
             CoreEffect::UploadBlob { upload } => {
-                // The object is opaque bytes under an opaque key: nothing
-                // about it is a leaf the ledger enumerates.
+                // The object is opaque bytes under an opaque key, so the
+                // ledger enumerates nothing of it. The request is recorded at
+                // the recipient's storage all the same: what it shares with
+                // the recipient's inbox is a question of separation.
+                let mut view = serde_json::Map::new();
+                view.insert("@url".into(), Value::String(upload.upload_target.clone()));
+                view.insert("@header".into(), host_view(&upload.upload_headers));
+                self.record_at(
+                    Surface::Deferred("blob_upload_request"),
+                    who.other(),
+                    Component::Storage,
+                    who,
+                    Value::Object(view),
+                );
                 self.blobs.insert(upload.blob_ref, upload.blob_ciphertext);
                 self.event(
                     who,
@@ -615,6 +655,22 @@ impl Recorder {
                 )
             }
             CoreEffect::DownloadBlob { download } => {
+                let mut view = serde_json::Map::new();
+                view.insert(
+                    "@url".into(),
+                    Value::String(download.download_target.clone()),
+                );
+                view.insert("@header".into(), host_view(&download.download_headers));
+                if let Some(auth) = download.auth.as_ref() {
+                    view.insert("@auth".into(), host_view(auth));
+                }
+                self.record_at(
+                    Surface::Deferred("blob_download_request"),
+                    who,
+                    Component::Storage,
+                    who,
+                    Value::Object(view),
+                );
                 let blob_ciphertext = self.blobs.get(&download.blob_ref).cloned();
                 self.event(
                     who,
@@ -972,6 +1028,31 @@ pub(crate) fn record_run(inputs: &RunInputs) -> Vec<Record> {
                     .is_ok()
             }),
         "the spilled attachment must reach Bob, not just the host"
+    );
+    // Opening it is the fetch at Bob's own storage, the other half of what
+    // that point observes of a payload.
+    let (message_id, reference) = recorder
+        .bob
+        .state
+        .conversations
+        .get(&conversation_id)
+        .expect("bob conversation")
+        .messages
+        .iter()
+        .find_map(|message| {
+            let reference = message.storage_refs.first()?;
+            Some((message.message_id.clone(), reference.object_ref.clone()))
+        })
+        .expect("the spilled attachment has a storage reference");
+    recorder.step(
+        "b_download",
+        Party::Bob,
+        CoreCommand::DownloadAttachment {
+            conversation_id: conversation_id.clone(),
+            message_id,
+            reference,
+            destination: "corpus/download.bin".into(),
+        },
     );
 
     harness::set_direct_pcs_debt(
@@ -1389,55 +1470,111 @@ fn only_a_payloads_size_reaches_the_host() {
     );
 }
 
-/// Double lane and the frame wrap, as one executable sentence: the two inboxes
-/// of one conversation share no value that varies.
+/// The values that vary among the records `at` selects: the tokens a point,
+/// or a set of points, could match against another.
 ///
 /// Constants are excluded because a deployment origin or a protocol version
 /// appears at every inbox of every user and links nobody. Numbers are excluded
 /// because counters and sizes are the volume channel the write-up concedes;
 /// asserting disjointness on those would go red on a coincidence rather than
 /// on a leak. Every other equal value is a token, and the script gives the two
-/// directions different inputs throughout, so a token seen at both inboxes came
+/// directions different inputs throughout, so a token seen at two points came
 /// from the protocol.
+fn tokens(corpus: &Corpus, records: &[Record], at: impl Fn(&Record) -> bool) -> BTreeSet<String> {
+    records
+        .iter()
+        .filter(|record| at(record))
+        .flat_map(|record| {
+            record
+                .leaves
+                .iter()
+                .filter(|(path, _)| {
+                    !matches!(
+                        corpus.classify(record.step, record.surface, path),
+                        Class::Constant(_)
+                    )
+                })
+                .filter(|(path, value)| !path.ends_with("#len") && value.parse::<u128>().is_err())
+                .map(|(_, value)| value.clone())
+        })
+        .collect()
+}
+
+/// Double lane and the frame wrap, as one executable sentence: the points of
+/// the two parties of one conversation, inbox and storage alike, share no
+/// value that varies.
 #[test]
 fn host_view_shares_no_token_across_inboxes() {
     let corpus = corpus();
     for (index, records) in corpus.runs.iter().enumerate() {
-        let tokens = |who: Party| -> BTreeSet<String> {
-            records
-                .iter()
-                .filter(|record| record.inbox == who)
-                .flat_map(|record| {
-                    record
-                        .leaves
-                        .iter()
-                        .map(|(path, value)| (path.clone(), value.clone()))
-                        .filter(|(path, _)| {
-                            !matches!(
-                                corpus.classify(record.step, record.surface, path),
-                                Class::Constant(_)
-                            )
-                        })
-                        .filter(|(path, value)| {
-                            !path.ends_with("#len") && value.parse::<u128>().is_err()
-                        })
-                        .map(|(_, value)| value)
-                })
-                .collect()
-        };
-        let (at_alice, at_bob) = (tokens(Party::Alice), tokens(Party::Bob));
+        let at = |who: Party| tokens(corpus, records, |record| record.inbox == who);
+        let (at_alice, at_bob) = (at(Party::Alice), at(Party::Bob));
         assert!(
             !at_alice.is_empty() && !at_bob.is_empty(),
-            "run {index}: one inbox saw no varying value, so the test is vacuous"
+            "run {index}: one party's points saw no varying value, so the test is vacuous"
         );
         let shared: Vec<&String> = at_alice.intersection(&at_bob).collect();
         assert!(
             shared.is_empty(),
-            "run {index}: the two inboxes of one conversation share {shared:?}. \
+            "run {index}: the points of the two parties of one conversation share {shared:?}. \
              Under the reference deployment one operator holds both and knows \
              whose they are, so a shared value is the edge between them."
         );
     }
+}
+
+/// A party's inbox and its storage share the names of the payloads the inbox
+/// grants, and nothing else.
+///
+/// Admission lives at the inbox, so the inbox grants each upload to the
+/// recipient's storage and mints the payload's name; the name is then presented
+/// at the storage, on upload and on fetch. It relates a record to its payload,
+/// both on an edge into the same party, and tells neither point what the
+/// sender's address, the time and the size had not told the inbox already.
+/// Any other value the two share would be a link the model does not grant.
+#[test]
+fn an_inbox_and_its_storage_share_only_payload_names() {
+    let corpus = corpus();
+    let mut checked = false;
+    for (index, records) in corpus.runs.iter().enumerate() {
+        for who in [Party::Alice, Party::Bob] {
+            let at = |component: Component| {
+                tokens(corpus, records, |record| {
+                    record.inbox == who && record.component == component
+                })
+            };
+            let storage = at(Component::Storage);
+            if storage.is_empty() {
+                continue;
+            }
+            let names: BTreeSet<&str> = records
+                .iter()
+                .filter(|record| record.inbox == who && record.component == Component::Inbox)
+                .filter_map(|record| record.view.pointer("/envelope/storageRef/ref"))
+                .filter_map(Value::as_str)
+                .collect();
+            let of_a_name = |value: &str| {
+                names
+                    .iter()
+                    .any(|name| *name == value || name.split('/').any(|part| part == value))
+            };
+            let stray: Vec<String> = at(Component::Inbox)
+                .intersection(&storage)
+                .filter(|value| !of_a_name(value))
+                .cloned()
+                .collect();
+            assert!(
+                stray.is_empty(),
+                "run {index}: {who:?}'s inbox and storage share {stray:?}, which is \
+                 not the name of a payload the inbox granted"
+            );
+            checked = true;
+        }
+    }
+    assert!(
+        checked,
+        "no storage traffic was recorded, so the test is vacuous"
+    );
 }
 
 #[cfg(test)]
