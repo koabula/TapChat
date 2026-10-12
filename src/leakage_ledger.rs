@@ -90,7 +90,7 @@ pub(crate) enum Bits {
 /// The previous version of this field named a *row of a table in the
 /// write-up*; rows are prose and get restructured, and when they were, five
 /// of nine names here came to point at rows that no longer existed while CI
-/// stayed green. A parameter of the ideal functionality (`def:fchat`) does not move.
+/// stayed green. A parameter of the ideal functionality (`def:point`) does not move.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 pub(crate) enum Parameter {
     #[serde(rename = "L_ibx")]
@@ -126,7 +126,7 @@ pub(crate) enum Fate {
     /// write-up concedes to `L_net` and to a bundle that is public by design.
     Accepted,
     /// The deployment falls short of what the write-up claims for it. Either
-    /// `tab:gaps` marks the row *to repair*, or the protocol section states
+    /// `sec:limitations` marks the row *to repair*, or the protocol section states
     /// something the code does not yet do.
     ToRepair,
     /// No decision recorded. This value fails CI; see
