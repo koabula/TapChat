@@ -1075,7 +1075,7 @@ mod tests {
                         last_acked_seq: 1,
                         updated_at: 1,
                     },
-                    seen_message_ids: Default::default(),
+                    seen_message_seqs: Default::default(),
                     quarantine: BTreeMap::new(),
                     last_head_seq: 1,
                     consecutive_failures: 0,

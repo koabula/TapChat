@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use crate::model::{Ack, InboxRecord, SyncCheckpoint};
 use serde::{Deserialize, Serialize};
@@ -19,6 +19,18 @@ pub const MAX_QUARANTINED_RECORDS: usize = 64;
 /// generous.
 pub const MAX_QUARANTINED_RECORDS_PER_CONVERSATION: usize = 16;
 
+/// How many message ids at or below the ack are remembered.
+///
+/// No fetch returns a seq at or below the ack (`next_fetch` starts past it),
+/// so these ids are belt and braces, not a dependency. A copy that does get
+/// past them is a message already disposed of, and the layers above refuse
+/// it: MLS rejects a consumed generation or a past epoch's commit, a joined
+/// Welcome finds its KeyPackage gone, and a message already shown is skipped.
+/// Without a bound the set grew by one id per record received, for good, in
+/// a row rewritten on every persist. Ids above the ack are always kept: they
+/// are what stops a record pushed ahead of a gap from being ingested twice.
+pub const MAX_ACKED_SEEN_MESSAGE_IDS: usize = 1024;
+
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct SyncEngineModule;
 
@@ -31,7 +43,12 @@ impl SyncEngineModule {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceSyncState {
     pub checkpoint: SyncCheckpoint,
-    pub seen_message_ids: BTreeSet<String>,
+    /// Message ids fetched, each with the seq it came at, which is what lets
+    /// the ones at or below the ack be bounded; see
+    /// [`MAX_ACKED_SEEN_MESSAGE_IDS`]. Rows written before this carry an
+    /// unbounded `seen_message_ids` set instead, which loading ignores.
+    #[serde(default)]
+    pub seen_message_seqs: BTreeMap<String, u64>,
     /// Records that could not be applied yet, keyed by seq.
     ///
     /// One map, not a map plus a key set plus a flag: the other two were
@@ -62,7 +79,7 @@ impl SyncEngine {
                 last_acked_seq: 0,
                 updated_at: 0,
             },
-            seen_message_ids: BTreeSet::new(),
+            seen_message_seqs: BTreeMap::new(),
             quarantine: BTreeMap::new(),
             last_head_seq: 0,
             consecutive_failures: 0,
@@ -72,18 +89,24 @@ impl SyncEngine {
     /// Select records that have not reached a terminal local disposition.
     ///
     /// This function is intentionally side-effect free. Callers must not
-    /// advance `seen_message_ids` or the fetched checkpoint until validation
+    /// advance `seen_message_seqs` or the fetched checkpoint until validation
     /// and record processing have completed successfully.
     pub fn select_fresh(state: &DeviceSyncState, records: &[InboxRecord]) -> Vec<InboxRecord> {
         records
             .iter()
-            .filter(|record| !state.seen_message_ids.contains(&record.message_id))
+            .filter(|record| !Self::has_seen(state, record))
             .cloned()
             .collect()
     }
 
+    pub fn has_seen(state: &DeviceSyncState, record: &InboxRecord) -> bool {
+        state.seen_message_seqs.contains_key(&record.message_id)
+    }
+
     pub fn commit_fetched_record(state: &mut DeviceSyncState, record: &InboxRecord) {
-        state.seen_message_ids.insert(record.message_id.clone());
+        state
+            .seen_message_seqs
+            .insert(record.message_id.clone(), record.seq);
         state.checkpoint.last_fetched_seq = record.seq.max(state.checkpoint.last_fetched_seq);
         state.checkpoint.updated_at = state.checkpoint.last_fetched_seq;
     }
@@ -182,10 +205,30 @@ impl SyncEngine {
     pub fn ack_up_to(state: &mut DeviceSyncState, ack_seq: u64) -> Ack {
         state.checkpoint.last_acked_seq = ack_seq.max(state.checkpoint.last_acked_seq);
         state.checkpoint.updated_at = state.checkpoint.last_acked_seq;
+        Self::forget_acked_ids_past_bound(state);
         Ack {
             device_id: state.checkpoint.device_id.clone(),
             ack_seq: state.checkpoint.last_acked_seq,
             acked_at: state.checkpoint.updated_at,
+        }
+    }
+
+    /// Keep the newest [`MAX_ACKED_SEEN_MESSAGE_IDS`] ids at or below the ack
+    /// and every id above it.
+    fn forget_acked_ids_past_bound(state: &mut DeviceSyncState) {
+        let acked = state.checkpoint.last_acked_seq;
+        let mut acked_ids: Vec<(u64, String)> = state
+            .seen_message_seqs
+            .iter()
+            .filter(|(_, seq)| **seq <= acked)
+            .map(|(id, seq)| (*seq, id.clone()))
+            .collect();
+        let Some(excess) = acked_ids.len().checked_sub(MAX_ACKED_SEEN_MESSAGE_IDS) else {
+            return;
+        };
+        acked_ids.sort_unstable();
+        for (_, id) in acked_ids.into_iter().take(excess) {
+            state.seen_message_seqs.remove(&id);
         }
     }
 }
@@ -193,8 +236,8 @@ impl SyncEngine {
 #[cfg(test)]
 mod tests {
     use super::{
-        SyncEngine, SyncEngineModule, MAX_QUARANTINED_RECORDS,
-        MAX_QUARANTINED_RECORDS_PER_CONVERSATION,
+        DeviceSyncState, SyncEngine, SyncEngineModule, MAX_ACKED_SEEN_MESSAGE_IDS,
+        MAX_QUARANTINED_RECORDS, MAX_QUARANTINED_RECORDS_PER_CONVERSATION,
     };
     use crate::model::{Envelope, InboxRecord, InboxRecordState};
 
@@ -327,6 +370,54 @@ mod tests {
         SyncEngine::release_quarantined(&mut state, 4);
         assert_eq!(state.checkpoint.last_acked_seq, 4);
         assert_eq!(state.checkpoint.last_fetched_seq, 4);
+    }
+
+    #[test]
+    fn seen_ids_at_or_below_the_ack_are_bounded_and_the_rest_kept() {
+        let mut state = SyncEngine::new_device_state("device:bob:phone");
+        let acked = MAX_ACKED_SEEN_MESSAGE_IDS as u64 + 10;
+        for seq in 1..=acked + 5 {
+            SyncEngine::commit_fetched_record(
+                &mut state,
+                &sample_record(&format!("msg:{seq}"), seq),
+            );
+        }
+        SyncEngine::ack_up_to(&mut state, acked);
+
+        assert_eq!(
+            state.seen_message_seqs.len(),
+            MAX_ACKED_SEEN_MESSAGE_IDS + 5
+        );
+        // The oldest go first.
+        for seq in 1..=10 {
+            let record = sample_record(&format!("msg:{seq}"), seq);
+            assert!(!SyncEngine::has_seen(&state, &record), "seq {seq}");
+        }
+        // Above the ack, nothing goes: a record pushed ahead of a gap comes
+        // back with the fetch that fills it.
+        for seq in acked - 5..=acked + 5 {
+            let record = sample_record(&format!("msg:{seq}"), seq);
+            assert!(SyncEngine::has_seen(&state, &record), "seq {seq}");
+        }
+    }
+
+    #[test]
+    fn a_row_written_before_the_bound_still_loads() {
+        let mut state = SyncEngine::new_device_state("device:bob:phone");
+        state.checkpoint.last_fetched_seq = 7;
+        state.checkpoint.last_acked_seq = 7;
+        let mut row = serde_json::to_value(&state).expect("encode");
+        let fields = row.as_object_mut().expect("object");
+        fields.remove("seen_message_seqs");
+        fields.insert(
+            "seen_message_ids".into(),
+            serde_json::json!(["msg:1", "msg:2"]),
+        );
+
+        let loaded: DeviceSyncState = serde_json::from_value(row).expect("old row loads");
+
+        assert_eq!(loaded.checkpoint, state.checkpoint);
+        assert!(loaded.seen_message_seqs.is_empty());
     }
 
     fn sample_record(message_id: &str, seq: u64) -> InboxRecord {

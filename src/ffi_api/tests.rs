@@ -8700,7 +8700,8 @@ pub(crate) mod tests {
             .sync_states
             .get_mut(&bob_device_id)
             .expect("sync state");
-        sync.seen_message_ids.remove(&application_record.message_id);
+        sync.seen_message_seqs
+            .remove(&application_record.message_id);
         let replay_seq = sync.checkpoint.last_fetched_seq + 1;
         application_record.seq = replay_seq;
 
@@ -9252,7 +9253,8 @@ pub(crate) mod tests {
             .sync_states
             .get_mut(&bob_device_id)
             .expect("sync state");
-        sync.seen_message_ids.remove(&application_record.message_id);
+        sync.seen_message_seqs
+            .remove(&application_record.message_id);
         let last_acked = sync.checkpoint.last_acked_seq;
         let replay_seq = sync.checkpoint.last_fetched_seq + 1;
         application_record.seq = replay_seq;
@@ -14407,6 +14409,80 @@ pub(crate) mod tests {
                 .last_acked_seq,
             fresh_seq,
             "a pinned device unpins on its next fetch"
+        );
+    }
+
+    /// **A record pushed ahead of a gap is acked when the fetch fills it.**
+    /// The realtime push hands the device the newest record while older ones
+    /// are still unfetched, so its ack waits on the gap. The fetch that fills
+    /// the gap returns the pushed record too; it is seen, and must be acked
+    /// with the rest, or the ack stops one short of it for good.
+    #[test]
+    fn a_pushed_record_is_acked_when_the_fetch_fills_the_gap() {
+        let mut chat = paired_direct_chat();
+        let conversation_id = chat.conversation_id.clone();
+        let bob_device = chat.bob_device_id.clone();
+        let mut sent = Vec::new();
+        for text in ["first", "second"] {
+            chat.alice
+                .handle_command(CoreCommand::SendTextMessage {
+                    conversation_id: conversation_id.clone(),
+                    plaintext: text.into(),
+                })
+                .expect("alice sends");
+            sent.push(last_pending_application_envelope(&chat.alice, &bob_device));
+        }
+        let gap_seq = chat.bob.state.sync_states[&bob_device]
+            .checkpoint
+            .last_acked_seq
+            + 1;
+        let pushed_seq = gap_seq + 1;
+        let record = |envelope: &Envelope, seq: u64| InboxRecord {
+            seq,
+            recipient_device_id: bob_device.clone(),
+            message_id: envelope.mid.clone(),
+            received_at: seq,
+            expires_at: None,
+            state: InboxRecordState::Available,
+            envelope: envelope.clone(),
+        };
+
+        chat.bob
+            .handle_event(CoreEvent::RealtimeEventReceived {
+                device_id: bob_device.clone(),
+                event: crate::ffi_api::RealtimeEvent::InboxRecordAvailable {
+                    seq: pushed_seq,
+                    record: Some(record(&sent[1], pushed_seq)),
+                },
+            })
+            .expect("push");
+        assert_eq!(
+            chat.bob.state.sync_states[&bob_device]
+                .checkpoint
+                .last_acked_seq,
+            gap_seq - 1,
+            "premise: the pushed record waits on the gap"
+        );
+        chat.bob
+            .handle_event(CoreEvent::InboxRecordsFetched {
+                device_id: bob_device.clone(),
+                records: vec![record(&sent[0], gap_seq), record(&sent[1], pushed_seq)],
+                to_seq: pushed_seq,
+            })
+            .expect("fetch");
+
+        for text in ["first", "second"] {
+            assert!(conversation_has_plaintext(
+                &chat.bob,
+                &conversation_id,
+                text
+            ));
+        }
+        assert_eq!(
+            chat.bob.state.sync_states[&bob_device]
+                .checkpoint
+                .last_acked_seq,
+            pushed_seq
         );
     }
 
