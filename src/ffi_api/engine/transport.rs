@@ -3151,6 +3151,29 @@ impl CoreEngine {
         let mut touched_recovery_context_ids = BTreeSet::new();
         let touched_sync_device_ids = BTreeSet::from([device_id.clone()]);
         let mut touched_pending_ack_device_ids = BTreeSet::new();
+        // A record whose message id this device has already seen is a second
+        // copy of a message it has disposed of: the host forgets an id when
+        // its record expires, so a sender's late retry is appended again at a
+        // new seq. The copy is dropped unread but acked like any other record
+        // (see `RecordRetention`). Left unacked it pins `last_acked_seq` below
+        // itself, `next_fetch` downloads everything after it on every sync,
+        // and the history floor never moves it, since the floor only covers
+        // what was never fetched.
+        let seen_copies: Vec<InboxRecord> = match source {
+            InboxRecordSource::Fetch => self
+                .state
+                .sync_states
+                .get(&device_id)
+                .map(|sync_state| {
+                    records
+                        .iter()
+                        .filter(|record| sync_state.seen_message_ids.contains(&record.message_id))
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default(),
+            InboxRecordSource::PendingReplay => Vec::new(),
+        };
         let mut fresh_records = match source {
             InboxRecordSource::Fetch => self
                 .state
@@ -3183,6 +3206,10 @@ impl CoreEngine {
             .map(|state| state.checkpoint.last_acked_seq)
             .unwrap_or(0);
         let mut deferred_ackable_seqs = BTreeSet::new();
+        for record in seen_copies {
+            advance_contiguous_ack(&mut contiguous_ack, &mut deferred_ackable_seqs, record.seq);
+            processed_records.push(record);
+        }
         for record in fresh_records {
             // Per-record admission. Anything wrong with this one envelope is
             // this one envelope's problem: ack it, drop it, leave no trace,

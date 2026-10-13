@@ -14325,6 +14325,91 @@ pub(crate) mod tests {
         assert!(!chat.bob.state.conversations.contains_key(&conversation_id));
     }
 
+    /// **A second copy of a message already disposed of is acked, not left
+    /// pinning the ack.** The host forgets a message id when its record
+    /// expires, so a sender whose append went through but whose response was
+    /// lost, and who retries after that, gets the same message appended again
+    /// at a new seq. The recipient has seen the id and drops the copy, which
+    /// is right; it must still ack it, or `next_fetch` restarts from that seq
+    /// on every sync and downloads everything after it again — for good, since
+    /// the history floor only ever moves the ack past what was never fetched.
+    #[test]
+    fn a_second_copy_of_a_seen_message_is_acked() {
+        let mut chat = paired_direct_chat();
+        let conversation_id = chat.conversation_id.clone();
+        let bob_device = chat.bob_device_id.clone();
+        let seen = last_pending_envelope(&chat.alice, &bob_device, MessageType::MlsWelcome);
+        let next_seq = |engine: &CoreEngine| {
+            engine.state.sync_states[&bob_device]
+                .checkpoint
+                .last_fetched_seq
+                + 1
+        };
+
+        let copy_seq = next_seq(&chat.bob);
+        deliver_inbox_envelope(&mut chat.bob, &bob_device, seen.clone(), copy_seq);
+        chat.alice
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "after the copy".into(),
+            })
+            .expect("alice sends");
+        let fresh = last_pending_application_envelope(&chat.alice, &bob_device);
+        let fresh_seq = copy_seq + 1;
+        deliver_inbox_envelope(&mut chat.bob, &bob_device, fresh.clone(), fresh_seq);
+
+        assert!(conversation_has_plaintext(
+            &chat.bob,
+            &conversation_id,
+            "after the copy"
+        ));
+        let mut sync_state = chat.bob.state.sync_states[&bob_device].clone();
+        assert_eq!(
+            sync_state.checkpoint.last_acked_seq, fresh_seq,
+            "the copy pins the ack below itself"
+        );
+        crate::sync_engine::SyncEngine::register_head(&mut sync_state, fresh_seq);
+        assert_eq!(
+            crate::sync_engine::SyncEngine::next_fetch(&sync_state),
+            None,
+            "nothing is left to fetch"
+        );
+
+        // A device pinned before this was fixed refetches from the copy, and
+        // everything it gets back it has seen: the batch acks all of it.
+        let pinned_at = copy_seq - 1;
+        chat.bob
+            .state
+            .sync_states
+            .get_mut(&bob_device)
+            .expect("sync state")
+            .checkpoint
+            .last_acked_seq = pinned_at;
+        let record = |envelope: Envelope, seq: u64| InboxRecord {
+            seq,
+            recipient_device_id: bob_device.clone(),
+            message_id: envelope.mid.clone(),
+            received_at: seq,
+            expires_at: None,
+            state: InboxRecordState::Available,
+            envelope,
+        };
+        chat.bob
+            .handle_event(CoreEvent::InboxRecordsFetched {
+                device_id: bob_device.clone(),
+                records: vec![record(seen, copy_seq), record(fresh, fresh_seq)],
+                to_seq: fresh_seq,
+            })
+            .expect("refetch");
+        assert_eq!(
+            chat.bob.state.sync_states[&bob_device]
+                .checkpoint
+                .last_acked_seq,
+            fresh_seq,
+            "a pinned device unpins on its next fetch"
+        );
+    }
+
     fn answer_key_package_claims(
         engine: &mut CoreEngine,
         mut output: CoreOutput,
