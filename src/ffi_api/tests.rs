@@ -13973,6 +13973,358 @@ pub(crate) mod tests {
         assert_eq!(registered_lanes(&output), vec![welcome_lane]);
     }
 
+    // ---- A Welcome joins once (ePrint 2026/727 §3.2.2) ---------------------
+    //
+    // Signal's replay: the same initial message twice gives the responder two
+    // sessions from one initial secret, and compromising the second exposes
+    // the first one's opening chain. Here the host re-appends a Welcome this
+    // device already joined. Two layers refuse it: the admission gate
+    // (`resolve_welcome_frame`) for a conversation this device holds, and, for
+    // the states the gate lets a plain Welcome through, the KeyPackage the
+    // Welcome targets, which openmls deleted at the first join.
+
+    /// Alice opens a session with Bob. Bob's host hands out a one-time pool
+    /// entry, or, with `pool` false, nothing, and Alice falls back to the
+    /// advertised package she cached. Returns the chat, the Welcome, and the
+    /// package it was built to.
+    fn welcome_to(pool: bool) -> (PairedDirectChat, Envelope, String) {
+        let mut alice = local_engine(ALICE_MNEMONIC, "phone");
+        let alice_bundle = alice.local_bundle().expect("alice bundle").clone();
+        let mut bob = local_engine(BOB_MNEMONIC, "phone");
+        let bob_bundle = bob.local_bundle().expect("bob bundle").clone();
+        alice
+            .handle_command(CoreCommand::ImportIdentityBundle {
+                bundle: bob_bundle.clone(),
+            })
+            .expect("alice imports bob");
+        bob.handle_command(CoreCommand::ImportIdentityBundle {
+            bundle: alice_bundle,
+        })
+        .expect("bob imports alice");
+        let target = if pool {
+            bob.state
+                .mls_adapter
+                .as_ref()
+                .expect("bob adapter")
+                .generate_one_time_key_packages(1, test_now_ms())
+                .expect("pool entry")
+                .remove(0)
+                .key_package_b64
+        } else {
+            bob.state
+                .published_key_package
+                .as_ref()
+                .expect("advertised package")
+                .key_package_b64
+                .clone()
+        };
+        let output = alice
+            .handle_command(CoreCommand::CreateConversation {
+                peer_user_id: bob_bundle.user_id.clone(),
+                conversation_kind: ConversationKind::Direct,
+            })
+            .expect("create conversation");
+        let request_id = first_http_request_id_containing(&output, "/keypackage-pool/");
+        let (status, body) = if pool {
+            let body = serde_json::json!({
+                "keyPackage": {
+                    "keyPackageId": "pool-entry-1",
+                    "keyPackage": target,
+                    "lifecycleVersion": 1,
+                    "notBefore": 0,
+                    "createdAt": 0,
+                    "expiresAt": 0,
+                }
+            });
+            (200, body.to_string())
+        } else {
+            (404, r#"{"code":"pool_empty"}"#.to_string())
+        };
+        alice
+            .handle_event(CoreEvent::HttpResponseReceived {
+                request_id,
+                status,
+                body: Some(body),
+            })
+            .expect("claim response completes conversation creation");
+        let conversation_id = alice
+            .state
+            .conversations
+            .keys()
+            .next()
+            .expect("session")
+            .clone();
+        let alice_device_id = alice.local_device_id().expect("alice device").to_string();
+        let bob_device_id = bob.local_device_id().expect("bob device").to_string();
+        let welcome = last_pending_envelope(&alice, &bob_device_id, MessageType::MlsWelcome);
+        assert!(
+            bob.state
+                .mls_adapter
+                .as_ref()
+                .expect("bob adapter")
+                .welcome_targets_key_package(welcome.payload_b64().unwrap_or_default(), &target)
+                .expect("welcome decodes"),
+            "premise: the Welcome is built to the package under test"
+        );
+        (
+            PairedDirectChat {
+                alice,
+                bob,
+                conversation_id,
+                alice_device_id,
+                bob_device_id,
+            },
+            welcome,
+            target,
+        )
+    }
+
+    /// Everything a Welcome moves on the device it is for.
+    fn welcome_trace(
+        engine: &CoreEngine,
+        conversation_id: &str,
+    ) -> impl PartialEq + std::fmt::Debug {
+        (
+            engine
+                .state
+                .mls_adapter
+                .as_ref()
+                .expect("adapter")
+                .state_fingerprint()
+                .expect("fingerprint"),
+            engine.state.conversations.get(conversation_id).cloned(),
+            engine.state.mls_summaries.get(conversation_id).cloned(),
+            engine.state.recovery_contexts.get(conversation_id).cloned(),
+            engine.state.published_key_package.clone(),
+            engine.state.pending_identity_publication.clone(),
+        )
+    }
+
+    /// The host appends `welcome`'s bytes again, twice: on the token it first
+    /// came with, and relabelled onto a token this device has never seen,
+    /// which reaches the gate as a first contact. Under the id it first came
+    /// with, `select_fresh` drops a record as seen, so each replay carries a
+    /// fresh id — the host chooses ids and tokens, nothing authenticates
+    /// either. Asserts both are acked and register no token; callers compare
+    /// traces.
+    fn replay_welcome(engine: &mut CoreEngine, device_id: &str, welcome: &Envelope) {
+        for lane in [welcome.lane.clone(), crate::model::random_opaque_id()] {
+            let seq = engine
+                .state
+                .sync_states
+                .get(device_id)
+                .map_or(0, |state| state.checkpoint.last_fetched_seq)
+                + 1;
+            let replay = Envelope::with_bytes(
+                welcome.recipient_device_id.clone(),
+                lane,
+                crate::model::random_opaque_id(),
+                welcome.payload_b64().expect("inline Welcome"),
+            );
+            let output = deliver_inbox_envelope(engine, device_id, replay, seq);
+            assert!(
+                !output
+                    .effects
+                    .iter()
+                    .any(|effect| matches!(effect, CoreEffect::RegisterAcceptedLane { .. })),
+                "a replayed Welcome registers no token"
+            );
+            assert_eq!(
+                engine.state.sync_states[device_id]
+                    .checkpoint
+                    .last_acked_seq,
+                seq,
+                "and is acked, so the host cannot hold it back for later"
+            );
+        }
+    }
+
+    fn holds_key_package_now(engine: &CoreEngine, key_package_b64: &str) -> bool {
+        engine
+            .state
+            .mls_adapter
+            .as_ref()
+            .expect("adapter")
+            .holds_key_package(key_package_b64)
+            .expect("key package lookup")
+    }
+
+    /// Cases (a) and (c): the session is live, and its Welcome came through
+    /// the first-contact queue and registered the token it came with.
+    #[test]
+    fn a_replayed_first_contact_welcome_leaves_no_trace() {
+        for pool in [false, true] {
+            let (mut chat, welcome, target) = welcome_to(pool);
+            let conversation_id = chat.conversation_id.clone();
+            let bob_device = chat.bob_device_id.clone();
+            let output = deliver_pending_outbox_to_device(&mut chat.bob, &chat.alice, &bob_device);
+            assert!(
+                output
+                    .effects
+                    .iter()
+                    .any(|effect| matches!(effect, CoreEffect::RegisterAcceptedLane { .. })),
+                "premise: the Welcome was a first contact"
+            );
+            assert!(
+                !holds_key_package_now(&chat.bob, &target),
+                "the package's private keys went with the join (pool: {pool})"
+            );
+            chat.bob
+                .handle_command(CoreCommand::SendTextMessage {
+                    conversation_id: conversation_id.clone(),
+                    plaintext: "after the join".into(),
+                })
+                .expect("bob sends");
+            let before = welcome_trace(&chat.bob, &conversation_id);
+
+            replay_welcome(&mut chat.bob, &bob_device, &welcome);
+
+            assert_eq!(
+                welcome_trace(&chat.bob, &conversation_id),
+                before,
+                "pool: {pool}"
+            );
+        }
+    }
+
+    /// Case (a) in the one state where the gate admits a plain Welcome for a
+    /// conversation this device holds: its group lost to a local fault, waiting
+    /// for the peer's rebuild. The replay is from the peer's trusted device,
+    /// for this conversation, so only the spent KeyPackage refuses it — after
+    /// a restart too, which restores the provider store from disk. Case (d):
+    /// the advertised package and a pool entry alike.
+    #[test]
+    fn a_replayed_welcome_while_awaiting_the_peers_rebuild_leaves_no_trace() {
+        for pool in [false, true] {
+            let (mut chat, welcome, target) = welcome_to(pool);
+            let conversation_id = chat.conversation_id.clone();
+            let bob_device = chat.bob_device_id.clone();
+            deliver_pending_outbox_to_device(&mut chat.bob, &chat.alice, &bob_device);
+
+            chat.bob
+                .handle_command(CoreCommand::RebuildConversation {
+                    conversation_id: conversation_id.clone(),
+                })
+                .expect("tear down");
+            {
+                let rebuild = &mut chat
+                    .bob
+                    .state
+                    .conversations
+                    .get_mut(&conversation_id)
+                    .expect("conversation")
+                    .rebuild;
+                rebuild.reset_requested = false;
+                rebuild.awaits_peer_welcome = true;
+            }
+            let on_disk =
+                serde_json::to_string(&chat.bob.refresh_snapshot()).expect("snapshot encodes");
+            chat.bob = CoreEngine::try_from_restored_state(
+                serde_json::from_str(&on_disk).expect("snapshot decodes"),
+            )
+            .expect("bob restarts");
+            assert!(
+                chat.bob.state.conversations[&conversation_id]
+                    .rebuild
+                    .awaits_peer_welcome,
+                "premise: the gate admits the peer's plain Welcome"
+            );
+            assert!(
+                !holds_key_package_now(&chat.bob, &target),
+                "a restart does not bring the spent package back (pool: {pool})"
+            );
+            let before = welcome_trace(&chat.bob, &conversation_id);
+
+            replay_welcome(&mut chat.bob, &bob_device, &welcome);
+
+            assert_eq!(
+                welcome_trace(&chat.bob, &conversation_id),
+                before,
+                "pool: {pool}"
+            );
+
+            // The window is still open for the rebuild it is there for.
+            chat.alice
+                .handle_command(CoreCommand::RebuildConversation {
+                    conversation_id: conversation_id.clone(),
+                })
+                .expect("alice resets");
+            let output = chat
+                .alice
+                .handle_command(CoreCommand::ReconcileConversationMembership {
+                    conversation_id: conversation_id.clone(),
+                })
+                .expect("alice rebuilds");
+            let current = chat
+                .bob
+                .state
+                .published_key_package
+                .as_ref()
+                .expect("bob key package")
+                .key_package_b64
+                .clone();
+            answer_key_package_claims(&mut chat.alice, output, &current);
+            let rebuild = last_pending_envelope(&chat.alice, &bob_device, MessageType::MlsWelcome);
+            assert_ne!(rebuild.payload_b64(), welcome.payload_b64());
+            let seq = chat.bob.state.sync_states[&bob_device]
+                .checkpoint
+                .last_fetched_seq
+                + 1;
+            deliver_inbox_envelope(&mut chat.bob, &bob_device, rebuild, seq);
+            assert!(
+                !chat.bob.state.conversations[&conversation_id]
+                    .rebuild
+                    .awaits_peer_welcome,
+                "the peer's real rebuild is still accepted (pool: {pool})"
+            );
+        }
+    }
+
+    /// Case (b): the contact removed, then added back, then — a state no path
+    /// reaches, since direct conversations are archived rather than dropped —
+    /// the conversation forgotten altogether, where the gate would call the
+    /// replay a first contact.
+    #[test]
+    fn a_replayed_welcome_after_the_contact_is_removed_leaves_no_trace() {
+        let (mut chat, welcome, _) = welcome_to(false);
+        let conversation_id = chat.conversation_id.clone();
+        let bob_device = chat.bob_device_id.clone();
+        deliver_pending_outbox_to_device(&mut chat.bob, &chat.alice, &bob_device);
+        let alice_bundle = chat.alice.local_bundle().expect("alice bundle").clone();
+
+        chat.bob
+            .handle_command(CoreCommand::DeleteContact {
+                user_id: alice_bundle.user_id.clone(),
+            })
+            .expect("bob removes alice");
+        let before = welcome_trace(&chat.bob, &conversation_id);
+        replay_welcome(&mut chat.bob, &bob_device, &welcome);
+        assert_eq!(welcome_trace(&chat.bob, &conversation_id), before);
+
+        chat.bob
+            .handle_command(CoreCommand::ImportIdentityBundle {
+                bundle: alice_bundle,
+            })
+            .expect("bob adds alice back");
+        let before = welcome_trace(&chat.bob, &conversation_id);
+        replay_welcome(&mut chat.bob, &bob_device, &welcome);
+        assert_eq!(welcome_trace(&chat.bob, &conversation_id), before);
+
+        chat.bob.state.conversations.remove(&conversation_id);
+        chat.bob.state.mls_summaries.remove(&conversation_id);
+        chat.bob.state.recovery_contexts.remove(&conversation_id);
+        chat.bob
+            .state
+            .mls_adapter
+            .as_mut()
+            .expect("adapter")
+            .clear_conversation(&conversation_id);
+        let before = welcome_trace(&chat.bob, &conversation_id);
+        replay_welcome(&mut chat.bob, &bob_device, &welcome);
+        assert_eq!(welcome_trace(&chat.bob, &conversation_id), before);
+        assert!(!chat.bob.state.conversations.contains_key(&conversation_id));
+    }
+
     fn answer_key_package_claims(
         engine: &mut CoreEngine,
         mut output: CoreOutput,

@@ -2396,8 +2396,10 @@ impl MlsAdapter {
     ///   material ... even if the caller does not turn the StagedWelcome into
     ///   an MlsGroup"). Since published KeyPackage hash refs are public,
     ///   anyone could otherwise drain our one-time KeyPackage pool by minting
-    ///   Welcomes with garbage secrets. Last-resort KeyPackages are exempt
-    ///   from the delete, so the pool is the exposed surface.
+    ///   Welcomes with garbage secrets. openmls exempts only packages with the
+    ///   `last_resort` extension, and ours carry none — the advertised one
+    ///   included — so the delete on a *successful* join is also what makes a
+    ///   replayed Welcome find no package and join nothing a second time.
     ///
     /// On any rejection the fork is dropped and the live adapter is unchanged,
     /// bit for bit — which is what `state_fingerprint()` asserts in the tests.
@@ -3998,6 +4000,110 @@ mod tests {
         );
         assert!(bob.has_conversation("conv:alice:bob"));
         let _ = first_epoch;
+    }
+
+    // ---- A Welcome joins once ---------------------------------------------
+    //
+    // The analogue of the Signal replay in ePrint 2026/727 §3.2.2: the same
+    // initial message twice, two sessions from one initial secret. Rebuild
+    // semantics mean this adapter replaces a live group with whatever Welcome
+    // it is handed, so what stops a replay here is that the KeyPackage it
+    // targets is gone: openmls deletes the package a Welcome joins from unless
+    // the package carries the `last_resort` extension, and none of ours do —
+    // not the advertised one, not the pool's. The engine's admission gate
+    // (`resolve_welcome_frame`) is the other layer; these tests hold without it.
+
+    #[test]
+    fn replayed_welcome_on_a_live_group_leaves_no_trace() {
+        let (mut bob, welcome, alice_identity, _) = welcome_for_bob();
+        bob.ingest_welcome("conv:alice:bob", &author(&alice_identity), &welcome)
+            .expect("first join");
+        // Move the sender ratchet, so a rejoin would show as a rollback.
+        bob.encrypt_application("conv:alice:bob", b"after the join")
+            .expect("bob sends");
+        let before = bob.state_fingerprint().expect("fingerprint");
+
+        let verdict = bob
+            .ingest_welcome("conv:alice:bob", &author(&alice_identity), &welcome)
+            .expect("a replayed welcome is discarded, not an error");
+
+        assert!(matches!(verdict, IngestResult::Rejected(_)), "{verdict:?}");
+        assert_eq!(bob.state_fingerprint().expect("fingerprint"), before);
+    }
+
+    #[test]
+    fn replayed_welcome_after_the_group_is_gone_leaves_no_trace() {
+        // No live group to replace: the conversation was torn down, so nothing
+        // but the KeyPackage stands between the replay and a second group.
+        let (mut bob, welcome, alice_identity, _) = welcome_for_bob();
+        bob.ingest_welcome("conv:alice:bob", &author(&alice_identity), &welcome)
+            .expect("first join");
+        bob.clear_conversation("conv:alice:bob");
+        let before = bob.state_fingerprint().expect("fingerprint");
+
+        let verdict = bob
+            .ingest_welcome("conv:alice:bob", &author(&alice_identity), &welcome)
+            .expect("a replayed welcome is discarded, not an error");
+
+        assert!(matches!(verdict, IngestResult::Rejected(_)), "{verdict:?}");
+        assert_eq!(bob.state_fingerprint().expect("fingerprint"), before);
+        assert!(!bob.has_conversation("conv:alice:bob"));
+    }
+
+    #[test]
+    fn a_joined_key_package_keeps_no_private_key() {
+        // Both kinds: the advertised package a contact falls back to when the
+        // pool is empty, and a one-time pool entry. Were the advertised one
+        // built with `last_resort`, openmls would keep it, and a replay of
+        // its Welcome would rejoin until the package expired.
+        let alice_identity = identity(ALICE_MNEMONIC);
+        let bob_identity = identity(BOB_MNEMONIC);
+        let (mut alice, _) = MlsAdapter::bootstrap(&alice_identity).expect("alice");
+        let (mut bob, advertised) = MlsAdapter::bootstrap(&bob_identity).expect("bob");
+        let advertised = advertised.key_package_b64;
+        let welcome = alice
+            .create_conversation("conv:alice:bob", &[peer(&bob_identity, advertised.clone())])
+            .expect("conversation to the advertised package")
+            .welcomes[0]
+            .payload_b64
+            .clone();
+        assert!(bob.holds_key_package(&advertised).expect("lookup"));
+        bob.ingest_welcome("conv:alice:bob", &author(&alice_identity), &welcome)
+            .expect("join from the advertised package");
+        assert!(
+            !bob.holds_key_package(&advertised).expect("lookup"),
+            "the advertised package's private keys went with the join"
+        );
+
+        let pooled = bob
+            .generate_one_time_key_packages(1, test_now_ms())
+            .expect("pool entry")
+            .remove(0)
+            .key_package_b64;
+        let pool_welcome = alice
+            .create_conversation("conv:alice:bob:2", &[peer(&bob_identity, pooled.clone())])
+            .expect("conversation to the pool entry")
+            .welcomes[0]
+            .payload_b64
+            .clone();
+        bob.ingest_welcome("conv:alice:bob:2", &author(&alice_identity), &pool_welcome)
+            .expect("join from the pool entry");
+        assert!(
+            !bob.holds_key_package(&pooled).expect("lookup"),
+            "the pool entry's private keys went with the join"
+        );
+
+        let before = bob.state_fingerprint().expect("fingerprint");
+        for (conversation_id, replay) in [
+            ("conv:alice:bob", &welcome),
+            ("conv:alice:bob:2", &pool_welcome),
+        ] {
+            let verdict = bob
+                .ingest_welcome(conversation_id, &author(&alice_identity), replay)
+                .expect("a replayed welcome is discarded, not an error");
+            assert!(matches!(verdict, IngestResult::Rejected(_)), "{verdict:?}");
+        }
+        assert_eq!(bob.state_fingerprint().expect("fingerprint"), before);
     }
 
     #[test]
