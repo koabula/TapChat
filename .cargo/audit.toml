@@ -7,10 +7,20 @@
 # feature (tauri-plugin-log -> byte-unit -> rust_decimal). It is absent from the
 # production feature graph. Remove this entry when rust_decimal no longer locks
 # the vulnerable optional version.
+# zip 4 is pulled in by tauri-plugin-updater (2.14.0 still requires zip ^4),
+# and only on Windows. Its three advisories concern what extraction does with
+# a malicious archive: Unix permission bits (SUID/SGID, modes through
+# symlinks), which Windows does not have, and symlink targets outside the
+# destination. The updater extracts only a bundle whose signature download()
+# has already verified, and the desktop installs only via downloadAndInstall.
+# Remove these entries when the updater accepts zip >= 9.
 ignore = [
   "RUSTSEC-2026-0194",
   "RUSTSEC-2026-0195",
   "RUSTSEC-2026-0235",
+  "RUSTSEC-2026-0367",
+  "RUSTSEC-2026-0368",
+  "RUSTSEC-2026-0369",
 ]
 informational_warnings = ["unmaintained", "unsound"]
 
