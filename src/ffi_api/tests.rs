@@ -3846,6 +3846,85 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_retried_append_is_not_overtaken_on_its_lane() {
+        let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
+        let mut alice = seeded_engine(ALICE_MNEMONIC, "phone", bob_bundle.clone());
+        let conversation_id = create_direct_conversation(&mut alice, bob_bundle.user_id.clone());
+        peer_has_joined(&mut alice, &conversation_id);
+        let appended = |engine: &CoreEngine, output: &crate::ffi_api::CoreOutput| -> Vec<String> {
+            output
+                .effects
+                .iter()
+                .filter_map(|effect| match effect {
+                    CoreEffect::ExecuteHttpRequest { request } => {
+                        match engine.state.pending_requests.get(&request.request_id) {
+                            Some(crate::ffi_api::types::PendingRequest::AppendEnvelope {
+                                message_id,
+                                ..
+                            }) => Some(message_id.clone()),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        let send = |engine: &mut CoreEngine, plaintext: &str| {
+            let output = engine
+                .handle_command(CoreCommand::SendTextMessage {
+                    conversation_id: conversation_id.clone(),
+                    plaintext: plaintext.into(),
+                })
+                .expect("send");
+            let mid = engine
+                .state
+                .pending_outbox
+                .last()
+                .expect("queued")
+                .envelope
+                .mid
+                .clone();
+            (output, mid)
+        };
+
+        let (output, first) = send(&mut alice, "one");
+        let first_request = find_http_request_id(&output, "/messages");
+        assert_eq!(appended(&alice, &output), vec![first.clone()]);
+        let (output, second) = send(&mut alice, "two");
+        assert!(
+            appended(&alice, &output).is_empty(),
+            "a second append must wait while the first is in flight"
+        );
+
+        let output = alice
+            .handle_event(CoreEvent::HttpRequestFailed {
+                request_id: first_request,
+                failure: test_failure("rate_limited", true, Some(429)),
+            })
+            .expect("transient append failure");
+        assert!(appended(&alice, &output).is_empty());
+        let output = alice
+            .handle_event(CoreEvent::TimerTriggered {
+                timer_id: format!("retry_append:{first}"),
+            })
+            .expect("retry timer");
+        assert_eq!(
+            appended(&alice, &output),
+            vec![first.clone()],
+            "the retry goes first, and alone"
+        );
+
+        let output = alice
+            .handle_event(CoreEvent::HttpResponseReceived {
+                request_id: find_http_request_id(&output, "/messages"),
+                status: 200,
+                body: Some(r#"{"accepted":true,"seq":1,"delivered_to":"inbox"}"#.into()),
+            })
+            .expect("append response");
+        assert_eq!(appended(&alice, &output), vec![second]);
+    }
+
+    #[test]
     fn create_conversation_enqueues_only_welcome_for_joiner() {
         let bob_bundle = sample_identity_bundle(BOB_MNEMONIC, "phone");
         let mut alice = local_engine(ALICE_MNEMONIC, "phone");
@@ -14543,6 +14622,9 @@ pub(crate) mod tests {
         stray.retries = 0;
         stray.durable = false;
         let stray_mid = stray.envelope.mid.clone();
+        // What was queued before has reached Bob, so those appends settled;
+        // left queued, they would hold the stray behind them on its lane.
+        chat.alice.state.pending_outbox.clear();
         chat.alice.state.pending_outbox.push(stray);
 
         let output = chat
@@ -17863,6 +17945,11 @@ pub(crate) mod tests {
         prime_direct_pcs_debt(&mut chat, DIRECT_PCS_COMMIT_INTERVAL - 1);
         let conversation_id = chat.conversation_id.clone();
         let alice_rotates = alice_is_designated(&chat);
+        // Everything sent so far has been delivered, so those appends settled.
+        rotator_engine_mut(&mut chat, alice_rotates)
+            .state
+            .pending_outbox
+            .clear();
         let output = complete_direct_attachment_send(
             rotator_engine_mut(&mut chat, alice_rotates),
             &conversation_id,
@@ -18249,14 +18336,24 @@ pub(crate) mod tests {
 
     /// The peer joined and has been heard from, as `paired_direct_chat` has
     /// it happen. For tests about sending in an established session that have
-    /// no engine for the peer.
+    /// no engine for the peer. A peer joins only from a Welcome that reached
+    /// its inbox, so that append has settled and left the outbox.
     fn peer_has_joined(engine: &mut CoreEngine, conversation_id: &str) {
-        engine
+        let session = engine
             .state
             .conversations
             .get_mut(conversation_id)
-            .expect("session")
-            .awaiting_peer = false;
+            .expect("session");
+        session.awaiting_peer = false;
+        let lanes: Vec<String> = session
+            .lanes
+            .iter()
+            .flat_map(|lanes| [lanes.inbound_lane.clone(), lanes.outbound_lane.clone()])
+            .collect();
+        engine.state.pending_outbox.retain(|item| {
+            !(lanes.contains(&item.envelope.lane)
+                && MlsAdapter::payload_is_welcome(item.envelope.payload_b64().unwrap_or_default()))
+        });
     }
 
     pub(crate) fn unjoined_direct_chat() -> PairedDirectChat {

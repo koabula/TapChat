@@ -939,9 +939,19 @@ impl CoreEngine {
         Ok(output)
     }
 
+    /// Appends reach a peer's inbox in the order they were queued, one lane at
+    /// a time: only the oldest queued item of each lane is ever sent. The
+    /// inbox stores records in arrival order and the peer can open a frame
+    /// only after the commit before it, so an append that overtook an earlier
+    /// one still waiting for a retry would land ahead of the key it needs.
+    /// The peer could only quarantine it, and a bounded quarantine loses it.
     pub(super) fn flush_outbox(&mut self) -> CoreResult<CoreOutput> {
         let mut effects = Vec::new();
+        let mut lanes_ahead = BTreeSet::new();
         for index in 0..self.state.pending_outbox.len() {
+            if !lanes_ahead.insert(self.state.pending_outbox[index].envelope.lane.clone()) {
+                continue;
+            }
             if self.state.pending_outbox[index].in_flight
                 || self.state.pending_outbox[index].retries >= MAX_TRANSPORT_RETRIES
             {
@@ -1719,12 +1729,27 @@ impl CoreEngine {
                 // one. The previous fallback fabricated a "not accepted"
                 // response instead, which read as a disposition the inbox
                 // never reports.
-                let result: AppendEnvelopeResult = serde_json::from_str(
-                    body.as_deref().unwrap_or_default(),
-                )
-                .map_err(|error| {
-                    CoreError::invalid_input(format!("failed to decode append response: {error}"))
-                })?;
+                let result: AppendEnvelopeResult =
+                    match serde_json::from_str(body.as_deref().unwrap_or_default()) {
+                        Ok(result) => result,
+                        Err(error) => {
+                            // The request is spent, so the envelope goes back
+                            // in the queue: left in flight with nothing behind
+                            // it, it would hold its lane for good. The inbox
+                            // dedupes the resend on its mid.
+                            if let Some(item) = self
+                                .state
+                                .pending_outbox
+                                .iter_mut()
+                                .find(|item| item.envelope.mid == message_id)
+                            {
+                                item.in_flight = false;
+                            }
+                            return Err(CoreError::invalid_input(format!(
+                                "failed to decode append response: {error}"
+                            )));
+                        }
+                    };
                 let append_delivery = self.handle_append_delivery_result(&message_id, &result);
                 self.state
                     .pending_outbox
