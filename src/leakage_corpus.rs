@@ -1521,8 +1521,13 @@ fn only_a_payloads_size_reaches_the_host() {
 
     // The partition view of the same fact. The matrix varies a body's length
     // as well as its content, and before the padding the length of the payload
-    // at `a_to_b` measured as carrying Alice's message. Now the length of
-    // every one-block payload is constant across the matrix.
+    // carrying Alice's message measured as carrying it. Now the length of every
+    // one-block payload is constant across the matrix.
+    //
+    // `a_to_b` appends nothing: Alice holds that message until Bob's
+    // `ContactAccepted` reaches her, and sends it on inside `a_fetch`. So the
+    // varied body is measured at `a_rotate`, which sends it again with nothing
+    // held.
     let (inputs, _) = matrix();
     let body_lengths: BTreeSet<usize> = inputs.iter().map(|run| run.body_a_to_b.len()).collect();
     assert!(
@@ -1530,7 +1535,7 @@ fn only_a_payloads_size_reaches_the_host() {
         "the matrix no longer varies a body's length, so a length leak could not show"
     );
     assert!(
-        wrapped_at.contains(&("a_to_b", Surface::Ledger("append_request"))),
+        wrapped_at.contains(&("a_rotate", Surface::Ledger("append_request"))),
         "the message whose body varies was not measured"
     );
     for (step, surface, path) in corpus.observed_leaves() {
