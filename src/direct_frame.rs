@@ -7,6 +7,11 @@
 //! 0x01 || signature(64) || MLS bytes   a commit, or a race loser's rebuild Welcome
 //! ```
 //!
+//! The MLS bytes run to the end of the frame, with no length prefix. The wrap
+//! pads the frame to a whole number of blocks and strips that padding before
+//! the frame reaches [`decode`] (see [`crate::lane_wrap`]), so no padding byte
+//! is ever read as part of the MLS message.
+//!
 //! This replaces a JSON object carrying the same two things. That object held
 //! the MLS message as base64, so every frame paid a third of its own size to
 //! make room for a field only a commit ever uses; the message now goes in as

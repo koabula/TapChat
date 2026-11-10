@@ -250,8 +250,8 @@ fn derive(
     if !is_string || depth == 0 || text.is_empty() {
         return;
     }
-    // Length is what makes |m| and the size-distinctive rotation measurable
-    // rather than conceded.
+    // Length is what makes |m|, and whether a rotation can be told from a
+    // message by its size, measurable rather than conceded.
     out.insert(format!("{path}#len"), text.len().to_string());
 
     // A percent-encoded `:` hides a device id's segments as surely as base64
@@ -1434,8 +1434,16 @@ fn host_view_is_a_function_of_l() {
 
 /// The ideal leaks `|m|` and nothing else about `m`. So a payload's content
 /// may reach the host as a length and in no other shape.
+///
+/// The wrap narrows the length itself: every wrapped payload is a whole number
+/// of [`crate::lane_wrap::WRAP_BLOCK`]s, so a payload that fits one block has
+/// the length of every other one-block payload. What a host learns of `|m|` is
+/// a block count, and of a short message, a rotation or `ContactAccepted`,
+/// nothing that tells them apart.
 #[test]
 fn only_a_payloads_size_reaches_the_host() {
+    use crate::lane_wrap::WRAP_BLOCK;
+
     let corpus = corpus();
     let mut escapes = Vec::new();
     for (step, surface, path) in corpus.observed_leaves() {
@@ -1456,17 +1464,109 @@ fn only_a_payloads_size_reaches_the_host() {
         "a message reached the host as something other than its length:\n{}",
         escapes.join("\n")
     );
-    // And the size channel must actually be observed, or the assertion above
-    // is about an empty set.
+
+    // The decoded length of a wrapped payload. The first-contact Welcome is
+    // the one frame that travels unwrapped, and it is told apart the way a
+    // host would tell it: it parses as an MLS message.
+    let wrapped_len = |record: &Record| -> Option<usize> {
+        let bytes = record.view.pointer("/envelope/bytes")?.as_str()?;
+        if record.leaves.contains_key("envelope.bytes#mls.wire_format") {
+            return None;
+        }
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(bytes)
+            .expect("an envelope payload is base64");
+        Some(decoded.len())
+    };
+
+    // Every wrapped payload is a whole number of blocks, and every record this
+    // script wraps fits one: a message each way, `ContactAccepted`, an
+    // attachment's manifest, and a rotation's commit and announcement are all
+    // the same length to the host.
+    let mut lengths: BTreeMap<usize, usize> = BTreeMap::new();
+    let mut wrapped_at: BTreeSet<(&'static str, Surface)> = BTreeSet::new();
+    let mut unwrapped_at: BTreeSet<(&'static str, Surface)> = BTreeSet::new();
+    for record in corpus.runs.iter().flatten() {
+        if record.view.pointer("/envelope/bytes").is_none() {
+            continue;
+        }
+        let Some(len) = wrapped_len(record) else {
+            unwrapped_at.insert((record.step, record.surface));
+            continue;
+        };
+        assert!(
+            len >= WRAP_BLOCK && len % WRAP_BLOCK == 0,
+            "{}: a wrapped payload of {len} bytes is not a whole number of blocks",
+            record.step
+        );
+        *lengths.entry(len).or_default() += 1;
+        wrapped_at.insert((record.step, record.surface));
+    }
+    assert_eq!(
+        lengths.keys().copied().collect::<Vec<_>>(),
+        vec![WRAP_BLOCK],
+        "every record the script wraps must fit one block; seen (length, count): {lengths:?}"
+    );
+    for (index, records) in corpus.runs.iter().enumerate() {
+        let at_rotation = records
+            .iter()
+            .filter(|record| record.step == "a_rotate" && wrapped_len(record).is_some())
+            .count();
+        assert!(
+            at_rotation >= 3,
+            "run {index}: the rotation step wrapped {at_rotation} record(s), so its \
+             commit, its announcement and the message are not all measured"
+        );
+    }
+
+    // The partition view of the same fact. The matrix varies a body's length
+    // as well as its content, and before the padding the length of the payload
+    // carrying Alice's message measured as carrying it. Now the length of every
+    // one-block payload is constant across the matrix.
+    //
+    // `a_to_b` appends nothing: Alice holds that message until Bob's
+    // `ContactAccepted` reaches her, and sends it on inside `a_fetch`. So the
+    // varied body is measured at `a_rotate`, which sends it again with nothing
+    // held.
+    let (inputs, _) = matrix();
+    let body_lengths: BTreeSet<usize> = inputs.iter().map(|run| run.body_a_to_b.len()).collect();
+    assert!(
+        body_lengths.len() > 1,
+        "the matrix no longer varies a body's length, so a length leak could not show"
+    );
+    assert!(
+        wrapped_at.contains(&("a_rotate", Surface::Ledger("append_request"))),
+        "the message whose body varies was not measured"
+    );
+    for (step, surface, path) in corpus.observed_leaves() {
+        if path != "envelope.bytes#len"
+            || !wrapped_at.contains(&(step, surface))
+            || unwrapped_at.contains(&(step, surface))
+        {
+            continue;
+        }
+        let class = corpus.classify(step, surface, &path);
+        assert!(
+            matches!(class, Class::Constant(_)),
+            "{step}/{surface:?}/{path}: a one-block payload's length measured as {class:?}"
+        );
+    }
+
+    // The size channel the padding leaves open is still measured: an
+    // attachment's length reaches the host as its size. Without this the
+    // assertions above could pass on a classifier that sees no size at all.
     assert!(
         corpus
             .observed_leaves()
             .iter()
             .any(|(step, surface, path)| {
-                path.ends_with("#len")
-                    && matches!(corpus.classify(step, *surface, path), Class::Carries(_))
+                (path.ends_with(".size") || path.ends_with("izeBytes"))
+                    && matches!(
+                        corpus.classify(step, *surface, path),
+                        Class::Carries(secrets) if secrets.contains(&Secret::AttachmentLen)
+                    )
             }),
-        "no payload length was measured at all"
+        "no attachment size was measured at all"
     );
 }
 
