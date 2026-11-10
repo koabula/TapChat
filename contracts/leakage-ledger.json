@@ -98,7 +98,7 @@
       {
         "channel": "ciphertext_length",
         "checked": true,
-        "note": "Measured, not conceded: the corpus derives a `#len` leaf for every string a host sees, and a payload's length reports as carrying the message it wraps. The assertion is the ideal's own statement about `|m|` - content may reach the host as a length and in no other shape. Rotation is now the loudest thing on a lane. A rotation carries the rotating party's whole signed bundle rather than a reference to it — roughly four to six times an ordinary message, separable by size alone — and rotation is triggered by how many messages a party has itself sent, so the two directions of one conversation rotate on correlated schedules. Both inboxes therefore show a size-distinctive, time-correlated periodic event. This stays inside what tab:leak already records (volume, timing and record kinds), and it bought the counterparty callback and user-determined hosting (def:userdet); it is recorded because a repair that moves a conceded parameter should be written down, and it is the first quantity the partition test should measure rather than estimate. A direct commit also carries a fresh KeyPackage in its MLS authenticated data, inside the wrap, which adds a few hundred bytes to the commit record and no field; with it, a rotation and a race re-entry (a Welcome under the losing commit's key) are each a size class of their own, as tab:leak states.",
+        "note": "Measured, not conceded: the corpus derives a `#len` leaf for every string a host sees. The lane wrap pads every wrapped 1:1 frame so that nonce, ciphertext and tag fill a whole number of 4096-byte blocks (`lane_wrap::WRAP_BLOCK`), so a length reaches the host only as a block count. Records that fit one block (short messages, rotation commits, rebuild Welcomes, ContactAccepted) have the same length and are not separable by size; a longer message reveals how many blocks it takes. The corpus measures every record its script wraps, a rotation's commit and announcement among them, as exactly one block, and the length of each as constant across a matrix that varies the message's length as well as its content. Content may still reach the host as a length and in no other shape, which is the ideal's own statement about `|m|`. A rotation's announcement carries the sender's whole signed bundle, which grows with the sender's device count: one device fits a block, and a bundle that does not makes the announcement a multi-block record. Rotation still sends a commit and an announcement beside the message that triggered it, so it remains visible in record count and timing, which tab:leak records as volume. Attachment sizes are unchanged: the blob's size reaches the host as `sizeBytes` and `storageRef.size`. The first-contact Welcome travels unwrapped and is not padded.",
         "measuredBy": "only_a_payloads_size_reaches_the_host"
       },
       {
@@ -108,7 +108,7 @@
       {
         "channel": "commit_frequency",
         "checked": false,
-        "note": "Doubled by the R1 rotation change; recorded there as a traffic-pattern cost. Also directly readable today from PrivateMessage.content_type and epoch; after the R3 wrap only size class remains."
+        "note": "Doubled by the R1 rotation change; recorded there as a traffic-pattern cost. Once readable from PrivateMessage.content_type and epoch; the R3 wrap hid those, and the block padding of the wrap hides the size class, so what remains is record count and timing."
       },
       {
         "channel": "mls_frame_header_epoch_and_content_type",
@@ -286,7 +286,7 @@
       "carries": [],
       "parameter": "L_ibx",
       "fate": "routing",
-      "note": "Wrapped MLS frame (nonce || ChaCha20-Poly1305). Check X must stay empty, and since the fixture frame now carries the shared conversation sentinel in its PrivateMessage group_id, an empty result is evidence that the wrap hides the frame header rather than an artefact of the id being random. Unwrapping it would report conversation."
+      "note": "Wrapped MLS frame (nonce || ChaCha20-Poly1305 over the frame padded to a whole number of 4096-byte blocks). Check X must stay empty, and since the fixture frame now carries the shared conversation sentinel in its PrivateMessage group_id, an empty result is evidence that the wrap hides the frame header rather than an artefact of the id being random. Unwrapping it would report conversation."
     },
     {
       "surface": "append_request",
