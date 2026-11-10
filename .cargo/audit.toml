@@ -7,13 +7,47 @@
 # feature (tauri-plugin-log -> byte-unit -> rust_decimal). It is absent from the
 # production feature graph. Remove this entry when rust_decimal no longer locks
 # the vulnerable optional version.
-# zip 4 is pulled in by tauri-plugin-updater (2.14.0 still requires zip ^4),
-# and only on Windows. Its three advisories concern what extraction does with
-# a malicious archive: Unix permission bits (SUID/SGID, modes through
+# zip 4 is pulled in by tauri-plugin-updater, and only on Windows. The locked
+# 2.10.1 requires zip ^4; 2.14.1 is the first on zip ^9, and taking it also
+# moves tauri to >= 2.12. The updater extracts only a bundle whose signature
+# download() has already verified, and the desktop installs only via
+# downloadAndInstall. Three of the advisories concern what extraction does
+# with a malicious archive: Unix permission bits (SUID/SGID, modes through
 # symlinks), which Windows does not have, and symlink targets outside the
-# destination. The updater extracts only a bundle whose signature download()
-# has already verified, and the desktop installs only via downloadAndInstall.
-# Remove these entries when the updater accepts zip >= 9.
+# destination. RUSTSEC-2026-0429 does apply on Windows: ZipArchive::extract()
+# aborts the process on a symlink entry that declares a huge size, and the
+# updater calls extract() when the verified bundle is a zip. TapChat ships its
+# Windows updates as the signed .msi and -setup.exe themselves
+# (createUpdaterArtifacts: true), so no genuine update takes that branch, and
+# a zip that passes verification needs the signing key, which could ship any
+# installer. Remove these entries when Cargo.lock takes tauri-plugin-updater
+# >= 2.14.1.
+# crypto-bigint 0.5 comes in through elliptic-curve 0.13 (p256, p384, k256),
+# which openmls_rust_crypto, openmls_basic_credential and the vendored
+# hpke-rs-rust-crypto require; the openmls crates still require p256 0.13 in
+# their newest release, 0.6.0. TapChat's only MLS ciphersuite is
+# MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519: the device key that signs
+# every KeyPackage, Welcome and commit is Ed25519, and HPKE runs on X25519,
+# both in curve25519 crates that do not use crypto-bigint. openmls rejects a
+# Welcome in another suite before it opens the group secrets, so no TapChat
+# secret reaches the NIST-curve code. That code runs only when
+# KeyPackage::validate() checks the signature on a peer KeyPackage in another
+# suite, on public inputs, and verify_key_package_is_peer_device() then
+# rejects it for not carrying the peer's Ed25519 device key. Remove this entry
+# when the openmls crypto crates move to elliptic-curve 0.14 (crypto-bigint
+# >= 0.7.6).
+# libsqlite3-sys 0.30 is rusqlite's, built with
+# bundled-sqlcipher-vendored-openssl, so the code at issue is the SQLite inside
+# SQLCipher. The libsqlite3-sys releases the advisory marks patched (0.39.x,
+# for rusqlite 0.41) still build that feature from sqlcipher-src =419.0.6,
+# which bundles the affected SQLite 3.53.4: upgrading would quiet this check
+# without fixing the build. The bug needs a database and -wal pair written by a
+# less trusted party. TapChat opens only state.db (WAL mode) in the profile it
+# unlocks, a file it creates itself, and neither the desktop nor the CLI
+# imports a database. Planting a -wal beside it takes write access to the
+# user's profile directory. Remove this entry, and take that rusqlite upgrade,
+# when a libsqlite3-sys release builds bundled-sqlcipher on SQLite >= 3.54
+# (sqlcipher-src >= 420).
 ignore = [
   "RUSTSEC-2026-0194",
   "RUSTSEC-2026-0195",
@@ -21,6 +55,9 @@ ignore = [
   "RUSTSEC-2026-0367",
   "RUSTSEC-2026-0368",
   "RUSTSEC-2026-0369",
+  "RUSTSEC-2026-0387",
+  "RUSTSEC-2026-0429",
+  "RUSTSEC-2026-0459",
 ]
 informational_warnings = ["unmaintained", "unsound"]
 
