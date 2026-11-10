@@ -5,6 +5,12 @@ all-features = false
 yanked = "deny"
 unmaintained = "workspace"
 unsound = "workspace"
+# The reasoning for each entry is in .cargo/audit.toml. Only advisories on
+# crates in this graph are listed; it leaves out the desktop's gui feature.
+ignore = [
+  { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5 only under P-256/P-384/K-256, which TapChat's X25519/Ed25519 MLS suite never uses on secrets" },
+  { id = "RUSTSEC-2026-0459", reason = "patched libsqlite3-sys still builds SQLCipher on SQLite 3.53.4; TapChat opens only its own state.db" },
+]
 
 [bans]
 multiple-versions = "warn"
