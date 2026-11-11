@@ -149,16 +149,31 @@ impl CoreEngine {
         // What is still queued on the old lane goes to the new one. A lane is
         // read by the host, not inside the wrap, so the envelope is otherwise
         // unchanged; its retries start again, since the failures, if any, were
-        // the old host's. Returns the envelopes readdressed.
+        // the old host's. An envelope in flight keeps its lane: if it fails,
+        // `flush_outbox` readdresses it before sending it again. Returns the
+        // envelopes readdressed.
         let mut readdressed = Vec::new();
         for item in &mut self.state.pending_outbox {
-            if item.envelope.lane == old_outbound {
+            if item.envelope.lane == old_outbound && !item.in_flight {
                 item.envelope.lane = new_outbound.clone();
                 item.retries = 0;
                 readdressed.push(item.envelope.mid.clone());
             }
         }
         Ok(readdressed)
+    }
+
+    /// The lane `peer_user_id`'s direct conversation now writes on, if the
+    /// peer has exactly one.
+    pub(super) fn outbound_lane_for_peer(&self, peer_user_id: &str) -> Option<String> {
+        let mut lanes = self
+            .state
+            .conversations
+            .values()
+            .filter(|conversation| conversation.peer_user_id == peer_user_id)
+            .filter_map(|conversation| conversation.lanes.as_ref());
+        let lane = lanes.next()?.outbound_lane.clone();
+        lanes.next().is_none().then_some(lane)
     }
 
     /// Whether `lane` is the inbound lane of a conversation this device holds.

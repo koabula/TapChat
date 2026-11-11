@@ -956,6 +956,17 @@ impl CoreEngine {
     /// one still waiting for a retry would land ahead of the key it needs.
     /// The peer could only quarantine it, and a bounded quarantine loses it.
     pub(super) fn flush_outbox(&mut self) -> CoreResult<CoreOutput> {
+        // An envelope whose lane no conversation uses any more was in flight
+        // when its peer announced a new one: it goes to the peer's lane now.
+        for index in 0..self.state.pending_outbox.len() {
+            let item = &self.state.pending_outbox[index];
+            if item.in_flight || self.conversation_id_for_lane(&item.envelope.lane).is_some() {
+                continue;
+            }
+            if let Some(lane) = self.outbound_lane_for_peer(&item.peer_user_id) {
+                self.state.pending_outbox[index].envelope.lane = lane;
+            }
+        }
         let mut effects = Vec::new();
         let mut lanes_ahead = BTreeSet::new();
         for index in 0..self.state.pending_outbox.len() {

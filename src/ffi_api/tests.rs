@@ -12713,8 +12713,8 @@ pub(crate) mod tests {
             .deployment_bundle
             .clone()
             .expect("deployment");
-        let queued_before = pending_mids(&chat.alice);
-        chat.alice
+        let sent = chat
+            .alice
             .handle_command(CoreCommand::SendTextMessage {
                 conversation_id: conversation_id.clone(),
                 plaintext: "sent before the notice".into(),
@@ -12753,7 +12753,7 @@ pub(crate) mod tests {
             .state
             .pending_outbox
             .iter()
-            .find(|queued| !queued_before.contains(&queued.envelope.mid))
+            .find(|queued| queued.plaintext_cache.as_deref() == Some("sent before the notice"))
             .expect("alice's message is queued")
             .clone();
         let record = InboxRecord {
@@ -12773,13 +12773,32 @@ pub(crate) mod tests {
                 records: vec![record],
             })
             .expect("the old host's record");
-        assert!(chat.bob.state.conversations[&conversation_id]
+        let taken = chat.bob.state.conversations[&conversation_id]
             .messages
             .iter()
-            .any(|message| message.plaintext.as_deref() == Some("sent before the notice")));
+            .any(|message| message.plaintext.as_deref() == Some("sent before the notice"));
+        let held = &chat.bob.state.sync_states[&key].quarantine;
+        assert!(
+            taken,
+            "lane {} previous lanes {:?} quarantined {:?}",
+            item.envelope.lane,
+            chat.bob.state.previous_inbox.as_ref().map(|p| &p.lanes),
+            held.keys().collect::<Vec<_>>()
+        );
         let acked_there = http_request(&read, |request| request.url.ends_with("/ack"));
         assert!(acked_there.is_none());
 
+        // If the message went out at all, its append to the old host fails,
+        // so it is still queued, and not in flight, when Alice hears of the
+        // move.
+        if let Some(append) = http_request(&sent, |request| request.url.ends_with("/messages")) {
+            chat.alice
+                .handle_event(CoreEvent::HttpRequestFailed {
+                    request_id: append.request_id,
+                    failure: test_failure("request_timeout", true, None),
+                })
+                .expect("the old host does not answer");
+        }
         deliver_pending_outbox_to_device(&mut chat.alice, &chat.bob, &chat.alice_device_id);
         let new_lane = chat.bob.state.conversations[&conversation_id]
             .lanes
@@ -13034,7 +13053,10 @@ pub(crate) mod tests {
                 plaintext: "after-move".into(),
             })
             .expect("alice sends after move");
-        assert!(after.effects.iter().any(|effect| matches!(
+        // What Alice had queued for Bob went to his new host as soon as she
+        // applied the notice; a message sent after that follows it there, in
+        // order.
+        assert!(inbound.effects.iter().chain(&after.effects).any(|effect| matches!(
             effect,
             CoreEffect::ExecuteHttpRequest { request }
                 if request.url.contains("bob-new.example.test")
