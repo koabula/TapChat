@@ -12707,7 +12707,12 @@ pub(crate) mod tests {
         let mut chat = paired_direct_chat();
         let conversation_id = chat.conversation_id.clone();
         let device_id = chat.bob_device_id.clone();
-        let old = chat.bob.state.deployment_bundle.clone().expect("deployment");
+        let old = chat
+            .bob
+            .state
+            .deployment_bundle
+            .clone()
+            .expect("deployment");
         let queued_before = pending_mids(&chat.alice);
         chat.alice
             .handle_command(CoreCommand::SendTextMessage {

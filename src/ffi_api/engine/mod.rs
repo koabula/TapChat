@@ -68,7 +68,6 @@ use crate::persistence::{
     PersistedSyncState,
 };
 use crate::sync_engine::{SyncDecision, SyncEngine};
-use previous_inbox::{inbox_device_id, is_previous_inbox_key};
 use crate::transport_contract::{
     AckRequest, AckResult, AppendEnvelopeRequest, AppendEnvelopeResult, AppendGroupEnvelopeRequest,
     AppendGroupEnvelopeResult, AppendGroupTransitionRequest, BlobDownloadRequest,
@@ -90,6 +89,7 @@ use crate::transport_contract::{
 };
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use log;
+use previous_inbox::{inbox_device_id, is_previous_inbox_key};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
