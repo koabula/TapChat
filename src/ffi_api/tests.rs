@@ -16361,6 +16361,85 @@ pub(crate) mod tests {
     /// the host for nothing. The winner joins with that package's leaf and,
     /// having made no rotation since, keeps it: the leaf is as new as the
     /// rotation it won with.
+    /// **A lane moved during a race reaches the peer once the race settles.**
+    /// The winner's commit goes to the loser's old lane, which the loser
+    /// still reads, so the race settles. The loser's notice of its new lane
+    /// went out in the epoch its losing commit made, which the winner never
+    /// holds; the rebuild announces the lane again, so the winner writes to it
+    /// without waiting for a refresh.
+    #[test]
+    fn a_lane_moved_during_a_race_is_announced_after_the_rebuild() {
+        let mut chat = paired_direct_chat();
+        let conversation_id = chat.conversation_id.clone();
+        let alice_is_winner = alice_is_designated(&chat);
+        let mut seen_from_winner = pending_mids(rotator_engine(&chat, alice_is_winner));
+        let mut seen_from_loser = pending_mids(peer_engine(&chat, alice_is_winner));
+        set_direct_pcs_debt(
+            peer_engine_mut(&mut chat, alice_is_winner),
+            &conversation_id,
+            DIRECT_PCS_COMMIT_INTERVAL * 2 - 1,
+        );
+        peer_engine_mut(&mut chat, alice_is_winner)
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "loser trigger".into(),
+            })
+            .expect("loser rotates");
+        set_direct_pcs_debt(
+            rotator_engine_mut(&mut chat, alice_is_winner),
+            &conversation_id,
+            DIRECT_PCS_COMMIT_INTERVAL - 1,
+        );
+        rotator_engine_mut(&mut chat, alice_is_winner)
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "winner trigger".into(),
+            })
+            .expect("winner rotates");
+
+        let mut relocated = sample_deployment();
+        relocated.inbox_http_endpoint = "https://loser-new.example.test".into();
+        relocated.inbox_websocket_endpoint = "wss://loser-new.example.test/ws".into();
+        relocated.runtime_id = "runtime:loser-new".into();
+        relocated.runtime_config.identity_bundle_ref =
+            Some("https://loser-new.example.test/state/identity.json".into());
+        let loser = peer_engine_mut(&mut chat, alice_is_winner);
+        loser
+            .handle_command(CoreCommand::ImportDeploymentBundle { bundle: relocated })
+            .expect("the loser moves while its commit is pending");
+        let moved_lane = loser.state.conversations[&conversation_id]
+            .lanes
+            .as_ref()
+            .expect("lanes")
+            .inbound_lane
+            .clone();
+
+        let mut seq = 54_000;
+        exchange_until_quiet(
+            &mut chat,
+            alice_is_winner,
+            &mut seen_from_winner,
+            &mut seen_from_loser,
+            &mut seq,
+        );
+        let winner = rotator_engine(&chat, alice_is_winner);
+        assert!(
+            !winner.state.conversations[&conversation_id]
+                .fork
+                .rebuild_welcomes
+                .is_empty(),
+            "premise: the race was settled by the winner joining the loser's rebuild"
+        );
+        assert_eq!(
+            winner.state.conversations[&conversation_id]
+                .lanes
+                .as_ref()
+                .expect("lanes")
+                .outbound_lane,
+            moved_lane
+        );
+    }
+
     /// **No message is lost to a commit race.** Each side's commit merges at
     /// once, so what it sends next is encrypted in the epoch that commit
     /// created, and only one of the two epochs survives the race: the winner
