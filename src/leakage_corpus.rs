@@ -1113,6 +1113,13 @@ const BOB_ALT2: &str = "scheme spot photo card baby mountain device kick cradle 
 
 /// The runs whose inputs are byte-identical. Three rather than two: a value
 /// that is fresh only sometimes would flip verdicts under a single pair.
+///
+/// They are the first run, the last and one in the middle, not three in a
+/// row. A value read off a coarse clock, such as a KeyPackage's `createdAt` in
+/// whole seconds, can hold still across three adjacent runs and change before
+/// a later one; it then reads as carrying every secret. The runs execute in
+/// order, so with a replicate at each end such a value either differs between
+/// the first run and the last, and is fresh, or is the same in every run.
 const REPLICATES: usize = 3;
 
 fn baseline() -> RunInputs {
@@ -1126,81 +1133,77 @@ fn baseline() -> RunInputs {
     }
 }
 
-/// One secret varied at a time, from a common baseline.
-fn matrix() -> (Vec<RunInputs>, BTreeMap<Secret, Vec<RunIx>>) {
-    let mut runs = vec![baseline(), baseline(), baseline()];
-    let mut varied: BTreeMap<Secret, Vec<RunIx>> = BTreeMap::new();
-    let mut push = |runs: &mut Vec<RunInputs>,
-                    varied: &mut BTreeMap<Secret, Vec<RunIx>>,
-                    secret: Secret,
-                    inputs: RunInputs| {
-        varied.entry(secret).or_default().push(runs.len());
-        runs.push(inputs);
-    };
-
+/// One secret varied at a time, from a common baseline, with the replicates
+/// spread over the order of the runs (see [`REPLICATES`]).
+fn matrix() -> (Vec<RunInputs>, BTreeMap<Secret, Vec<RunIx>>, BTreeSet<RunIx>) {
+    let mut variants: Vec<(Secret, RunInputs)> = Vec::new();
     for mnemonic in [harness::CAROL_MNEMONIC, harness::DANA_MNEMONIC] {
-        push(
-            &mut runs,
-            &mut varied,
+        variants.push((
             Secret::Identity(Party::Alice),
             RunInputs {
                 alice_mnemonic: mnemonic,
                 ..baseline()
             },
-        );
+        ));
     }
     for mnemonic in [BOB_ALT, BOB_ALT2] {
-        push(
-            &mut runs,
-            &mut varied,
+        variants.push((
             Secret::Identity(Party::Bob),
             RunInputs {
                 bob_mnemonic: mnemonic,
                 ..baseline()
             },
-        );
+        ));
     }
     // One alternative of the same length and one of a different length, so
     // that content and length are separable.
     for body in ["the first direCTION", "shorter"] {
-        push(
-            &mut runs,
-            &mut varied,
+        variants.push((
             Secret::Body(Party::Alice),
             RunInputs {
                 body_a_to_b: body,
                 ..baseline()
             },
-        );
+        ));
     }
-    push(
-        &mut runs,
-        &mut varied,
+    variants.push((
         Secret::Body(Party::Bob),
         RunInputs {
             body_b_to_a: "a different second direction entirely",
             ..baseline()
         },
-    );
-    push(
-        &mut runs,
-        &mut varied,
+    ));
+    variants.push((
         Secret::AttachmentName,
         RunInputs {
             attachment_name: "two.bin",
             ..baseline()
         },
-    );
-    push(
-        &mut runs,
-        &mut varied,
+    ));
+    variants.push((
         Secret::AttachmentLen,
         RunInputs {
             attachment_len: 4096,
             ..baseline()
         },
-    );
-    (runs, varied)
+    ));
+
+    let middle = variants.len() / 2;
+    let mut runs = Vec::new();
+    let mut varied: BTreeMap<Secret, Vec<RunIx>> = BTreeMap::new();
+    let mut replicates = BTreeSet::new();
+    for (index, (secret, inputs)) in variants.into_iter().enumerate() {
+        if index == 0 || index == middle {
+            replicates.insert(runs.len());
+            runs.push(baseline());
+        }
+        varied.entry(secret).or_default().push(runs.len());
+        runs.push(inputs);
+    }
+    replicates.insert(runs.len());
+    runs.push(baseline());
+    assert_eq!(replicates.len(), REPLICATES, "the replicates must be distinct runs");
+    (runs, varied, replicates)
 }
 
 pub(crate) struct Corpus {
@@ -1251,7 +1254,7 @@ impl Corpus {
 fn corpus() -> &'static Corpus {
     static CORPUS: std::sync::OnceLock<Corpus> = std::sync::OnceLock::new();
     CORPUS.get_or_init(|| {
-        let (inputs, varied) = matrix();
+        let (inputs, varied, replicates) = matrix();
         let total = inputs.len();
         let runs: Vec<Vec<Record>> = inputs.iter().map(record_run).collect();
         let secrets = varied
@@ -1269,7 +1272,7 @@ fn corpus() -> &'static Corpus {
             .collect();
         Corpus {
             runs,
-            replicates: (0..REPLICATES).collect(),
+            replicates,
             secrets,
         }
     })
@@ -1528,7 +1531,7 @@ fn only_a_payloads_size_reaches_the_host() {
     // `ContactAccepted` reaches her, and sends it on inside `a_fetch`. So the
     // varied body is measured at `a_rotate`, which sends it again with nothing
     // held.
-    let (inputs, _) = matrix();
+    let (inputs, _, _) = matrix();
     let body_lengths: BTreeSet<usize> = inputs.iter().map(|run| run.body_a_to_b.len()).collect();
     assert!(
         body_lengths.len() > 1,
