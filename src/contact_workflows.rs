@@ -376,7 +376,9 @@ mod tests {
         let error = ensure_welcome_signed_by_bundle(&preview, &signed_bundle(IMPOSTOR_MNEMONIC))
             .expect_err("another user's bundle must be refused");
         assert!(
-            error.to_string().contains("does not match the Welcome author"),
+            error
+                .to_string()
+                .contains("does not match the Welcome author"),
             "{error}"
         );
     }
