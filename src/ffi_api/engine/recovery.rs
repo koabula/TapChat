@@ -355,11 +355,10 @@ impl CoreEngine {
                 peer_active_device_ids.iter().cloned().collect();
         }
 
-        let mut generated = self.commit_envelopes_for_artifacts(
-            &conversation_id,
-            &peer_active_device_ids,
-            &artifacts,
-        )?;
+        // Everyone in the new group joins it from a Welcome, so the commit
+        // that created it has no reader: a peer could only drop it as
+        // superseded. A rebuild therefore sends the Welcome and the resends,
+        // as a first contact sends only its Welcome.
         let mut welcomes = self.welcome_envelopes_for_artifacts(&conversation_id, &artifacts)?;
         let wrap_out = self
             .state
@@ -394,7 +393,7 @@ impl CoreEngine {
             .iter()
             .map(|envelope| envelope.mid.clone())
             .collect();
-        generated.extend(welcomes);
+        let generated = welcomes;
         self.enqueue_envelopes(peer_user_id, generated.clone());
         self.resend_unconfirmed_frames(&conversation_id)?;
         self.mark_recovery_needed(&conversation_id, RecoveryReason::MembershipChanged);

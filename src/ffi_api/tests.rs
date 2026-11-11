@@ -5549,14 +5549,16 @@ pub(crate) mod tests {
             })
             .expect("claim response rebuilds the conversation");
 
+        // A rebuild sends its Welcome and not the commit that made the group:
+        // everyone joins from the Welcome, so the commit has no reader.
         assert!(completed.view_model.as_ref().is_some_and(|view| {
             view.messages
                 .iter()
-                .any(|message| message.message_type == MessageType::MlsCommit)
-                && view
+                .any(|message| message.message_type == MessageType::MlsWelcome)
+                && !view
                     .messages
                     .iter()
-                    .any(|message| message.message_type == MessageType::MlsWelcome)
+                    .any(|message| message.message_type == MessageType::MlsCommit)
         }));
         assert_eq!(
             alice
@@ -10964,13 +10966,13 @@ pub(crate) mod tests {
         assert!(output.view_model.as_ref().is_some_and(|view| {
             view.messages
                 .iter()
-                .any(|message| message.message_type == MessageType::MlsCommit)
-                && view
+                .any(|message| message.message_type == MessageType::MlsWelcome)
+                && !view
                     .messages
                     .iter()
-                    .any(|message| message.message_type == MessageType::MlsWelcome)
+                    .any(|message| message.message_type == MessageType::MlsCommit)
         }));
-        assert!(restored.state.pending_outbox[pending_before..]
+        assert!(!restored.state.pending_outbox[pending_before..]
             .iter()
             .any(|item| outbox_item_matches_type(item, MessageType::MlsCommit)));
         assert!(restored.state.pending_outbox[pending_before..]

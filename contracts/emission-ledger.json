@@ -60,7 +60,7 @@
     {
       "fn": "handle_inbox_records_batch",
       "trigger": "reaction",
-      "emits": "the contact-accepted reply that ends establishment, on applying the initiator's welcome"
+      "emits": "the contact-accepted reply, on applying the initiator's welcome, which ends establishment, or a race loser's rebuild welcome, where it is the first record of the new session the loser processes and so ends the loser's recovery"
     },
     {
       "fn": "finalize_reconcile_membership_rebootstrap",
