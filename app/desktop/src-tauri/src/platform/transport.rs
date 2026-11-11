@@ -6,10 +6,10 @@ use tokio::sync::RwLock;
 
 use tapchat_core::cli::util::{to_camel_case_json_string, to_snake_case_json_string};
 use tapchat_core::ffi_api::{CoreEvent, HttpMethod, HttpRequestEffect};
-use tapchat_core::model::{Ack, IdentityBundle, InboxRecord};
+use tapchat_core::model::{Ack, InboxRecord};
 use tapchat_core::transport_contract::{
-    AckRequest, AckResult, AppendEnvelopeRequest, AppendEnvelopeResult, FetchIdentityBundleRequest,
-    GetHeadResult, PrepareBlobUploadRequest, PrepareBlobUploadResult,
+    AckRequest, AckResult, AppendEnvelopeRequest, AppendEnvelopeResult, GetHeadResult,
+    PrepareBlobUploadRequest, PrepareBlobUploadResult,
 };
 
 use crate::platform::log_sanitize::{
@@ -427,32 +427,6 @@ impl DesktopTransport {
             crate::ts_ms()
         );
         Ok(result.head_seq)
-    }
-
-    /// Fetch identity bundle from URL.
-    pub async fn fetch_identity_bundle(
-        &self,
-        request: FetchIdentityBundleRequest,
-    ) -> Result<IdentityBundle> {
-        let reference = request
-            .reference
-            .as_ref()
-            .context("identity bundle fetch missing reference")?;
-        let response = self
-            .client
-            .get(reference)
-            .send()
-            .await
-            .context("fetch identity bundle")?;
-
-        let status = response.status();
-        if !status.is_success() {
-            anyhow::bail!("fetch bundle failed with status {}", status);
-        }
-
-        let body = response.text().await.context("read identity bundle")?;
-        let body = to_snake_case_json_string(&body)?;
-        serde_json::from_str(&body).context("parse identity bundle")
     }
 
     /// Prepare blob upload.
