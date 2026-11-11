@@ -72,6 +72,7 @@ pub struct DriverRuntime {
     recent_appends: Vec<Envelope>,
     recent_messages: Vec<(String, MessageType)>,
     runtime_credential: Option<DeviceRuntimeAuth>,
+    previous_runtime_credential: Option<DeviceRuntimeAuth>,
     store: Option<Arc<ProfileStorageSession>>,
 }
 
@@ -136,6 +137,7 @@ impl CoreDriver {
                 recent_appends: Vec::new(),
                 recent_messages: Vec::new(),
                 runtime_credential: None,
+                previous_runtime_credential: None,
                 store: None,
             },
             suppress_realtime: false,
@@ -154,8 +156,21 @@ impl CoreDriver {
         self.runtime.latest_snapshot.as_ref()
     }
 
+    /// Install the credential for the current runtime. One for another
+    /// runtime is a move, and the one it replaces is kept for the host left
+    /// behind, which the engine still reads.
     pub fn set_runtime_credential(&mut self, credential: Option<DeviceRuntimeAuth>) {
+        if crate::cli::profile::runtime_changes(
+            self.runtime.runtime_credential.as_ref(),
+            credential.as_ref(),
+        ) {
+            self.runtime.previous_runtime_credential = self.runtime.runtime_credential.take();
+        }
         self.runtime.runtime_credential = credential;
+    }
+
+    pub fn set_previous_runtime_credential(&mut self, credential: Option<DeviceRuntimeAuth>) {
+        self.runtime.previous_runtime_credential = credential;
     }
 
     fn inject_runtime_authorization(
@@ -170,14 +185,22 @@ impl CoreDriver {
         else {
             return Ok(());
         };
-        let credential = self
-            .runtime
-            .runtime_credential
-            .as_ref()
-            .ok_or_else(|| anyhow!("runtime credential is not available"))?;
-        if credential.runtime_id != *runtime_id || credential.device_id != *device_id {
-            return Err(anyhow!("runtime credential scope mismatch"));
+        // The current runtime's credential, or the one kept for the host a
+        // move left behind, which the engine still reads.
+        let held = [
+            self.runtime.runtime_credential.as_ref(),
+            self.runtime.previous_runtime_credential.as_ref(),
+        ];
+        if held.iter().all(Option::is_none) {
+            return Err(anyhow!("runtime credential is not available"));
         }
+        let credential = held
+            .into_iter()
+            .flatten()
+            .find(|credential| {
+                credential.runtime_id == *runtime_id && credential.device_id == *device_id
+            })
+            .ok_or_else(|| anyhow!("runtime credential scope mismatch"))?;
         headers.insert(
             "Authorization".into(),
             format!("Bearer {}", credential.token),

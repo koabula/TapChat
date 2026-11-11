@@ -12673,6 +12673,170 @@ pub(crate) mod tests {
             .any(|effect| matches!(effect, CoreEffect::ScheduleTimer { .. })));
     }
 
+    /// Bob moves to a new host, as `relocation_to_empty_runtime_keeps_the_conversation` does.
+    fn relocate_bob(chat: &mut PairedDirectChat) {
+        let mut relocated = sample_deployment();
+        relocated.inbox_http_endpoint = "https://bob-new.example.test".into();
+        relocated.inbox_websocket_endpoint = "wss://bob-new.example.test/ws".into();
+        relocated.runtime_id = "runtime:bob-new".into();
+        relocated.runtime_config.identity_bundle_ref =
+            Some("https://bob-new.example.test/state/identity.json".into());
+        chat.bob
+            .handle_command(CoreCommand::ImportDeploymentBundle { bundle: relocated })
+            .expect("bob relocates");
+    }
+
+    /// The first request in `output` that `matches`.
+    fn http_request(
+        output: &CoreOutput,
+        matches: impl Fn(&crate::ffi_api::HttpRequestEffect) -> bool,
+    ) -> Option<crate::ffi_api::HttpRequestEffect> {
+        output.effects.iter().find_map(|effect| match effect {
+            CoreEffect::ExecuteHttpRequest { request } if matches(request) => Some(request.clone()),
+            _ => None,
+        })
+    }
+
+    /// **A move goes on reading the host it left.** Alice writes before she
+    /// hears of the move, so her message goes to Bob's old host on his old
+    /// lane. Bob reads that host under the credential he held there, takes
+    /// the message, and acknowledges nothing there. When Alice applies the
+    /// lane notice, what she still has queued for Bob moves to his new lane.
+    #[test]
+    fn a_move_goes_on_reading_the_host_it_left() {
+        let mut chat = paired_direct_chat();
+        let conversation_id = chat.conversation_id.clone();
+        let device_id = chat.bob_device_id.clone();
+        let old = chat.bob.state.deployment_bundle.clone().expect("deployment");
+        let queued_before = pending_mids(&chat.alice);
+        chat.alice
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "sent before the notice".into(),
+            })
+            .expect("alice sends");
+        relocate_bob(&mut chat);
+
+        let previous = chat.bob.state.previous_inbox.clone().expect("the old host");
+        assert_eq!(
+            previous.deployment_bundle.inbox_http_endpoint,
+            old.inbox_http_endpoint
+        );
+        assert_eq!(previous.awaiting, vec![conversation_id.clone()]);
+
+        let sync = chat
+            .bob
+            .handle_command(CoreCommand::SyncInbox {
+                device_id: device_id.clone(),
+                reason: Some("test".into()),
+            })
+            .expect("sync");
+        let head = http_request(&sync, |request| {
+            request.url.starts_with(&old.inbox_http_endpoint) && request.url.ends_with("/head")
+        })
+        .expect("a read of the old host");
+        assert!(matches!(
+            head.auth,
+            Some(TransportAuthRequirement::DeviceRuntime { ref runtime_id, .. })
+                if runtime_id == &old.runtime_id
+        ));
+
+        let key = format!("previous:{device_id}");
+        let acked = chat.bob.state.sync_states[&key].checkpoint.last_acked_seq;
+        let item = chat
+            .alice
+            .state
+            .pending_outbox
+            .iter()
+            .find(|queued| !queued_before.contains(&queued.envelope.mid))
+            .expect("alice's message is queued")
+            .clone();
+        let record = InboxRecord {
+            seq: acked + 1,
+            recipient_device_id: device_id.clone(),
+            message_id: item.envelope.mid.clone(),
+            received_at: acked + 1,
+            expires_at: None,
+            state: InboxRecordState::Available,
+            envelope: item.envelope.clone(),
+        };
+        let read = chat
+            .bob
+            .handle_event(CoreEvent::InboxRecordsFetched {
+                device_id: key.clone(),
+                to_seq: acked + 1,
+                records: vec![record],
+            })
+            .expect("the old host's record");
+        assert!(chat.bob.state.conversations[&conversation_id]
+            .messages
+            .iter()
+            .any(|message| message.plaintext.as_deref() == Some("sent before the notice")));
+        let acked_there = http_request(&read, |request| request.url.ends_with("/ack"));
+        assert!(acked_there.is_none());
+
+        deliver_pending_outbox_to_device(&mut chat.alice, &chat.bob, &chat.alice_device_id);
+        let new_lane = chat.bob.state.conversations[&conversation_id]
+            .lanes
+            .as_ref()
+            .expect("lanes")
+            .inbound_lane
+            .clone();
+        let readdressed = chat
+            .alice
+            .state
+            .pending_outbox
+            .iter()
+            .find(|queued| queued.envelope.mid == item.envelope.mid)
+            .expect("still queued at alice");
+        assert_eq!(readdressed.envelope.lane, new_lane);
+        assert_eq!(readdressed.retries, 0);
+    }
+
+    /// **The old host is read until every peer has followed.** Once Alice
+    /// writes to Bob's new host, and the old one has nothing left, Bob stops
+    /// reading it.
+    #[test]
+    fn the_old_host_is_read_until_every_peer_has_followed() {
+        let mut chat = paired_direct_chat();
+        let conversation_id = chat.conversation_id.clone();
+        let device_id = chat.bob_device_id.clone();
+        relocate_bob(&mut chat);
+        deliver_pending_outbox_to_device(&mut chat.alice, &chat.bob, &chat.alice_device_id);
+        chat.alice
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "sent after the notice".into(),
+            })
+            .expect("alice sends");
+        deliver_pending_outbox_to_device(&mut chat.bob, &chat.alice, &device_id);
+        let previous = chat.bob.state.previous_inbox.as_ref().expect("still read");
+        assert!(previous.awaiting.is_empty(), "{:?}", previous.awaiting);
+
+        let key = format!("previous:{device_id}");
+        let acked = chat.bob.state.sync_states[&key].checkpoint.last_acked_seq;
+        let sync = chat
+            .bob
+            .handle_command(CoreCommand::SyncInbox {
+                device_id: device_id.clone(),
+                reason: Some("test".into()),
+            })
+            .expect("sync");
+        let head = http_request(&sync, |request| {
+            request.url.ends_with("/head") && !request.url.contains("bob-new.example.test")
+        })
+        .expect("a read of the old host");
+        chat.bob
+            .handle_event(CoreEvent::HttpResponseReceived {
+                request_id: head.request_id,
+                status: 200,
+                body: Some(format!("{{\"head_seq\":{acked}}}")),
+            })
+            .expect("the old host has nothing more");
+        assert!(chat.bob.state.previous_inbox.is_none());
+        assert!(!chat.bob.state.sync_states.contains_key(&key));
+    }
+
     #[test]
     fn a_move_reads_the_new_host_from_its_first_record() {
         use crate::sync_engine::SyncEngine;

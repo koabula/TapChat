@@ -105,11 +105,20 @@ impl DesktopPlatformPorts {
         let profile_manager = crate::platform::profile::ProfileManager::from_inner(
             self.transport.profile_inner.clone(),
         );
-        let credential = self
+        // A request to the host a move left behind carries that host's
+        // runtime id, and goes under the credential kept for it.
+        let previous = self
             .runtime_auth
-            .ensure(&profile_manager, force_refresh)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("runtime_auth_error:enrollment_required"))?;
+            .ensure_previous(&profile_manager, runtime_id)
+            .await?;
+        let credential = match previous {
+            Some(credential) => credential,
+            None => self
+                .runtime_auth
+                .ensure(&profile_manager, force_refresh)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("runtime_auth_error:enrollment_required"))?,
+        };
         if credential.runtime_id != *runtime_id || credential.device_id != *device_id {
             anyhow::bail!("runtime_auth_error:runtime_mismatch");
         }

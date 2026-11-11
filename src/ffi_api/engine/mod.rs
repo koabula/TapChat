@@ -4,6 +4,7 @@ mod group_fsm;
 mod group_sync;
 mod keypackage_claim;
 mod lanes;
+mod previous_inbox;
 mod recovery;
 mod transport;
 
@@ -67,6 +68,7 @@ use crate::persistence::{
     PersistedSyncState,
 };
 use crate::sync_engine::{SyncDecision, SyncEngine};
+use previous_inbox::{inbox_device_id, is_previous_inbox_key};
 use crate::transport_contract::{
     AckRequest, AckResult, AppendEnvelopeRequest, AppendEnvelopeResult, AppendGroupEnvelopeRequest,
     AppendGroupEnvelopeResult, AppendGroupTransitionRequest, BlobDownloadRequest,
@@ -702,6 +704,9 @@ impl CoreEngine {
                 deployment_bundle: persisted_deployment
                     .as_ref()
                     .map(|deployment| deployment.deployment_bundle.clone()),
+                previous_inbox: persisted_deployment
+                    .as_ref()
+                    .and_then(|deployment| deployment.previous_inbox.clone()),
                 contacts,
                 conversations,
                 lane_index: BTreeMap::new(),
@@ -3306,6 +3311,7 @@ fn build_persistence_snapshot(state: &CoreState) -> CorePersistenceSnapshot {
                     .mls_adapter
                     .as_ref()
                     .and_then(|adapter| adapter.export_bootstrap_state().ok()),
+                previous_inbox: state.previous_inbox.clone(),
             }),
         contacts: state
             .contacts

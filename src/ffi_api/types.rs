@@ -1321,6 +1321,7 @@ pub(crate) struct CoreState {
     pub(crate) local_identity: Option<LocalIdentityState>,
     pub(crate) local_bundle: Option<IdentityBundle>,
     pub(crate) deployment_bundle: Option<DeploymentBundle>,
+    pub(crate) previous_inbox: Option<crate::persistence::PreviousInbox>,
     pub(crate) contacts: BTreeMap<String, PersistedContact>,
     pub(crate) conversations: BTreeMap<String, LocalConversationState>,
     /// inbound lane → conversation_id. Rebuilt from `conversations` on load.
@@ -1603,6 +1604,7 @@ impl Default for CoreState {
             local_identity: None,
             local_bundle: None,
             deployment_bundle: None,
+            previous_inbox: None,
             contacts: BTreeMap::new(),
             conversations: BTreeMap::new(),
             lane_index: BTreeMap::new(),
