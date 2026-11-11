@@ -204,7 +204,7 @@ fn validate_tapchat_path(
     }
 }
 
-fn decoded_path_segments(url: &Url) -> Result<Vec<String>, ExternalFetchError> {
+pub(crate) fn decoded_path_segments(url: &Url) -> Result<Vec<String>, ExternalFetchError> {
     url.path_segments()
         .ok_or_else(|| ExternalFetchError::rejected("external URL path is invalid"))?
         .map(|segment| {
