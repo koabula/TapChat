@@ -13056,11 +13056,15 @@ pub(crate) mod tests {
         // What Alice had queued for Bob went to his new host as soon as she
         // applied the notice; a message sent after that follows it there, in
         // order.
-        assert!(inbound.effects.iter().chain(&after.effects).any(|effect| matches!(
-            effect,
-            CoreEffect::ExecuteHttpRequest { request }
-                if request.url.contains("bob-new.example.test")
-        )));
+        assert!(inbound
+            .effects
+            .iter()
+            .chain(&after.effects)
+            .any(|effect| matches!(
+                effect,
+                CoreEffect::ExecuteHttpRequest { request }
+                    if request.url.contains("bob-new.example.test")
+            )));
         assert!(after.effects.iter().all(|effect| match effect {
             CoreEffect::ExecuteHttpRequest { request } if request.url.contains("/messages") => {
                 !request.url.contains(&old_endpoint)
