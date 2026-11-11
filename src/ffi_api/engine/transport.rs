@@ -3411,7 +3411,7 @@ impl CoreEngine {
                             match self.evaluate_direct_application_plaintext(
                                 &record,
                                 &local_user_id,
-                                &device_id,
+                                &recipient,
                                 application,
                             ) {
                                 ApplicationPlaintextDecision::Accepted {
@@ -3942,7 +3942,7 @@ impl CoreEngine {
                                         let mut local = ConversationManager::create_direct_conversation_with_id(
                                             conversation_id.clone(),
                                             &local_user_id,
-                                            &device_id,
+                                            &recipient,
                                             &inbound_peer_user_id,
                                             &[author_device_id],
                                         )?;
