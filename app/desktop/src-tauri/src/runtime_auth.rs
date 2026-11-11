@@ -644,6 +644,61 @@ impl RuntimeAuthManager {
         Ok(Some(refreshed))
     }
 
+    /// The credential for the host a move left behind, which the engine still
+    /// reads, refreshed there when it nears expiry. `None` unless the profile
+    /// keeps one for `runtime_id` and still names that host.
+    pub async fn ensure_previous(
+        &self,
+        profile_manager: &ProfileManager,
+        runtime_id: &str,
+    ) -> Result<Option<DeviceRuntimeAuth>> {
+        let (credential, deployment, identity) = {
+            let inner = profile_manager.inner.read().await;
+            let Some(profile) = inner.active_profile.as_ref() else {
+                return Ok(None);
+            };
+            let Some(credential) = profile
+                .load_previous_runtime_credential()
+                .context("load previous runtime credential")?
+            else {
+                return Ok(None);
+            };
+            if credential.runtime_id != runtime_id {
+                return Ok(None);
+            }
+            let snapshot = profile
+                .load_snapshot()
+                .context("load snapshot for previous runtime authorization")?;
+            let Some(previous) = snapshot
+                .deployment
+                .and_then(|deployment| deployment.previous_inbox)
+            else {
+                return Ok(None);
+            };
+            let Some(identity) = snapshot.local_identity.map(|value| value.state) else {
+                return Ok(None);
+            };
+            (credential, previous.deployment_bundle, identity)
+        };
+        if !runtime_credential_needs_refresh(Some(&credential), now_ms()?) {
+            return Ok(Some(credential));
+        }
+        let refreshed = request_runtime_credential_with_retry(
+            &deployment,
+            &identity,
+            ProofPurpose::Refresh,
+            None,
+        )
+        .await?;
+        let inner = profile_manager.inner.read().await;
+        if let Some(profile) = inner.active_profile.as_ref() {
+            profile
+                .save_previous_runtime_credential(Some(refreshed.clone()))
+                .context("persist refreshed previous runtime credential")?;
+        }
+        Ok(Some(refreshed))
+    }
+
     pub async fn enroll(
         &self,
         profile_manager: &ProfileManager,

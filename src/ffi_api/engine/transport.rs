@@ -420,6 +420,9 @@ impl CoreEngine {
         if device_id.trim().is_empty() {
             return Err(CoreError::invalid_input("device_id must not be empty"));
         }
+        if is_previous_inbox_key(&device_id) {
+            return self.drain_previous_inbox();
+        }
 
         // Check if deployment_bundle exists - if not, skip sync gracefully
         let deployment = match self.state.deployment_bundle.as_ref() {
@@ -508,7 +511,8 @@ impl CoreEngine {
         };
         // Nothing to retransmit here any more: a PCS rotation is an ordinary
         // outbox envelope with ordinary retry, not a handshake this path had
-        // to re-offer.
+        // to re-offer. A host left behind by a move is read at each sync too.
+        let sync_output = merge_outputs(sync_output, self.drain_previous_inbox()?);
         if retry_reset_ops.is_empty() {
             return Ok(sync_output);
         }
@@ -952,6 +956,17 @@ impl CoreEngine {
     /// one still waiting for a retry would land ahead of the key it needs.
     /// The peer could only quarantine it, and a bounded quarantine loses it.
     pub(super) fn flush_outbox(&mut self) -> CoreResult<CoreOutput> {
+        // An envelope whose lane no conversation uses any more was in flight
+        // when its peer announced a new one: it goes to the peer's lane now.
+        for index in 0..self.state.pending_outbox.len() {
+            let item = &self.state.pending_outbox[index];
+            if item.in_flight || self.conversation_id_for_lane(&item.envelope.lane).is_some() {
+                continue;
+            }
+            if let Some(lane) = self.outbound_lane_for_peer(&item.peer_user_id) {
+                self.state.pending_outbox[index].envelope.lane = lane;
+            }
+        }
         let mut effects = Vec::new();
         let mut lanes_ahead = BTreeSet::new();
         for index in 0..self.state.pending_outbox.len() {
@@ -1627,13 +1642,7 @@ impl CoreEngine {
         device_id: String,
         decision: SyncDecision,
     ) -> CoreResult<CoreOutput> {
-        let deployment = self
-            .state
-            .deployment_bundle
-            .as_ref()
-            .ok_or_else(|| CoreError::invalid_state("deployment bundle is not initialized"))?;
-        let inbox_http_endpoint = deployment.inbox_http_endpoint.clone();
-        let auth = self.device_runtime_auth_requirement()?;
+        let route = self.inbox_route(&device_id)?;
         let limit = decision
             .to_seq
             .saturating_sub(decision.from_seq)
@@ -1649,7 +1658,7 @@ impl CoreEngine {
             },
         );
         let fetch = FetchMessagesRequest {
-            device_id: device_id.clone(),
+            device_id: route.device_id.clone(),
             from_seq: decision.from_seq,
             limit,
         };
@@ -1665,13 +1674,10 @@ impl CoreEngine {
                     method: HttpMethod::Get,
                     url: format!(
                         "{}/v1/inbox/{}/messages?fromSeq={}&limit={}",
-                        inbox_http_endpoint.trim_end_matches('/'),
-                        fetch.device_id,
-                        fetch.from_seq,
-                        fetch.limit
+                        route.http_endpoint, fetch.device_id, fetch.from_seq, fetch.limit
                     ),
                     headers: BTreeMap::new(),
-                    auth: Some(auth),
+                    auth: Some(route.auth),
                     body: None,
                 },
             }],
@@ -1709,6 +1715,8 @@ impl CoreEngine {
                 SyncEngine::register_head(sync_state, head.head_seq);
                 if let Some(decision) = SyncEngine::next_fetch(sync_state) {
                     self.issue_fetch(device_id, decision)
+                } else if is_previous_inbox_key(&device_id) {
+                    Ok(self.finish_previous_inbox_read(&device_id))
                 } else {
                     Ok(CoreOutput::default())
                 }
@@ -1720,6 +1728,15 @@ impl CoreEngine {
                 .map_err(|error| {
                     CoreError::invalid_input(format!("failed to decode fetch response: {error}"))
                 })?;
+                if is_previous_inbox_key(&device_id) {
+                    self.skip_previous_inbox_floor(&device_id, response.history_floor_seq);
+                    let read = self.handle_inbox_records(
+                        device_id.clone(),
+                        response.records,
+                        response.to_seq,
+                    )?;
+                    return Ok(merge_outputs(read, self.finish_previous_inbox_read(&device_id)));
+                }
                 let floor =
                     self.handle_inbox_history_floor(device_id.clone(), response.history_floor_seq)?;
                 Ok(merge_outputs(
@@ -3243,11 +3260,14 @@ impl CoreEngine {
             advance_contiguous_ack(&mut contiguous_ack, &mut deferred_ackable_seqs, record.seq);
             processed_records.push(record);
         }
+        // The device the records are addressed to; `device_id` keys the inbox
+        // they come from, which may be the host a move left behind.
+        let recipient = inbox_device_id(&device_id).to_string();
         for record in fresh_records {
             // Per-record admission. Anything wrong with this one envelope is
             // this one envelope's problem: ack it, drop it, leave no trace,
             // and carry on with the rest of the batch.
-            if let Err(reason) = self.authenticate_inbox_record(&local_user_id, &device_id, &record)
+            if let Err(reason) = self.authenticate_inbox_record(&local_user_id, &recipient, &record)
             {
                 log::warn!(
                     "handle_inbox_records: discarding unauthenticated record seq={} reason={}",
@@ -3391,7 +3411,7 @@ impl CoreEngine {
                             match self.evaluate_direct_application_plaintext(
                                 &record,
                                 &local_user_id,
-                                &device_id,
+                                &recipient,
                                 application,
                             ) {
                                 ApplicationPlaintextDecision::Accepted {
@@ -3922,7 +3942,7 @@ impl CoreEngine {
                                         let mut local = ConversationManager::create_direct_conversation_with_id(
                                             conversation_id.clone(),
                                             &local_user_id,
-                                            &device_id,
+                                            &recipient,
                                             &inbound_peer_user_id,
                                             &[author_device_id],
                                         )?;
@@ -4174,7 +4194,9 @@ impl CoreEngine {
                 .or_insert_with(|| SyncEngine::new_device_state(&device_id));
             SyncEngine::ack_up_to(sync_state, contiguous_ack)
         };
-        if ack.ack_seq > 0 {
+        // The host a move left behind is read, never acknowledged: the device
+        // keeps no state there, and its records expire on their own.
+        if ack.ack_seq > 0 && !is_previous_inbox_key(&device_id) {
             self.state.pending_acks.insert(
                 ack.device_id.clone(),
                 PendingAckState {
@@ -4184,6 +4206,11 @@ impl CoreEngine {
                 },
             );
             touched_pending_ack_device_ids.insert(device_id.clone());
+        }
+        // A peer whose frame arrived at the current host has followed a move,
+        // so the host left behind need not be read for it any more.
+        if !is_previous_inbox_key(&device_id) {
+            self.note_peers_followed(&touched_conversation_ids);
         }
         let pending_recovery_conversations_for_persist = pending_recovery_conversations.clone();
         output = merge_outputs(

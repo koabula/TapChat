@@ -38,6 +38,25 @@ pub struct PersistedDeployment {
     pub pending_identity_publication: Option<PendingIdentityPublication>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub serialized_mls_bootstrap_state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_inbox: Option<PreviousInbox>,
+}
+
+/// The host this device moved away from, still read until its contacts have
+/// followed to the new one. Contacts learn of a move from a lane notice inside
+/// each session, and until they apply it they keep appending to the old host;
+/// the device reads it, under the credential it held there, so nothing they
+/// write in that time is lost. See `CoreEngine::drain_previous_inbox`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreviousInbox {
+    pub deployment_bundle: DeploymentBundle,
+    pub moved_at_ms: u64,
+    /// Each conversation's inbound lane at the old host, by lane.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub lanes: BTreeMap<String, String>,
+    /// The conversations whose peer has not yet been seen at the new host.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub awaiting: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1290,6 +1309,7 @@ mod tests {
                 key_package_inventory: vec![],
                 pending_identity_publication: None,
                 serialized_mls_bootstrap_state: None,
+                previous_inbox: None,
             }),
             contacts: vec![PersistedContact {
                 user_id: "user:bob".into(),

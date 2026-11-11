@@ -138,12 +138,28 @@ pub struct ProfilePrivateState {
         skip_serializing_if = "Option::is_none"
     )]
     pub runtime_credential: Option<DeviceRuntimeAuth>,
+    /// The credential this device held at the host it moved away from, kept
+    /// while the engine still reads that host (its `previous_inbox`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_runtime_credential: Option<DeviceRuntimeAuth>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_runtime_provisioning: Option<PendingRuntimeProvisioning>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub settings: BTreeMap<String, Value>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub attachment_cache: BTreeMap<String, AttachmentCacheEntry>,
+}
+
+/// Whether `replacement` is a credential for another runtime than `held`,
+/// that is, whether storing it is a move.
+pub fn runtime_changes(
+    held: Option<&DeviceRuntimeAuth>,
+    replacement: Option<&DeviceRuntimeAuth>,
+) -> bool {
+    match (held, replacement) {
+        (Some(held), Some(replacement)) => held.runtime_id != replacement.runtime_id,
+        _ => false,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -243,6 +259,7 @@ impl Default for ProfilePrivateState {
             runtime_secrets: RuntimeSecrets::default(),
             runtime_secret_rotation: None,
             runtime_credential: None,
+            previous_runtime_credential: None,
             pending_runtime_provisioning: None,
             settings: BTreeMap::new(),
             attachment_cache: BTreeMap::new(),
@@ -749,9 +766,28 @@ impl Profile {
         Ok(self.load_private_state()?.runtime_credential)
     }
 
+    /// Store the credential for the current runtime. One for another runtime
+    /// than the credential it replaces is a move, and the replaced one is
+    /// kept as the previous credential, for the host left behind.
     pub fn save_runtime_credential(&self, credential: Option<DeviceRuntimeAuth>) -> Result<()> {
         let mut private = self.load_private_state()?;
+        if runtime_changes(private.runtime_credential.as_ref(), credential.as_ref()) {
+            private.previous_runtime_credential = private.runtime_credential.take();
+        }
         private.runtime_credential = credential;
+        self.save_private_state(&private)
+    }
+
+    pub fn load_previous_runtime_credential(&self) -> Result<Option<DeviceRuntimeAuth>> {
+        Ok(self.load_private_state()?.previous_runtime_credential)
+    }
+
+    pub fn save_previous_runtime_credential(
+        &self,
+        credential: Option<DeviceRuntimeAuth>,
+    ) -> Result<()> {
+        let mut private = self.load_private_state()?;
+        private.previous_runtime_credential = credential;
         self.save_private_state(&private)
     }
 

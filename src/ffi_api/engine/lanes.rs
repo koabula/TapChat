@@ -21,17 +21,28 @@ impl CoreEngine {
     }
 
     pub(super) fn conversation_id_for_lane(&self, lane: &str) -> Option<String> {
-        self.state.lane_index.get(lane).cloned().or_else(|| {
-            self.state
-                .conversations
-                .iter()
-                .find_map(|(id, conversation)| {
-                    conversation.lanes.as_ref().and_then(|lanes| {
-                        (lanes.inbound_lane == lane || lanes.outbound_lane == lane)
-                            .then(|| id.clone())
+        self.state
+            .lane_index
+            .get(lane)
+            .cloned()
+            .or_else(|| {
+                self.state
+                    .conversations
+                    .iter()
+                    .find_map(|(id, conversation)| {
+                        conversation.lanes.as_ref().and_then(|lanes| {
+                            (lanes.inbound_lane == lane || lanes.outbound_lane == lane)
+                                .then(|| id.clone())
+                        })
                     })
-                })
-        })
+            })
+            .or_else(|| {
+                // A lane at the host this device moved away from, still read.
+                self.state
+                    .previous_inbox
+                    .as_ref()
+                    .and_then(|previous| previous.lanes.get(lane).cloned())
+            })
     }
 
     pub(super) fn index_inbound_lane(&mut self, lane: &str, conversation_id: &str) {
@@ -111,7 +122,7 @@ impl CoreEngine {
         &mut self,
         conversation_id: &str,
         new_outbound: String,
-    ) -> CoreResult<()> {
+    ) -> CoreResult<Vec<String>> {
         if !is_opaque_id(&new_outbound) {
             return Err(CoreError::invalid_input("lane must be a 128-bit hex id"));
         }
@@ -123,7 +134,7 @@ impl CoreEngine {
             .map(|lanes| lanes.outbound_lane.clone())
             .ok_or_else(|| CoreError::invalid_state("conversation has no outbound lane"))?;
         if old_outbound == new_outbound {
-            return Ok(());
+            return Ok(Vec::new());
         }
         if let Some(lanes) = self
             .state
@@ -135,7 +146,34 @@ impl CoreEngine {
         }
         self.state.lane_index.remove(&old_outbound);
         self.index_inbound_lane(&new_outbound, conversation_id);
-        Ok(())
+        // What is still queued on the old lane goes to the new one. A lane is
+        // read by the host, not inside the wrap, so the envelope is otherwise
+        // unchanged; its retries start again, since the failures, if any, were
+        // the old host's. An envelope in flight keeps its lane: if it fails,
+        // `flush_outbox` readdresses it before sending it again. Returns the
+        // envelopes readdressed.
+        let mut readdressed = Vec::new();
+        for item in &mut self.state.pending_outbox {
+            if item.envelope.lane == old_outbound && !item.in_flight {
+                item.envelope.lane = new_outbound.clone();
+                item.retries = 0;
+                readdressed.push(item.envelope.mid.clone());
+            }
+        }
+        Ok(readdressed)
+    }
+
+    /// The lane `peer_user_id`'s direct conversation now writes on, if the
+    /// peer has exactly one.
+    pub(super) fn outbound_lane_for_peer(&self, peer_user_id: &str) -> Option<String> {
+        let mut lanes = self
+            .state
+            .conversations
+            .values()
+            .filter(|conversation| conversation.peer_user_id == peer_user_id)
+            .filter_map(|conversation| conversation.lanes.as_ref());
+        let lane = lanes.next()?.outbound_lane.clone();
+        lanes.next().is_none().then_some(lane)
     }
 
     /// Whether `lane` is the inbound lane of a conversation this device holds.
@@ -359,7 +397,8 @@ impl CoreEngine {
                 .conversations
                 .get(&conversation_id)
                 .and_then(|conversation| conversation.lanes.as_ref())
-                .is_some_and(|lanes| lanes.inbound_lane == record.envelope.lane);
+                .is_some_and(|lanes| lanes.inbound_lane == record.envelope.lane)
+                || self.is_previous_inbound_lane(&conversation_id, &record.envelope.lane);
             if !inbound {
                 return Ok(InboundFrameResolution::Rejected);
             }

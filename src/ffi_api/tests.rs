@@ -12673,6 +12673,194 @@ pub(crate) mod tests {
             .any(|effect| matches!(effect, CoreEffect::ScheduleTimer { .. })));
     }
 
+    /// Bob moves to a new host, as `relocation_to_empty_runtime_keeps_the_conversation` does.
+    fn relocate_bob(chat: &mut PairedDirectChat) {
+        let mut relocated = sample_deployment();
+        relocated.inbox_http_endpoint = "https://bob-new.example.test".into();
+        relocated.inbox_websocket_endpoint = "wss://bob-new.example.test/ws".into();
+        relocated.runtime_id = "runtime:bob-new".into();
+        relocated.runtime_config.identity_bundle_ref =
+            Some("https://bob-new.example.test/state/identity.json".into());
+        chat.bob
+            .handle_command(CoreCommand::ImportDeploymentBundle { bundle: relocated })
+            .expect("bob relocates");
+    }
+
+    /// The first request in `output` that `matches`.
+    fn http_request(
+        output: &CoreOutput,
+        matches: impl Fn(&crate::ffi_api::HttpRequestEffect) -> bool,
+    ) -> Option<crate::ffi_api::HttpRequestEffect> {
+        output.effects.iter().find_map(|effect| match effect {
+            CoreEffect::ExecuteHttpRequest { request } if matches(request) => Some(request.clone()),
+            _ => None,
+        })
+    }
+
+    /// **A move goes on reading the host it left.** Alice writes before she
+    /// hears of the move, so her message goes to Bob's old host on his old
+    /// lane. Bob reads that host under the credential he held there, takes
+    /// the message, and acknowledges nothing there. When Alice applies the
+    /// lane notice, what she still has queued for Bob moves to his new lane.
+    #[test]
+    fn a_move_goes_on_reading_the_host_it_left() {
+        let mut chat = paired_direct_chat();
+        let conversation_id = chat.conversation_id.clone();
+        let device_id = chat.bob_device_id.clone();
+        let old = chat
+            .bob
+            .state
+            .deployment_bundle
+            .clone()
+            .expect("deployment");
+        let sent = chat
+            .alice
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "sent before the notice".into(),
+            })
+            .expect("alice sends");
+        relocate_bob(&mut chat);
+
+        let previous = chat.bob.state.previous_inbox.clone().expect("the old host");
+        assert_eq!(
+            previous.deployment_bundle.inbox_http_endpoint,
+            old.inbox_http_endpoint
+        );
+        assert_eq!(previous.awaiting, vec![conversation_id.clone()]);
+
+        let sync = chat
+            .bob
+            .handle_command(CoreCommand::SyncInbox {
+                device_id: device_id.clone(),
+                reason: Some("test".into()),
+            })
+            .expect("sync");
+        let head = http_request(&sync, |request| {
+            request.url.starts_with(&old.inbox_http_endpoint) && request.url.ends_with("/head")
+        })
+        .expect("a read of the old host");
+        assert!(matches!(
+            head.auth,
+            Some(TransportAuthRequirement::DeviceRuntime { ref runtime_id, .. })
+                if runtime_id == &old.runtime_id
+        ));
+
+        let key = format!("previous:{device_id}");
+        let acked = chat.bob.state.sync_states[&key].checkpoint.last_acked_seq;
+        let item = chat
+            .alice
+            .state
+            .pending_outbox
+            .iter()
+            .find(|queued| queued.plaintext_cache.as_deref() == Some("sent before the notice"))
+            .expect("alice's message is queued")
+            .clone();
+        let record = InboxRecord {
+            seq: acked + 1,
+            recipient_device_id: device_id.clone(),
+            message_id: item.envelope.mid.clone(),
+            received_at: acked + 1,
+            expires_at: None,
+            state: InboxRecordState::Available,
+            envelope: item.envelope.clone(),
+        };
+        let read = chat
+            .bob
+            .handle_event(CoreEvent::InboxRecordsFetched {
+                device_id: key.clone(),
+                to_seq: acked + 1,
+                records: vec![record],
+            })
+            .expect("the old host's record");
+        let taken = chat.bob.state.conversations[&conversation_id]
+            .messages
+            .iter()
+            .any(|message| message.plaintext.as_deref() == Some("sent before the notice"));
+        let held = &chat.bob.state.sync_states[&key].quarantine;
+        assert!(
+            taken,
+            "lane {} previous lanes {:?} quarantined {:?}",
+            item.envelope.lane,
+            chat.bob.state.previous_inbox.as_ref().map(|p| &p.lanes),
+            held.keys().collect::<Vec<_>>()
+        );
+        let acked_there = http_request(&read, |request| request.url.ends_with("/ack"));
+        assert!(acked_there.is_none());
+
+        // If the message went out at all, its append to the old host fails,
+        // so it is still queued, and not in flight, when Alice hears of the
+        // move.
+        if let Some(append) = http_request(&sent, |request| request.url.ends_with("/messages")) {
+            chat.alice
+                .handle_event(CoreEvent::HttpRequestFailed {
+                    request_id: append.request_id,
+                    failure: test_failure("request_timeout", true, None),
+                })
+                .expect("the old host does not answer");
+        }
+        deliver_pending_outbox_to_device(&mut chat.alice, &chat.bob, &chat.alice_device_id);
+        let new_lane = chat.bob.state.conversations[&conversation_id]
+            .lanes
+            .as_ref()
+            .expect("lanes")
+            .inbound_lane
+            .clone();
+        let readdressed = chat
+            .alice
+            .state
+            .pending_outbox
+            .iter()
+            .find(|queued| queued.envelope.mid == item.envelope.mid)
+            .expect("still queued at alice");
+        assert_eq!(readdressed.envelope.lane, new_lane);
+        assert_eq!(readdressed.retries, 0);
+    }
+
+    /// **The old host is read until every peer has followed.** Once Alice
+    /// writes to Bob's new host, and the old one has nothing left, Bob stops
+    /// reading it.
+    #[test]
+    fn the_old_host_is_read_until_every_peer_has_followed() {
+        let mut chat = paired_direct_chat();
+        let conversation_id = chat.conversation_id.clone();
+        let device_id = chat.bob_device_id.clone();
+        relocate_bob(&mut chat);
+        deliver_pending_outbox_to_device(&mut chat.alice, &chat.bob, &chat.alice_device_id);
+        chat.alice
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "sent after the notice".into(),
+            })
+            .expect("alice sends");
+        deliver_pending_outbox_to_device(&mut chat.bob, &chat.alice, &device_id);
+        let previous = chat.bob.state.previous_inbox.as_ref().expect("still read");
+        assert!(previous.awaiting.is_empty(), "{:?}", previous.awaiting);
+
+        let key = format!("previous:{device_id}");
+        let acked = chat.bob.state.sync_states[&key].checkpoint.last_acked_seq;
+        let sync = chat
+            .bob
+            .handle_command(CoreCommand::SyncInbox {
+                device_id: device_id.clone(),
+                reason: Some("test".into()),
+            })
+            .expect("sync");
+        let head = http_request(&sync, |request| {
+            request.url.ends_with("/head") && !request.url.contains("bob-new.example.test")
+        })
+        .expect("a read of the old host");
+        chat.bob
+            .handle_event(CoreEvent::HttpResponseReceived {
+                request_id: head.request_id,
+                status: 200,
+                body: Some(format!("{{\"head_seq\":{acked}}}")),
+            })
+            .expect("the old host has nothing more");
+        assert!(chat.bob.state.previous_inbox.is_none());
+        assert!(!chat.bob.state.sync_states.contains_key(&key));
+    }
+
     #[test]
     fn a_move_reads_the_new_host_from_its_first_record() {
         use crate::sync_engine::SyncEngine;
@@ -12865,11 +13053,18 @@ pub(crate) mod tests {
                 plaintext: "after-move".into(),
             })
             .expect("alice sends after move");
-        assert!(after.effects.iter().any(|effect| matches!(
-            effect,
-            CoreEffect::ExecuteHttpRequest { request }
-                if request.url.contains("bob-new.example.test")
-        )));
+        // What Alice had queued for Bob went to his new host as soon as she
+        // applied the notice; a message sent after that follows it there, in
+        // order.
+        assert!(inbound
+            .effects
+            .iter()
+            .chain(&after.effects)
+            .any(|effect| matches!(
+                effect,
+                CoreEffect::ExecuteHttpRequest { request }
+                    if request.url.contains("bob-new.example.test")
+            )));
         assert!(after.effects.iter().all(|effect| match effect {
             CoreEffect::ExecuteHttpRequest { request } if request.url.contains("/messages") => {
                 !request.url.contains(&old_endpoint)
@@ -16197,6 +16392,85 @@ pub(crate) mod tests {
     /// the host for nothing. The winner joins with that package's leaf and,
     /// having made no rotation since, keeps it: the leaf is as new as the
     /// rotation it won with.
+    /// **A lane moved during a race reaches the peer once the race settles.**
+    /// The winner's commit goes to the loser's old lane, which the loser
+    /// still reads, so the race settles. The loser's notice of its new lane
+    /// went out in the epoch its losing commit made, which the winner never
+    /// holds; the rebuild announces the lane again, so the winner writes to it
+    /// without waiting for a refresh.
+    #[test]
+    fn a_lane_moved_during_a_race_is_announced_after_the_rebuild() {
+        let mut chat = paired_direct_chat();
+        let conversation_id = chat.conversation_id.clone();
+        let alice_is_winner = alice_is_designated(&chat);
+        let mut seen_from_winner = pending_mids(rotator_engine(&chat, alice_is_winner));
+        let mut seen_from_loser = pending_mids(peer_engine(&chat, alice_is_winner));
+        set_direct_pcs_debt(
+            peer_engine_mut(&mut chat, alice_is_winner),
+            &conversation_id,
+            DIRECT_PCS_COMMIT_INTERVAL * 2 - 1,
+        );
+        peer_engine_mut(&mut chat, alice_is_winner)
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "loser trigger".into(),
+            })
+            .expect("loser rotates");
+        set_direct_pcs_debt(
+            rotator_engine_mut(&mut chat, alice_is_winner),
+            &conversation_id,
+            DIRECT_PCS_COMMIT_INTERVAL - 1,
+        );
+        rotator_engine_mut(&mut chat, alice_is_winner)
+            .handle_command(CoreCommand::SendTextMessage {
+                conversation_id: conversation_id.clone(),
+                plaintext: "winner trigger".into(),
+            })
+            .expect("winner rotates");
+
+        let mut relocated = sample_deployment();
+        relocated.inbox_http_endpoint = "https://loser-new.example.test".into();
+        relocated.inbox_websocket_endpoint = "wss://loser-new.example.test/ws".into();
+        relocated.runtime_id = "runtime:loser-new".into();
+        relocated.runtime_config.identity_bundle_ref =
+            Some("https://loser-new.example.test/state/identity.json".into());
+        let loser = peer_engine_mut(&mut chat, alice_is_winner);
+        loser
+            .handle_command(CoreCommand::ImportDeploymentBundle { bundle: relocated })
+            .expect("the loser moves while its commit is pending");
+        let moved_lane = loser.state.conversations[&conversation_id]
+            .lanes
+            .as_ref()
+            .expect("lanes")
+            .inbound_lane
+            .clone();
+
+        let mut seq = 54_000;
+        exchange_until_quiet(
+            &mut chat,
+            alice_is_winner,
+            &mut seen_from_winner,
+            &mut seen_from_loser,
+            &mut seq,
+        );
+        let winner = rotator_engine(&chat, alice_is_winner);
+        assert!(
+            !winner.state.conversations[&conversation_id]
+                .fork
+                .rebuild_welcomes
+                .is_empty(),
+            "premise: the race was settled by the winner joining the loser's rebuild"
+        );
+        assert_eq!(
+            winner.state.conversations[&conversation_id]
+                .lanes
+                .as_ref()
+                .expect("lanes")
+                .outbound_lane,
+            moved_lane
+        );
+    }
+
     /// **No message is lost to a commit race.** Each side's commit merges at
     /// once, so what it sends next is encrypted in the epoch that commit
     /// created, and only one of the two epochs survives the race: the winner

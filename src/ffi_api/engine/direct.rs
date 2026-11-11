@@ -21,7 +21,7 @@ impl CoreEngine {
         let inbox_moved = previous_inbox
             .as_ref()
             .is_some_and(|endpoint| endpoint != &bundle.inbox_http_endpoint);
-        self.state.deployment_bundle = Some(bundle);
+        let left_behind = self.state.deployment_bundle.replace(bundle);
         // A new deployment is new content for a bundle already published, and
         // a peer accepts a bundle only at a higher revision: at the one it
         // holds it keeps what it has, so an unchanged revision would leave it
@@ -57,17 +57,15 @@ impl CoreEngine {
             .effects
             .extend(self.local_shared_state_publish_effects()?);
         if inbox_moved {
-            // The new host numbers its records from 1. A cursor carried over
-            // would wait for that host's head to pass the old ack before
-            // fetching anything, and the host refuses an ack above its head.
-            // Records held back for a commit cannot resolve either: whatever
-            // they wait for is at the old host, which this device no longer
-            // reads.
-            if let Ok(device_id) = self.local_device_id_required() {
-                self.state
-                    .sync_states
-                    .insert(device_id.clone(), SyncEngine::new_device_state(&device_id));
-                self.state.pending_acks.remove(&device_id);
+            // The new host numbers its records from 1, so its cursor starts
+            // afresh; the old one goes on reading the host left behind, where
+            // contacts write until they apply the lane notice (see
+            // `previous_inbox`).
+            if let (Ok(device_id), Some(left_behind)) =
+                (self.local_device_id_required(), left_behind)
+            {
+                let ops = self.begin_previous_inbox_drain(left_behind, &device_id);
+                output.effects.push(persist_effect(&self.state, ops));
             }
             // The new host's KeyPackage pool starts empty, and until it is
             // filled every claim there falls back to the last-resort package.
@@ -3843,11 +3841,16 @@ impl CoreEngine {
                 .and_then(|conversation| conversation.lanes.as_ref())
                 .is_some()
         {
-            self.switch_outbound_lane(conversation_id, inbound_lane)?;
+            let readdressed = self.switch_outbound_lane(conversation_id, inbound_lane)?;
             output.state_update.conversations_changed = true;
             persist_ops.push(PersistOp::SaveConversation {
                 conversation_id: conversation_id.to_string(),
             });
+            persist_ops.extend(
+                readdressed
+                    .into_iter()
+                    .map(|message_id| PersistOp::SaveOutgoingEnvelope { message_id }),
+            );
         }
         if !persist_ops.is_empty() {
             output
