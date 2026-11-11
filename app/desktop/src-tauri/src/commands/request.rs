@@ -128,11 +128,11 @@ async fn act_on_message_request_impl(
             )
             .await
             .map_err(|error| error.to_string())?;
-            if sender_bundle.user_id != preview.author_user_id {
-                return Err(
-                    "fetched identity bundle user_id does not match the Welcome author".to_string(),
-                );
-            }
+            tapchat_core::contact_workflows::ensure_welcome_signed_by_bundle(
+                &preview,
+                &sender_bundle,
+            )
+            .map_err(|error| error.to_string())?;
             let imported_sender_user_id = sender_bundle.user_id.clone();
 
             drive_core_with_handle(

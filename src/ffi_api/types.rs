@@ -1109,6 +1109,10 @@ pub struct WelcomePreview {
     pub conversation_id: String,
     pub author_user_id: String,
     pub author_device_id: String,
+    /// Hex. The key that signed the Welcome; see
+    /// [`crate::contact_workflows::ensure_welcome_signed_by_bundle`].
+    #[serde(default)]
+    pub author_device_public_key: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity_bundle_ref: Option<String>,
 }

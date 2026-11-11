@@ -121,6 +121,10 @@ pub struct WelcomeInspection {
     pub conversation_id: String,
     pub author_user_id: String,
     pub author_device_id: String,
+    /// The author's leaf signature key, hex. Staging verified the GroupInfo
+    /// signature under it, so a caller that finds it equal to a device key it
+    /// trusts knows who made the Welcome before anything is stored.
+    pub author_signature_key: String,
     pub identity_bundle_ref: Option<String>,
 }
 
@@ -1632,6 +1636,7 @@ impl MlsAdapter {
             return None;
         }
         let sender = staged.welcome_sender().ok()?;
+        let author_signature_key = crate::identity::encode_hex(sender.signature_key().as_slice());
         let identity = extract_sender_identity(sender.credential()).ok()?;
         let mut parts = identity.split('|');
         let author_user_id = parts.next()?.to_string();
@@ -1649,6 +1654,7 @@ impl MlsAdapter {
             conversation_id,
             author_user_id,
             author_device_id,
+            author_signature_key,
             identity_bundle_ref,
         })
     }
@@ -3185,6 +3191,14 @@ mod tests {
         assert_eq!(inspection.conversation_id, conversation_id);
         assert_eq!(inspection.author_user_id, alice.user_identity.user_id);
         assert_eq!(inspection.author_device_id, alice.device_identity.device_id);
+        assert_eq!(
+            crate::identity::parse_verifying_key(&inspection.author_signature_key)
+                .expect("signature key")
+                .as_bytes(),
+            crate::identity::parse_verifying_key(&alice.device_identity.device_public_key)
+                .expect("device key")
+                .as_bytes()
+        );
         assert_eq!(
             inspection.identity_bundle_ref.as_deref(),
             Some("https://example.test/v1/contact-share/alice")

@@ -795,6 +795,7 @@ impl CoreEngine {
                     conversation_id: inspection.conversation_id,
                     author_user_id: inspection.author_user_id,
                     author_device_id: inspection.author_device_id,
+                    author_device_public_key: inspection.author_signature_key,
                     identity_bundle_ref: inspection.identity_bundle_ref,
                 }),
                 ..CoreViewModel::default()
