@@ -436,9 +436,13 @@ impl CoreEngine {
 
     /// Builds the effect that checks the remaining count of the local
     /// device's own one-time KeyPackage pool. Called once per maintenance
-    /// cycle, right after the existing last-resort rotation check.
+    /// cycle, right after the existing last-resort rotation check, and once
+    /// after a move, since the new host's pool starts empty.
+    ///
+    /// The host serves the count at the pool's own path; it has no `/count`
+    /// route, and a request there is refused, which left the pool unfilled.
     pub(super) fn key_package_pool_count_check_effect(&mut self) -> CoreResult<CoreEffect> {
-        let url = format!("{}/count", self.own_key_package_pool_url()?);
+        let url = self.own_key_package_pool_url()?;
         let auth = self.device_runtime_auth_requirement()?;
         let request_id = self.next_request_id("keypackage_pool_count");
         self.state

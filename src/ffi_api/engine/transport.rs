@@ -871,6 +871,12 @@ impl CoreEngine {
             }
             return self.flush_pending_transport();
         }
+        if let Some(lane) = timer_id.strip_prefix("retry_register_lane:") {
+            if self.is_current_inbound_lane(lane) {
+                return self.register_accepted_lane(lane.to_string());
+            }
+            return Ok(CoreOutput::default());
+        }
         if let Some(device_id) = timer_id.strip_prefix("retry_ack:") {
             if let Some(ack) = self.state.pending_acks.get_mut(device_id) {
                 ack.in_flight = false;
@@ -4071,6 +4077,9 @@ impl CoreEngine {
                                             ProtectedPayloadKind::ContactAccepted,
                                             "{}".to_string(),
                                         )?;
+                                        if !first_contact {
+                                            self.announce_lane_after_rebuild(&conversation_id);
+                                        }
                                     }
                                 }
                                 unapplied @ (IngestResult::Rejected(_)

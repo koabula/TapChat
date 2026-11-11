@@ -1517,19 +1517,35 @@ impl CoreEngine {
                 view_model: None,
             }),
             CoreEvent::AcceptedLaneRegistered { .. } => Ok(CoreOutput::default()),
-            CoreEvent::AcceptedLaneRegisterFailed { lane: _, failure: _ } => Ok(CoreOutput {
-                state_update: CoreStateUpdate {
-                    system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
-                    ..CoreStateUpdate::default()
-                },
-                effects: vec![CoreEffect::EmitUserNotification {
+            CoreEvent::AcceptedLaneRegisterFailed { lane, failure } => {
+                let mut effects = vec![CoreEffect::EmitUserNotification {
                     notification: UserNotificationEffect {
                         status: SystemStatus::TemporaryNetworkFailure,
                         message: "TapChat couldn't register the inbox lane. Try again.".into(),
                     },
-                }],
-                view_model: None,
-            }),
+                }];
+                // A lane its owner has not admitted turns every later append
+                // on it into a message request, so the registration is tried
+                // again while this device still reads the lane. The host is
+                // this device's own, so the retry keeps the slowest pace.
+                if failure.retryable && self.is_current_inbound_lane(&lane) {
+                    let timer_id = format!("retry_register_lane:{lane}");
+                    effects.push(CoreEffect::ScheduleTimer {
+                        timer: TimerEffect {
+                            delay_ms: retry_delay_ms(&timer_id, u32::MAX),
+                            timer_id,
+                        },
+                    });
+                }
+                Ok(CoreOutput {
+                    state_update: CoreStateUpdate {
+                        system_statuses_changed: vec![SystemStatus::TemporaryNetworkFailure],
+                        ..CoreStateUpdate::default()
+                    },
+                    effects,
+                    view_model: None,
+                })
+            }
             CoreEvent::AcceptedLanesRevoked { .. } => Ok(CoreOutput::default()),
             CoreEvent::AcceptedLanesRevokeFailed { lanes: _, failure: _ } => Ok(CoreOutput {
                 state_update: CoreStateUpdate {

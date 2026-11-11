@@ -57,6 +57,23 @@ impl CoreEngine {
             .effects
             .extend(self.local_shared_state_publish_effects()?);
         if inbox_moved {
+            // The new host numbers its records from 1. A cursor carried over
+            // would wait for that host's head to pass the old ack before
+            // fetching anything, and the host refuses an ack above its head.
+            // Records held back for a commit cannot resolve either: whatever
+            // they wait for is at the old host, which this device no longer
+            // reads.
+            if let Ok(device_id) = self.local_device_id_required() {
+                self.state
+                    .sync_states
+                    .insert(device_id.clone(), SyncEngine::new_device_state(&device_id));
+                self.state.pending_acks.remove(&device_id);
+            }
+            // The new host's KeyPackage pool starts empty, and until it is
+            // filled every claim there falls back to the last-resort package.
+            if let Ok(pool_check) = self.key_package_pool_count_check_effect() {
+                output.effects.push(pool_check);
+            }
             output = merge_outputs(output, self.relocate_inbound_lanes()?);
             output = self.merge_with_transport_flush(output)?;
         }
@@ -441,11 +458,49 @@ impl CoreEngine {
 
     pub(super) fn maintain_local_credentials(&mut self, now_ms: u64) -> CoreResult<CoreOutput> {
         let swept = self.sweep_expired_key_packages(now_ms)?;
+        let quiet = self.expire_quiet_direct_state();
         let mut output = self.maintain_local_credentials_after_sweep(now_ms)?;
         if !swept.is_empty() {
             output.effects.push(persist_effect(&self.state, swept));
         }
+        if !quiet.is_empty() {
+            output.effects.push(persist_effect(&self.state, quiet));
+        }
         Ok(output)
+    }
+
+    /// Expire what each direct session keeps for a race or as fork evidence:
+    /// pending commits with their keys and KeyPackage secrets, the frames
+    /// kept for a resend, and witnesses. A send or a receipt does this too,
+    /// but a session with no traffic, or one marked compromised, would
+    /// otherwise keep them for as long as it stays that way, and a snapshot
+    /// would find them.
+    fn expire_quiet_direct_state(&mut self) -> Vec<PersistOp> {
+        let now_ms = current_unix_millis(self.state.message_nonce);
+        let conversation_ids: Vec<String> = self.state.conversations.keys().cloned().collect();
+        let mut ops = Vec::new();
+        for conversation_id in conversation_ids {
+            let before = self.kept_for_races(&conversation_id);
+            self.expire_direct_pending(&conversation_id);
+            if let Some(state) = self.state.conversations.get_mut(&conversation_id) {
+                state.fork.prune(now_ms);
+            }
+            if self.kept_for_races(&conversation_id) != before {
+                ops.push(PersistOp::SaveConversation { conversation_id });
+            }
+        }
+        ops
+    }
+
+    /// How much a session keeps for a race or as fork evidence, by count.
+    fn kept_for_races(&self, conversation_id: &str) -> Option<[usize; 4]> {
+        let state = self.state.conversations.get(conversation_id)?;
+        Some([
+            state.pcs.pending_commits.len(),
+            state.pcs.unconfirmed.len(),
+            state.fork.witnesses.len(),
+            state.fork.rebuild_welcomes.len(),
+        ])
     }
 
     /// Delete the private keys of every inventoried KeyPackage that has
@@ -3726,6 +3781,22 @@ impl CoreEngine {
         })?;
         self.enqueue_protected_app(conversation_id, ProtectedPayloadKind::LaneRotation, body)?;
         Ok(())
+    }
+
+    /// Announce the inbound lane again once a rebuild has settled a race. A
+    /// notice sent in the epoch the race took was never opened: the loser's
+    /// went out after its losing commit, and the winner's after a commit the
+    /// loser abandoned. Every refresh repeats the notice, but the next one may
+    /// be days away, and after a move the peer writes to the host this device
+    /// left until then.
+    pub(super) fn announce_lane_after_rebuild(&mut self, conversation_id: &str) {
+        if let Err(error) = self.enqueue_lane_rotation(conversation_id) {
+            log::warn!(
+                "lane announcement after rebuild failed conversation_id={}: {}",
+                redact_id("conv", conversation_id),
+                error.message()
+            );
+        }
     }
 
     fn bundle_device_ids(bundle: &IdentityBundle) -> BTreeSet<String> {

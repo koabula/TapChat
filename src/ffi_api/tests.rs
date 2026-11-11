@@ -5549,14 +5549,16 @@ pub(crate) mod tests {
             })
             .expect("claim response rebuilds the conversation");
 
+        // A rebuild sends its Welcome and not the commit that made the group:
+        // everyone joins from the Welcome, so the commit has no reader.
         assert!(completed.view_model.as_ref().is_some_and(|view| {
             view.messages
                 .iter()
-                .any(|message| message.message_type == MessageType::MlsCommit)
-                && view
+                .any(|message| message.message_type == MessageType::MlsWelcome)
+                && !view
                     .messages
                     .iter()
-                    .any(|message| message.message_type == MessageType::MlsWelcome)
+                    .any(|message| message.message_type == MessageType::MlsCommit)
         }));
         assert_eq!(
             alice
@@ -5625,6 +5627,46 @@ pub(crate) mod tests {
             .iter()
             .any(|member| member.device_id == laptop_device_id));
         let _ = laptop_keypackage_b64;
+    }
+
+    /// The pool count is read where the host serves it, `GET
+    /// /v1/keypackage-pool/{deviceId}`. The host has no `/count` route, so a
+    /// request there was refused and the pool was never topped up.
+    #[test]
+    fn credential_maintenance_reads_the_pool_count_at_the_hosts_route() {
+        let mut engine = local_engine(ALICE_MNEMONIC, "phone");
+        let now_ms = engine
+            .state
+            .published_key_package
+            .as_ref()
+            .expect("published key package")
+            .created_at;
+        let output = engine
+            .handle_event(CoreEvent::CredentialMaintenanceRequested { now_ms })
+            .expect("credential maintenance");
+        let request = output
+            .effects
+            .iter()
+            .find_map(|effect| match effect {
+                CoreEffect::ExecuteHttpRequest { request }
+                    if request.url.contains("/keypackage-pool/") =>
+                {
+                    Some(request.clone())
+                }
+                _ => None,
+            })
+            .expect("pool count request");
+        let device_id = engine
+            .state
+            .local_identity
+            .as_ref()
+            .expect("identity")
+            .device_identity
+            .device_id
+            .clone();
+        let route = format!("/v1/keypackage-pool/{}", urlencoding::encode(&device_id));
+        assert!(request.method == crate::ffi_api::HttpMethod::Get);
+        assert!(request.url.ends_with(&route), "{}", request.url);
     }
 
     #[test]
@@ -10964,13 +11006,13 @@ pub(crate) mod tests {
         assert!(output.view_model.as_ref().is_some_and(|view| {
             view.messages
                 .iter()
-                .any(|message| message.message_type == MessageType::MlsCommit)
-                && view
+                .any(|message| message.message_type == MessageType::MlsWelcome)
+                && !view
                     .messages
                     .iter()
-                    .any(|message| message.message_type == MessageType::MlsWelcome)
+                    .any(|message| message.message_type == MessageType::MlsCommit)
         }));
-        assert!(restored.state.pending_outbox[pending_before..]
+        assert!(!restored.state.pending_outbox[pending_before..]
             .iter()
             .any(|item| outbox_item_matches_type(item, MessageType::MlsCommit)));
         assert!(restored.state.pending_outbox[pending_before..]
@@ -12579,6 +12621,93 @@ pub(crate) mod tests {
                 .identity_bundle_ref
                 .as_deref(),
             Some(stored_ref.as_str())
+        );
+    }
+
+    /// **A lane whose registration failed is registered again.** Until the
+    /// owner's host admits a lane, every append on it becomes a message
+    /// request, so a retryable failure is retried while the lane is still
+    /// one this device reads, and not for a lane it no longer reads.
+    #[test]
+    fn a_failed_lane_registration_is_retried_while_the_lane_is_read() {
+        let mut chat = paired_direct_chat();
+        let lane = chat.bob.state.conversations[&chat.conversation_id]
+            .lanes
+            .as_ref()
+            .expect("lanes")
+            .inbound_lane
+            .clone();
+        let failed = chat
+            .bob
+            .handle_event(CoreEvent::AcceptedLaneRegisterFailed {
+                lane: lane.clone(),
+                failure: test_failure("request_timeout", true, None),
+            })
+            .expect("failure handled");
+        let timer_id = format!("retry_register_lane:{lane}");
+        assert!(failed.effects.iter().any(|effect| matches!(
+            effect,
+            CoreEffect::ScheduleTimer { timer } if timer.timer_id == timer_id
+        )));
+
+        let retried = chat
+            .bob
+            .handle_event(CoreEvent::TimerTriggered { timer_id })
+            .expect("retry handled");
+        assert!(retried.effects.iter().any(|effect| matches!(
+            effect,
+            CoreEffect::RegisterAcceptedLane { register } if register.lane == lane
+        )));
+
+        let gone = crate::model::random_opaque_id();
+        let ignored = chat
+            .bob
+            .handle_event(CoreEvent::AcceptedLaneRegisterFailed {
+                lane: gone,
+                failure: test_failure("request_timeout", true, None),
+            })
+            .expect("failure handled");
+        assert!(!ignored
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, CoreEffect::ScheduleTimer { .. })));
+    }
+
+    #[test]
+    fn a_move_reads_the_new_host_from_its_first_record() {
+        use crate::sync_engine::SyncEngine;
+
+        let mut chat = paired_direct_chat();
+        let device_id = chat.bob_device_id.clone();
+        let sync = chat
+            .bob
+            .state
+            .sync_states
+            .entry(device_id.clone())
+            .or_insert_with(|| SyncEngine::new_device_state(&device_id));
+        sync.checkpoint.last_fetched_seq = 9;
+        sync.checkpoint.last_acked_seq = 9;
+        sync.last_head_seq = 9;
+
+        let mut relocated = sample_deployment();
+        relocated.inbox_http_endpoint = "https://bob-new.example.test".into();
+        relocated.inbox_websocket_endpoint = "wss://bob-new.example.test/ws".into();
+        relocated.runtime_id = "runtime:bob-new".into();
+        relocated.runtime_config.identity_bundle_ref =
+            Some("https://bob-new.example.test/state/identity.json".into());
+        chat.bob
+            .handle_command(CoreCommand::ImportDeploymentBundle { bundle: relocated })
+            .expect("bob relocates");
+
+        let sync = &chat.bob.state.sync_states[&device_id];
+        assert_eq!(sync.checkpoint.last_fetched_seq, 0);
+        assert_eq!(sync.checkpoint.last_acked_seq, 0);
+        assert_eq!(sync.last_head_seq, 0);
+        let mut sync = sync.clone();
+        SyncEngine::register_head(&mut sync, 1);
+        assert_eq!(
+            SyncEngine::next_fetch(&sync).map(|next| next.from_seq),
+            Some(1)
         );
     }
 
@@ -16698,6 +16827,37 @@ pub(crate) mod tests {
             !holds_key_package(&restored, &older),
             "nor does the persisted state keep it"
         );
+    }
+
+    /// **A quiet session drops what no race can reach, too.** A send or a
+    /// receipt expires old pending commits, but a session with no traffic
+    /// has neither, so the daily upkeep does it.
+    #[test]
+    fn upkeep_drops_a_pending_commit_no_race_can_reach_in_a_quiet_session() {
+        let mut chat = paired_direct_chat();
+        let conversation_id = chat.conversation_id.clone();
+        let (rotating, [older, latest]) = two_pending_commits(&mut chat);
+        let rotator = rotator_engine_mut(&mut chat, rotating);
+        age_pending_commits(
+            rotator,
+            &conversation_id,
+            crate::direct_pcs::PENDING_COMMIT_TTL_MS,
+        );
+        rotator
+            .handle_event(CoreEvent::CredentialMaintenanceRequested {
+                now_ms: wall_clock_ms(),
+            })
+            .expect("upkeep");
+
+        let rotator = rotator_engine(&chat, rotating);
+        let pending = rotator.state.conversations[&conversation_id]
+            .pcs
+            .pending_commits
+            .iter()
+            .filter_map(|commit| commit.key_package_b64.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(pending, vec![latest.clone()], "only the latest stays");
+        assert!(!holds_key_package(rotator, &older));
     }
 
     /// **A pending commit stays for the whole window a race can take.** Past

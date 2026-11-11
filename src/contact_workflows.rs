@@ -6,9 +6,9 @@ use crate::cli::util::to_snake_case_json_string;
 use crate::contact_share::contact_share_url_user_id;
 use crate::error::{CoreError, CoreResult};
 use crate::external_fetch::{fetch_external_json, ExternalResourceKind};
-use crate::ffi_api::{CoreCommand, CoreOutput, MessageRequestActionSummary};
-use crate::identity::IdentityManager;
-use crate::model::{IdentityBundle, Validate};
+use crate::ffi_api::{CoreCommand, CoreOutput, MessageRequestActionSummary, WelcomePreview};
+use crate::identity::{parse_verifying_key, IdentityManager};
+use crate::model::{DeviceStatusKind, IdentityBundle, Validate};
 use crate::transport_contract::{MessageRequestAction, MessageRequestItem};
 
 pub async fn import_identity_bundle_into_profile(
@@ -64,7 +64,7 @@ pub async fn accept_message_request_with_bundle_import(
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| anyhow!("the Welcome did not include an importable identity bundle"))?;
     let bundle = fetch_identity_bundle_from_url(&sender_bundle_share_url).await?;
-    ensure_fetched_bundle_matches_expected_sender(&bundle, &preview.author_user_id)?;
+    ensure_welcome_signed_by_bundle(&preview, &bundle)?;
     import_identity_bundle_into_profile(profile, driver, bundle).await?;
     let output = driver
         .run_command_until_idle(CoreCommand::ActOnMessageRequest {
@@ -80,13 +80,36 @@ pub async fn accept_message_request_with_bundle_import(
     Ok(summary)
 }
 
-fn ensure_fetched_bundle_matches_expected_sender(
+/// Whether `bundle` belongs to whoever signed the Welcome that `preview`
+/// describes. A request names its sender only inside the Welcome, and the
+/// bundle comes from wherever the Welcome points, so neither is evidence on
+/// its own: the Welcome is the bundle owner's only if the device key in the
+/// bundle signed it. Checked before the bundle is imported, so a Welcome that
+/// merely names someone leaves no contact behind.
+pub fn ensure_welcome_signed_by_bundle(
+    preview: &WelcomePreview,
     bundle: &IdentityBundle,
-    expected_sender_user_id: &str,
-) -> Result<()> {
-    if bundle.user_id != expected_sender_user_id {
-        return Err(anyhow!(
-            "fetched identity bundle user_id does not match the Welcome author"
+) -> CoreResult<()> {
+    if bundle.user_id != preview.author_user_id {
+        return Err(CoreError::invalid_input(
+            "fetched identity bundle user_id does not match the Welcome author",
+        ));
+    }
+    let device = bundle
+        .devices
+        .iter()
+        .find(|device| {
+            device.device_id == preview.author_device_id
+                && matches!(device.status, DeviceStatusKind::Active)
+        })
+        .ok_or_else(|| {
+            CoreError::invalid_input("the Welcome author is not an active device of the bundle")
+        })?;
+    let trusted = parse_verifying_key(&device.device_public_key)?;
+    let signer = parse_verifying_key(&preview.author_device_public_key)?;
+    if trusted.as_bytes() != signer.as_bytes() {
+        return Err(CoreError::invalid_input(
+            "the Welcome was not signed by the device key in the sender's bundle",
         ));
     }
     Ok(())
@@ -163,30 +186,41 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
 
-    use super::{ensure_fetched_bundle_matches_expected_sender, fetch_identity_bundle_from_url};
+    use super::{ensure_welcome_signed_by_bundle, fetch_identity_bundle_from_url};
     use crate::contact_share::encode_contact_share_url;
-    use crate::identity::IdentityManager;
-    use crate::mls_adapter::MlsAdapter;
+    use crate::ffi_api::WelcomePreview;
+    use crate::identity::{IdentityManager, LocalIdentityState};
+    use crate::mls_adapter::{MlsAdapter, PeerDeviceKeyPackage};
     use crate::model::IdentityBundle;
 
     const NAMED_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
     const IMPOSTOR_MNEMONIC: &str =
         "legal winner thank year wave sausage worth useful legal winner thank yellow";
+    const RECEIVER_MNEMONIC: &str =
+        "letter advice cage absurd amount doctor acoustic avoid letter advice cage above";
     const SECRET: &str = "0123456789abcdef0123456789abcdef";
+
+    fn identity(mnemonic: &str) -> LocalIdentityState {
+        IdentityManager::create_or_recover(Some(mnemonic), None).expect("root")
+    }
 
     /// A bundle signed by the root key `mnemonic` recovers, as its host serves it.
     fn signed_bundle(mnemonic: &str) -> IdentityBundle {
-        let identity = IdentityManager::create_or_recover(Some(mnemonic), None).expect("root");
+        signed_bundle_of(&identity(mnemonic))
+    }
+
+    /// `identity`'s bundle, as its host serves it.
+    fn signed_bundle_of(identity: &LocalIdentityState) -> IdentityBundle {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("test clock")
             .as_millis() as u64;
-        let package = MlsAdapter::generate_key_package(&identity, now_ms).expect("key package");
+        let package = MlsAdapter::generate_key_package(identity, now_ms).expect("key package");
         let mut deployment = crate::ffi_api::tests::tests::sample_deployment();
         deployment.runtime_config.identity_bundle_ref =
             Some("https://runtime.example/v1/shared-state/{userId}/identity-bundle".into());
         let bundle = IdentityManager::export_identity_bundle(
-            &identity,
+            identity,
             &deployment,
             package.key_package_b64,
             package.expires_at,
@@ -283,30 +317,69 @@ mod tests {
         }
     }
 
-    fn bundle_with_user_id(user_id: &str) -> IdentityBundle {
-        serde_json::from_value(serde_json::json!({
-            "version": "v1",
-            "user_id": user_id,
-            "user_public_key": "aa",
-            "devices": [],
-            "updated_at": 0,
-            "signature": "sig",
-        }))
-        .expect("minimal identity bundle")
+    /// The preview the receiver's core shows for a Welcome `author` made to it.
+    fn preview_of_welcome_from(author: &LocalIdentityState) -> WelcomePreview {
+        let receiver = identity(RECEIVER_MNEMONIC);
+        let (mut author_adapter, _) = MlsAdapter::bootstrap(author).expect("author adapter");
+        let (receiver_adapter, receiver_package) =
+            MlsAdapter::bootstrap(&receiver).expect("receiver adapter");
+        let artifacts = author_adapter
+            .create_conversation(
+                &crate::model::random_opaque_id(),
+                &[PeerDeviceKeyPackage {
+                    user_id: receiver.user_identity.user_id.clone(),
+                    device_id: receiver.device_identity.device_id.clone(),
+                    device_public_key: receiver.device_identity.device_public_key.clone(),
+                    key_package_b64: receiver_package.key_package_b64,
+                }],
+            )
+            .expect("welcome");
+        let inspection = receiver_adapter
+            .inspect_welcome(&artifacts.welcomes[0].payload_b64)
+            .expect("inspect");
+        WelcomePreview {
+            conversation_id: inspection.conversation_id,
+            author_user_id: inspection.author_user_id,
+            author_device_id: inspection.author_device_id,
+            author_device_public_key: inspection.author_signature_key,
+            identity_bundle_ref: inspection.identity_bundle_ref,
+        }
     }
 
     #[test]
-    fn rejects_bundle_whose_user_id_does_not_match_expected_sender() {
-        let bundle = bundle_with_user_id("user:alice");
-        let error = ensure_fetched_bundle_matches_expected_sender(&bundle, "user:mallory")
-            .expect_err("mismatched sender should be rejected");
-        assert!(error.to_string().contains("does not match"));
+    fn a_welcome_is_accepted_with_the_bundle_whose_device_key_signed_it() {
+        let named = identity(NAMED_MNEMONIC);
+        let preview = preview_of_welcome_from(&named);
+        ensure_welcome_signed_by_bundle(&preview, &signed_bundle_of(&named))
+            .expect("the author's own bundle is accepted");
     }
 
     #[test]
-    fn accepts_bundle_whose_user_id_matches_expected_sender() {
-        let bundle = bundle_with_user_id("user:alice");
-        ensure_fetched_bundle_matches_expected_sender(&bundle, "user:alice")
-            .expect("matching sender should be accepted");
+    fn a_welcome_that_only_names_a_user_is_refused_with_that_users_bundle() {
+        // The credential is a string the Welcome's maker chooses; the key that
+        // signs the Welcome is not.
+        let named = identity(NAMED_MNEMONIC);
+        let mut preview = preview_of_welcome_from(&identity(IMPOSTOR_MNEMONIC));
+        preview.author_user_id = named.user_identity.user_id.clone();
+        preview.author_device_id = named.device_identity.device_id.clone();
+        let error = ensure_welcome_signed_by_bundle(&preview, &signed_bundle_of(&named))
+            .expect_err("a Welcome the named device did not sign must be refused");
+        assert!(
+            error.to_string().contains("not signed by the device key"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_bundle_of_another_user_than_the_welcome_names_is_refused() {
+        let preview = preview_of_welcome_from(&identity(NAMED_MNEMONIC));
+        let error = ensure_welcome_signed_by_bundle(&preview, &signed_bundle(IMPOSTOR_MNEMONIC))
+            .expect_err("another user's bundle must be refused");
+        assert!(
+            error
+                .to_string()
+                .contains("does not match the Welcome author"),
+            "{error}"
+        );
     }
 }

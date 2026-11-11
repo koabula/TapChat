@@ -24,7 +24,8 @@
     "enqueue_protected_app",
     "enqueue_or_create_direct_app",
     "flush_pending_direct_app",
-    "enqueue_lane_rotation"
+    "enqueue_lane_rotation",
+    "announce_lane_after_rebuild"
   ],
   "sites": [
     {
@@ -60,12 +61,12 @@
     {
       "fn": "handle_inbox_records_batch",
       "trigger": "reaction",
-      "emits": "the contact-accepted reply that ends establishment, on applying the initiator's welcome"
+      "emits": "the contact-accepted reply, on applying the initiator's welcome, which ends establishment, or a race loser's rebuild welcome, where it is the first record of the new session the loser processes and so ends the loser's recovery; after a rebuild welcome, also a lane notice"
     },
     {
       "fn": "finalize_reconcile_membership_rebootstrap",
       "trigger": "reaction",
-      "emits": "the welcome of a re-entry, on losing a race; or of a rebuild the user confirmed"
+      "emits": "the welcome of a re-entry, on losing a race; or of a rebuild the user confirmed; then the frames kept for a resend and a lane notice"
     },
     {
       "fn": "resend_unconfirmed_frames",
