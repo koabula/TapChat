@@ -1135,7 +1135,11 @@ fn baseline() -> RunInputs {
 
 /// One secret varied at a time, from a common baseline, with the replicates
 /// spread over the order of the runs (see [`REPLICATES`]).
-fn matrix() -> (Vec<RunInputs>, BTreeMap<Secret, Vec<RunIx>>, BTreeSet<RunIx>) {
+fn matrix() -> (
+    Vec<RunInputs>,
+    BTreeMap<Secret, Vec<RunIx>>,
+    BTreeSet<RunIx>,
+) {
     let mut variants: Vec<(Secret, RunInputs)> = Vec::new();
     for mnemonic in [harness::CAROL_MNEMONIC, harness::DANA_MNEMONIC] {
         variants.push((
@@ -1202,7 +1206,11 @@ fn matrix() -> (Vec<RunInputs>, BTreeMap<Secret, Vec<RunIx>>, BTreeSet<RunIx>) {
     }
     replicates.insert(runs.len());
     runs.push(baseline());
-    assert_eq!(replicates.len(), REPLICATES, "the replicates must be distinct runs");
+    assert_eq!(
+        replicates.len(),
+        REPLICATES,
+        "the replicates must be distinct runs"
+    );
     (runs, varied, replicates)
 }
 
