@@ -138,6 +138,16 @@ impl CoreEngine {
         Ok(())
     }
 
+    /// Whether `lane` is the inbound lane of a conversation this device holds.
+    pub(super) fn is_current_inbound_lane(&self, lane: &str) -> bool {
+        self.state.conversations.values().any(|conversation| {
+            conversation
+                .lanes
+                .as_ref()
+                .is_some_and(|lanes| lanes.inbound_lane == lane)
+        })
+    }
+
     pub(super) fn register_accepted_lane(&mut self, lane: String) -> CoreResult<CoreOutput> {
         if !is_opaque_id(&lane) {
             return Err(CoreError::invalid_input("lane must be a 128-bit hex id"));

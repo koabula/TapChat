@@ -396,6 +396,7 @@ impl CoreEngine {
         let generated = welcomes;
         self.enqueue_envelopes(peer_user_id, generated.clone());
         self.resend_unconfirmed_frames(&conversation_id)?;
+        self.announce_lane_after_rebuild(&conversation_id);
         self.mark_recovery_needed(&conversation_id, RecoveryReason::MembershipChanged);
         self.merge_with_transport_flush(CoreOutput {
             state_update: CoreStateUpdate {
