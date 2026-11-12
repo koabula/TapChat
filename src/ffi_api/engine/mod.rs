@@ -3668,7 +3668,18 @@ mod protected_application_message_tests {
         .expect("protected bytes")
     }
 
+    /// What MLS hands back for `plaintext` sent on the 1:1 path: padded, as
+    /// `encrypt_direct_application` pads it.
     fn decrypted(
+        plaintext: Vec<u8>,
+        user_id: &str,
+        device_id: &str,
+    ) -> DecryptedApplicationMessage {
+        let padded = crate::lane_wrap::pad_application_plaintext(&plaintext);
+        decrypted_unpadded(padded.expect("pad"), user_id, device_id)
+    }
+
+    fn decrypted_unpadded(
         plaintext: Vec<u8>,
         user_id: &str,
         device_id: &str,
@@ -3821,6 +3832,26 @@ mod protected_application_message_tests {
         );
         assert!(matches!(
             malformed,
+            ApplicationPlaintextDecision::RejectedProtocol { .. }
+        ));
+    }
+
+    #[test]
+    fn an_unpadded_protected_plaintext_is_rejected() {
+        let mut engine = CoreEngine::default();
+        seed_direct_conversation(&mut engine);
+        let decision = engine.evaluate_direct_application_plaintext(
+            &sample_record(),
+            "user:bob",
+            "device:bob:phone",
+            decrypted_unpadded(
+                protected_plaintext(vec!["device:bob:phone".into()]),
+                "user:alice",
+                "device:alice:phone",
+            ),
+        );
+        assert!(matches!(
+            decision,
             ApplicationPlaintextDecision::RejectedProtocol { .. }
         ));
     }

@@ -22,6 +22,15 @@
 //! marks where the frame ends, because a `direct_frame` runs to the end of its
 //! plaintext and may itself end in zero bytes. A wrapped payload of any other
 //! length is refused unopened.
+//!
+//! That padding sits outside MLS, so whoever holds a wrap key sees, under it,
+//! each MLS message's exact length. An application message is therefore
+//! padded inside MLS as well, before it is encrypted
+//! ([`pad_application_plaintext`]), to a length that leaves the frame exactly
+//! a whole number of blocks: the wrap's own padding then adds only the few
+//! bytes the MLS overhead fell short of its bound, and under the wrap key the
+//! frame shows the block count and nothing finer. Commits and Welcomes are not
+//! padded this way.
 
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
@@ -55,6 +64,82 @@ const WRAP_OVERHEAD: usize = NONCE_LEN + TAG_LEN + 1;
 pub const MAX_ONE_BLOCK_FRAME: usize = WRAP_BLOCK - WRAP_OVERHEAD;
 
 const _: () = assert!(WRAP_BLOCK > WRAP_OVERHEAD);
+
+/// The longest MLS group id [`APPLICATION_RESERVE`] makes room for. A 1:1
+/// group id is the conversation id, 32 hex characters (`random_opaque_id`).
+/// A conversation can send only once it has lanes, and it gets them only when
+/// created under such an id or by joining a Welcome, which `inspect_welcome`
+/// refuses unless the group id has that shape. An older `conv:{user}:{user}`
+/// conversation (80 bytes) has no lanes, so none of its frames is ever sent.
+pub const MAX_DIRECT_GROUP_ID_LEN: usize = 64;
+
+/// The most an MLS application message can add to its plaintext, under the
+/// one ciphersuite in use (`DEFAULT_CIPHERSUITE`: AES-128-GCM, Ed25519), with
+/// every variable-length prefix at its largest (RFC 9420 §6, §6.3). Outside
+/// the content's encryption: the MLSMessage version and wire format (4), the
+/// group id with a 2-byte prefix, the epoch (8), the content type (1), an
+/// empty authenticated data (1), and the encrypted sender data with its
+/// prefix (1 + leaf index, generation and reuse guard 12 + tag).
+const MLS_HEADER_MAX: usize = 4 + 2 + MAX_DIRECT_GROUP_ID_LEN + 8 + 1 + 1 + 1 + 12 + TAG_LEN;
+/// Inside it: the ciphertext's prefix and the application data's prefix (4
+/// each at their largest), the Ed25519 signature with its prefix (2 + 64: a
+/// 1-byte prefix covers lengths 0 to 63 only) and the tag. There is no
+/// padding there: OpenMLS's `padding_size` stays 0.
+const MLS_CONTENT_MAX: usize = 4 + 4 + 2 + 64 + TAG_LEN;
+const MLS_APPLICATION_OVERHEAD: usize = MLS_HEADER_MAX + MLS_CONTENT_MAX;
+
+/// The `direct_frame` tag of a frame that is not a commit.
+const PLAIN_FRAME_TAG_LEN: usize = 1;
+
+/// The constant C: every 1:1 application plaintext handed to MLS is padded to
+/// `WRAP_BLOCK * k - APPLICATION_RESERVE` bytes for the smallest whole `k >= 1`
+/// that holds it, by [`pad_application_plaintext`]. The reserve covers the
+/// largest MLS overhead, the frame tag and the wrap's own overhead, so the
+/// wrapped frame then fills exactly `k` blocks and its length shows `k` and
+/// nothing else, even to a holder of the wrap key.
+pub const APPLICATION_RESERVE: usize =
+    MLS_APPLICATION_OVERHEAD + PLAIN_FRAME_TAG_LEN + WRAP_OVERHEAD;
+
+/// The longest application plaintext, before padding, that still travels as
+/// a single block: one block less the reserve and the padding marker.
+pub const MAX_ONE_BLOCK_APPLICATION: usize = WRAP_BLOCK - APPLICATION_RESERVE - 1;
+
+const _: () = assert!(WRAP_BLOCK > APPLICATION_RESERVE + 1);
+
+/// Pad a 1:1 application plaintext to `WRAP_BLOCK * k - APPLICATION_RESERVE`
+/// bytes, the smallest such length above it: the plaintext, the marker `0x80`,
+/// then zeros. The same for every application kind, so a message, a lane
+/// notice and `ContactAccepted` of one block count are one length.
+pub fn pad_application_plaintext(plaintext: &[u8]) -> CoreResult<Vec<u8>> {
+    let too_long = || CoreError::invalid_input("application plaintext is too long to pad");
+    let blocks = plaintext
+        .len()
+        .checked_add(1 + APPLICATION_RESERVE)
+        .and_then(|unpadded| unpadded.checked_add(WRAP_BLOCK - 1))
+        .map(|rounded_up| rounded_up / WRAP_BLOCK)
+        .ok_or_else(too_long)?;
+    // `blocks >= 1` and `WRAP_BLOCK > APPLICATION_RESERVE`, so no underflow.
+    let total = blocks.checked_mul(WRAP_BLOCK).ok_or_else(too_long)?;
+    let padded_len = total - APPLICATION_RESERVE;
+    let mut padded = Vec::with_capacity(padded_len);
+    padded.extend_from_slice(plaintext);
+    padded.push(PAD_MARKER);
+    padded.resize(padded_len, 0);
+    Ok(padded)
+}
+
+/// Undo [`pad_application_plaintext`]. `None` for any length it does not
+/// produce, or a plaintext whose last nonzero byte is not the marker. Called
+/// only on what MLS has already authenticated.
+pub fn strip_application_padding(padded: &[u8]) -> Option<&[u8]> {
+    if padded.len() < WRAP_BLOCK - APPLICATION_RESERVE
+        || (padded.len() + APPLICATION_RESERVE) % WRAP_BLOCK != 0
+    {
+        return None;
+    }
+    let marker = padded.iter().rposition(|byte| *byte != 0)?;
+    (padded[marker] == PAD_MARKER).then(|| &padded[..marker])
+}
 
 pub fn wrap_frame(key: &[u8; WRAP_KEY_LEN], frame: &[u8]) -> CoreResult<Vec<u8>> {
     let too_long = || CoreError::invalid_input("lane wrap frame is too long to pad");
@@ -285,5 +370,268 @@ mod tests {
             Some(b"frame".as_slice()),
             "the previous epoch's key still opens it"
         );
+    }
+
+    // ---- Application padding inside MLS ------------------------------------
+
+    const C: usize = APPLICATION_RESERVE;
+
+    #[test]
+    fn the_reserve_is_the_sum_of_its_parts() {
+        assert_eq!(MLS_APPLICATION_OVERHEAD, 199);
+        assert_eq!(C, 229);
+        assert_eq!(MAX_ONE_BLOCK_APPLICATION, B - 230);
+    }
+
+    #[test]
+    fn every_padded_plaintext_is_a_whole_number_of_blocks_less_the_reserve() {
+        let mut lens: Vec<usize> = (0..5 * B).step_by(61).collect();
+        for k in 1..=5 {
+            // Either side of the last length that still fits k blocks.
+            lens.extend([k * B - C - 2, k * B - C - 1, k * B - C]);
+        }
+        lens.extend([62, 63, 64, 16_382, 16_383, 16_384, 16_385, 100_000]);
+        for len in lens {
+            let padded = pad_application_plaintext(&frame(len)).expect("pad");
+            let k = (len + 1 + C).div_ceil(B);
+            assert_eq!(padded.len(), k * B - C, "a plaintext of {len} bytes");
+            assert_eq!(
+                strip_application_padding(&padded),
+                Some(frame(len).as_slice()),
+                "a plaintext of {len} bytes"
+            );
+        }
+        let one = MAX_ONE_BLOCK_APPLICATION;
+        assert_eq!(pad_application_plaintext(b"").unwrap().len(), B - C);
+        assert_eq!(pad_application_plaintext(&frame(one)).unwrap().len(), B - C);
+        let spilled = pad_application_plaintext(&frame(one + 1)).unwrap();
+        assert_eq!(spilled.len(), 2 * B - C);
+    }
+
+    #[test]
+    fn only_a_padded_plaintext_strips() {
+        let padded = pad_application_plaintext(b"{}").expect("pad");
+        assert_eq!(strip_application_padding(&padded), Some(b"{}".as_slice()));
+        assert_eq!(strip_application_padding(b"{}"), None, "unpadded");
+        assert_eq!(strip_application_padding(&padded[1..]), None, "one short");
+        let mut longer = padded.clone();
+        longer.push(0);
+        assert_eq!(strip_application_padding(&longer), None, "one over");
+        let zeros = vec![0_u8; B - C];
+        assert_eq!(strip_application_padding(&zeros), None, "all zeros");
+        let mut no_marker = zeros.clone();
+        no_marker[10] = 0x7f;
+        assert_eq!(strip_application_padding(&no_marker), None, "no marker");
+        let mut two = vec![0x01_u8; 2 * B - C];
+        two[B] = PAD_MARKER;
+        two[B + 1..].fill(0);
+        assert_eq!(strip_application_padding(&two).map(<[u8]>::len), Some(B));
+    }
+
+    mod through_mls {
+        use super::*;
+
+        use crate::identity::IdentityManager;
+        use crate::mls_adapter::{IngestResult, MlsAdapter, PeerDeviceKeyPackage, WelcomeAuthor};
+        use crate::model::{MessageType, ProtectedAppMessage, ProtectedPayloadKind};
+
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+        /// Alice and Bob in a 1:1 group whose id is `conversation_id`.
+        fn pair(conversation_id: &str) -> (MlsAdapter, MlsAdapter) {
+            let alice = IdentityManager::create_or_recover(None, None).unwrap();
+            let bob = IdentityManager::create_or_recover(None, None).unwrap();
+            let (mut alice_adapter, _) = MlsAdapter::bootstrap(&alice).expect("alice adapter");
+            let (mut bob_adapter, bob_package) = MlsAdapter::bootstrap(&bob).expect("bob adapter");
+            let artifacts = alice_adapter
+                .create_conversation(
+                    conversation_id,
+                    &[PeerDeviceKeyPackage {
+                        user_id: bob.user_identity.user_id.clone(),
+                        device_id: bob.device_identity.device_id.clone(),
+                        device_public_key: bob.device_identity.device_public_key.clone(),
+                        key_package_b64: bob_package.key_package_b64,
+                    }],
+                )
+                .expect("create conversation");
+            bob_adapter
+                .ingest_welcome(
+                    conversation_id,
+                    &WelcomeAuthor {
+                        device_id: alice.device_identity.device_id.clone(),
+                        device_public_key: alice.device_identity.device_public_key.clone(),
+                    },
+                    &artifacts.welcomes[0].payload_b64,
+                )
+                .expect("welcome");
+            let _ = bob_adapter
+                .ingest_message(
+                    conversation_id,
+                    MessageType::MlsCommit,
+                    &artifacts.commit_b64,
+                )
+                .expect("genesis commit");
+            (alice_adapter, bob_adapter)
+        }
+
+        /// What the 1:1 send path puts on the wire for an unpadded plaintext,
+        /// and the MLS message inside it.
+        fn send(
+            alice: &mut MlsAdapter,
+            conversation_id: &str,
+            plaintext: &[u8],
+        ) -> (Vec<u8>, String) {
+            let padded = pad_application_plaintext(plaintext).expect("pad");
+            let mls = alice
+                .encrypt_application(conversation_id, &padded)
+                .expect("encrypt")
+                .payload_b64;
+            let frame = crate::direct_frame::encode(&mls, None).expect("frame");
+            let key = alice
+                .export_lane_wrap_key(conversation_id, WRAP_DIR_C1)
+                .expect("wrap key");
+            (wrap_frame(&key, &frame).expect("wrap"), mls)
+        }
+
+        /// A group id as long as the reserve allows, and the production shape.
+        fn conversation_ids() -> [String; 2] {
+            [
+                "g".repeat(MAX_DIRECT_GROUP_ID_LEN),
+                crate::model::random_opaque_id(),
+            ]
+        }
+
+        #[test]
+        fn a_padded_plaintext_never_spills_into_another_block() {
+            for conversation_id in conversation_ids() {
+                let (mut alice, _bob) = pair(&conversation_id);
+                // The longest plaintext each k holds, over a range of k and
+                // a k past the 4-byte length prefixes.
+                let mut lens: Vec<usize> = (1..=8).map(|k| k * B - C - 1).collect();
+                lens.push(64 * B - C - 1);
+                // Either side of where MLS's length prefixes grow: 63/64 bytes
+                // and 16383/16384 bytes, for the application data and for the
+                // ciphertext around it.
+                for edge in [64_usize, 16_384] {
+                    for delta in 0..=200 {
+                        lens.push(edge.saturating_sub(delta));
+                        lens.push(edge + delta);
+                    }
+                }
+                lens.extend([0, 1, MAX_ONE_BLOCK_APPLICATION]);
+                lens.push(MAX_ONE_BLOCK_APPLICATION + 1);
+                lens.sort_unstable();
+                lens.dedup();
+                for len in lens {
+                    let (wrapped, mls) = send(&mut alice, &conversation_id, &frame(len));
+                    let k = (len + 1 + C).div_ceil(B);
+                    assert_eq!(
+                        wrapped.len(),
+                        k * B,
+                        "a plaintext of {len} bytes, group id of {} bytes",
+                        conversation_id.len()
+                    );
+                    let mls_len = STANDARD.decode(&mls).expect("mls").len();
+                    let overhead = mls_len - (k * B - C);
+                    assert!(
+                        overhead <= MLS_APPLICATION_OVERHEAD,
+                        "MLS added {overhead} bytes to {len}"
+                    );
+                    // At the largest group id and with both 4-byte prefixes,
+                    // the bound is met exactly: the test checks the bound,
+                    // not the slack a shorter group id leaves.
+                    if conversation_id.len() == MAX_DIRECT_GROUP_ID_LEN && k * B - C >= 16_384 {
+                        assert_eq!(overhead, MLS_APPLICATION_OVERHEAD, "at {len} bytes");
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn the_smallest_message_is_one_block() {
+            let conversation_id = crate::model::random_opaque_id();
+            let (mut alice, _bob) = pair(&conversation_id);
+            assert_eq!(send(&mut alice, &conversation_id, b"").0.len(), B);
+            assert_eq!(send(&mut alice, &conversation_id, b"x").0.len(), B);
+        }
+
+        #[test]
+        fn pad_encrypt_wrap_unwrap_decrypt_strip_returns_the_message() {
+            for conversation_id in conversation_ids() {
+                let (mut alice, mut bob) = pair(&conversation_id);
+                let one = MAX_ONE_BLOCK_APPLICATION;
+                for len in [0, 1, 300, one, one + 1, 3 * B] {
+                    let message = frame(len);
+                    let (wrapped, _) = send(&mut alice, &conversation_id, &message);
+                    let key = bob
+                        .export_lane_wrap_key(&conversation_id, WRAP_DIR_C1)
+                        .expect("wrap key");
+                    let opened = unwrap_frame(&key, &wrapped).expect("unwrap");
+                    let (mls, signature) = crate::direct_frame::decode(&opened).expect("frame");
+                    assert_eq!(signature, None);
+                    let application = match bob
+                        .ingest_message(&conversation_id, MessageType::MlsApplication, &mls)
+                        .expect("decrypt")
+                    {
+                        IngestResult::AppliedApplication(application) => application,
+                        other => panic!("expected an application, got {other:?}"),
+                    };
+                    let padded_len = (len + 1 + C).div_ceil(B) * B - C;
+                    assert_eq!(application.plaintext.len(), padded_len);
+                    assert_eq!(
+                        strip_application_padding(&application.plaintext),
+                        Some(message.as_slice()),
+                        "a message of {len} bytes"
+                    );
+                }
+            }
+        }
+
+        /// The protected payload of `kind` as the send path serializes it.
+        /// Built unchecked: a real lane notice carries a signed identity
+        /// bundle, and only its length matters here.
+        fn protected(kind: ProtectedPayloadKind, body: String) -> Vec<u8> {
+            let conversation_id = crate::model::random_opaque_id();
+            let mut message = ProtectedAppMessage::new_text(
+                format!("app:{conversation_id}:1:device:alice"),
+                conversation_id,
+                "user:alice".into(),
+                "device:alice".into(),
+                "user:bob".into(),
+                vec!["device:bob".into()],
+                "placeholder".into(),
+                1_700_000_000_000,
+            )
+            .expect("protected");
+            message.payload_kind = kind;
+            message.body = body;
+            serde_json::to_vec(&message).expect("json")
+        }
+
+        #[test]
+        fn kinds_of_one_block_count_give_frames_of_one_length() {
+            let text = protected(ProtectedPayloadKind::Text, "hi".into());
+            let accepted = protected(ProtectedPayloadKind::ContactAccepted, "{}".into());
+            let rotation = protected(
+                ProtectedPayloadKind::LaneRotation,
+                format!(
+                    r#"{{"bundle":{{"devices":["{}"]}},"inbound_lane":"{}"}}"#,
+                    "d".repeat(1500),
+                    crate::model::random_opaque_id()
+                ),
+            );
+            let conversation_id = crate::model::random_opaque_id();
+            let (mut alice, _bob) = pair(&conversation_id);
+            let lengths: Vec<(usize, usize)> = [&text, &accepted, &rotation]
+                .iter()
+                .map(|plaintext| {
+                    assert!(plaintext.len() <= MAX_ONE_BLOCK_APPLICATION);
+                    let padded = pad_application_plaintext(plaintext).expect("pad").len();
+                    let sent = send(&mut alice, &conversation_id, plaintext).0.len();
+                    (padded, sent)
+                })
+                .collect();
+            assert_eq!(lengths, vec![(B - C, B); 3]);
+        }
     }
 }
