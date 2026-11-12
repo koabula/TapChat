@@ -18240,7 +18240,9 @@ pub(crate) mod tests {
             .expect("late e")
         {
             IngestResult::AppliedApplication(application) => {
-                let plaintext = String::from_utf8(application.plaintext).expect("utf8");
+                let protected = crate::lane_wrap::strip_application_padding(&application.plaintext)
+                    .expect("padded");
+                let plaintext = std::str::from_utf8(protected).expect("utf8");
                 assert!(plaintext.contains("late-e"));
                 assert!(application.from_previous_epoch);
             }
