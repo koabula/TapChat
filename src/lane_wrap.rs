@@ -66,8 +66,11 @@ pub const MAX_ONE_BLOCK_FRAME: usize = WRAP_BLOCK - WRAP_OVERHEAD;
 const _: () = assert!(WRAP_BLOCK > WRAP_OVERHEAD);
 
 /// The longest MLS group id [`APPLICATION_RESERVE`] makes room for. A 1:1
-/// group id is the conversation id: 32 hex characters (`random_opaque_id`),
-/// or `conv:{user}:{user}` for a conversation made before that.
+/// group id is the conversation id, 32 hex characters (`random_opaque_id`).
+/// A conversation can send only once it has lanes, and it gets them only when
+/// created under such an id or by joining a Welcome, which `inspect_welcome`
+/// refuses unless the group id has that shape. An older `conv:{user}:{user}`
+/// conversation (80 bytes) has no lanes, so none of its frames is ever sent.
 pub const MAX_DIRECT_GROUP_ID_LEN: usize = 64;
 
 /// The most an MLS application message can add to its plaintext, under the
@@ -79,9 +82,10 @@ pub const MAX_DIRECT_GROUP_ID_LEN: usize = 64;
 /// prefix (1 + leaf index, generation and reuse guard 12 + tag).
 const MLS_HEADER_MAX: usize = 4 + 2 + MAX_DIRECT_GROUP_ID_LEN + 8 + 1 + 1 + 1 + 12 + TAG_LEN;
 /// Inside it: the ciphertext's prefix and the application data's prefix (4
-/// each at their largest), the Ed25519 signature with its prefix (1 + 64) and
-/// the tag. There is no padding there: OpenMLS's `padding_size` stays 0.
-const MLS_CONTENT_MAX: usize = 4 + 4 + 1 + 64 + TAG_LEN;
+/// each at their largest), the Ed25519 signature with its prefix (2 + 64: a
+/// 1-byte prefix covers lengths 0 to 63 only) and the tag. There is no
+/// padding there: OpenMLS's `padding_size` stays 0.
+const MLS_CONTENT_MAX: usize = 4 + 4 + 2 + 64 + TAG_LEN;
 const MLS_APPLICATION_OVERHEAD: usize = MLS_HEADER_MAX + MLS_CONTENT_MAX;
 
 /// The `direct_frame` tag of a frame that is not a commit.
@@ -374,9 +378,9 @@ mod tests {
 
     #[test]
     fn the_reserve_is_the_sum_of_its_parts() {
-        assert_eq!(MLS_APPLICATION_OVERHEAD, 198);
-        assert_eq!(C, 228);
-        assert_eq!(MAX_ONE_BLOCK_APPLICATION, B - 229);
+        assert_eq!(MLS_APPLICATION_OVERHEAD, 199);
+        assert_eq!(C, 229);
+        assert_eq!(MAX_ONE_BLOCK_APPLICATION, B - 230);
     }
 
     #[test]
@@ -528,11 +532,17 @@ mod tests {
                         conversation_id.len()
                     );
                     let mls_len = STANDARD.decode(&mls).expect("mls").len();
+                    let overhead = mls_len - (k * B - C);
                     assert!(
-                        mls_len - (k * B - C) <= MLS_APPLICATION_OVERHEAD,
-                        "MLS added {} bytes to {len}",
-                        mls_len - (k * B - C)
+                        overhead <= MLS_APPLICATION_OVERHEAD,
+                        "MLS added {overhead} bytes to {len}"
                     );
+                    // At the largest group id and with both 4-byte prefixes,
+                    // the bound is met exactly: the test checks the bound,
+                    // not the slack a shorter group id leaves.
+                    if conversation_id.len() == MAX_DIRECT_GROUP_ID_LEN && k * B - C >= 16_384 {
+                        assert_eq!(overhead, MLS_APPLICATION_OVERHEAD, "at {len} bytes");
+                    }
                 }
             }
         }
