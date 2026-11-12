@@ -1328,12 +1328,7 @@ impl CoreEngine {
         )?;
         let protected_bytes = protected_message.to_json_bytes()?;
         self.rotate_direct_pcs_before_encrypting(&conversation_id)?;
-        let payload = self
-            .state
-            .mls_adapter
-            .as_mut()
-            .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
-            .encrypt_application(&conversation_id, &protected_bytes)?;
+        let payload = self.encrypt_direct_application(&conversation_id, &protected_bytes)?;
         self.keep_unconfirmed_frame(&conversation_id, &protected_bytes, Vec::new());
         let envelopes = recipient_device_ids
             .iter()
@@ -1999,12 +1994,7 @@ impl CoreEngine {
             sent_at,
         )?;
         let bytes = protected.to_json_bytes()?;
-        let payload = self
-            .state
-            .mls_adapter
-            .as_mut()
-            .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
-            .encrypt_application(conversation_id, &bytes)?;
+        let payload = self.encrypt_direct_application(conversation_id, &bytes)?;
         if resent_after_a_race(kind) {
             self.keep_unconfirmed_frame(conversation_id, &bytes, storage_refs.clone());
         }
@@ -2076,12 +2066,8 @@ impl CoreEngine {
         let recipient_device_ids = self.recipient_device_ids(conversation_id)?;
         let mut envelopes = Vec::new();
         for frame in frames {
-            let payload = self
-                .state
-                .mls_adapter
-                .as_mut()
-                .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
-                .encrypt_application(conversation_id, frame.protected.as_bytes())?;
+            let payload =
+                self.encrypt_direct_application(conversation_id, frame.protected.as_bytes())?;
             for device_id in &recipient_device_ids {
                 envelopes.push(self.build_envelope_with_storage_refs(
                     conversation_id,
@@ -2094,6 +2080,23 @@ impl CoreEngine {
         }
         self.enqueue_envelopes(peer_user_id, envelopes);
         Ok(())
+    }
+
+    /// The one place a 1:1 application plaintext reaches MLS: padded first,
+    /// whatever its kind, so that its length shows only its block count (see
+    /// [`crate::lane_wrap::pad_application_plaintext`]). What is kept for a
+    /// resend stays unpadded and comes back through here.
+    fn encrypt_direct_application(
+        &mut self,
+        conversation_id: &str,
+        protected: &[u8],
+    ) -> CoreResult<crate::mls_adapter::OutboundMlsMessage> {
+        let padded = crate::lane_wrap::pad_application_plaintext(protected)?;
+        self.state
+            .mls_adapter
+            .as_mut()
+            .ok_or_else(|| CoreError::invalid_state("mls adapter is not initialized"))?
+            .encrypt_application(conversation_id, &padded)
     }
 
     pub(super) fn enqueue_or_create_direct_app(
@@ -2207,7 +2210,16 @@ impl CoreEngine {
             };
         }
 
-        match ProtectedAppMessage::from_json_slice(&application.plaintext) {
+        // Padded on the send side to a length that shows only its block count
+        // (`encrypt_direct_application`); anything else did not come from it.
+        let Some(protected_bytes) =
+            crate::lane_wrap::strip_application_padding(&application.plaintext)
+        else {
+            return ApplicationPlaintextDecision::RejectedProtocol {
+                reason: "application plaintext is not padded".into(),
+            };
+        };
+        match ProtectedAppMessage::from_json_slice(protected_bytes) {
             Ok(protected) => {
                 if protected.sender_user_id != mls_sender.user_id
                     || protected.sender_device_id != mls_sender.device_id
