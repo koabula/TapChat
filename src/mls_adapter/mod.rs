@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 use crate::error::{CoreError, CoreResult};
 use crate::identity::{parse_verifying_key, LocalIdentityState};
 use crate::log_sanitize::redact_id;
-use crate::model::{MessageType, MlsStateStatus, MlsStateSummary};
+use crate::model::{DeviceBinding, MessageType, MlsStateStatus, MlsStateSummary};
 
 pub const DEFAULT_CIPHERSUITE: Ciphersuite =
     Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
@@ -80,12 +80,24 @@ impl PublishedKeyPackage {
     }
 
     pub fn should_rotate_at(&self, now_ms: u64, device_id: &str) -> bool {
-        if self.is_legacy() || self.is_expired_at(now_ms) {
+        if self.is_legacy() || self.is_expired_at(now_ms) || self.lacks_creator_root_proof() {
             return true;
         }
         let threshold = KEY_PACKAGE_ROTATION_WINDOW_MS
             .saturating_add(key_package_rotation_jitter_ms(device_id));
         now_ms >= self.expires_at.saturating_sub(threshold)
+    }
+
+    /// Built before first contacts required the creator root proof
+    /// extension, so no first contact can be made to it. Rotated at once.
+    fn lacks_creator_root_proof(&self) -> bool {
+        decode_key_package(&self.key_package_b64).is_ok_and(|key_package| {
+            !key_package
+                .leaf_node()
+                .capabilities()
+                .extensions()
+                .contains(&MlsAdapter::creator_root_proof_extension_type())
+        })
     }
 }
 
@@ -126,6 +138,31 @@ pub struct WelcomeInspection {
     /// trusts knows who made the Welcome before anything is stored.
     pub author_signature_key: String,
     pub identity_bundle_ref: Option<String>,
+    /// The creator's root public key, hex, set only when the Welcome carried
+    /// a [`CreatorRootProof`] that passed [`verify_creator_root_proof`]. A
+    /// first-contact Welcome without one yields no inspection at all; a
+    /// rebuild Welcome carries none and leaves this `None`.
+    pub author_user_public_key: Option<String>,
+}
+
+/// What a first-contact Welcome carries so that its receiver can tell, from
+/// the Welcome alone, that whoever made it holds a device key the named
+/// user's root key bound: the root public key (whose fingerprint is the user
+/// id) and the root key's signature over the device key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, SerdeDeserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreatorRootProof {
+    pub user_public_key: String,
+    pub binding: DeviceBinding,
+}
+
+impl CreatorRootProof {
+    pub fn of(local_identity: &LocalIdentityState) -> Self {
+        Self {
+            user_public_key: local_identity.user_identity.user_public_key.clone(),
+            binding: local_identity.device_identity.binding.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -868,6 +905,7 @@ impl MlsAdapter {
 
     pub const REPLY_LANE_EXTENSION_TYPE: u16 = 0xF0A1;
     pub const IDENTITY_BUNDLE_REF_EXTENSION_TYPE: u16 = 0xF0A2;
+    pub const CREATOR_ROOT_PROOF_EXTENSION_TYPE: u16 = 0xF0A3;
 
     fn reply_lane_extension_type() -> ExtensionType {
         ExtensionType::Unknown(Self::REPLY_LANE_EXTENSION_TYPE)
@@ -877,11 +915,16 @@ impl MlsAdapter {
         ExtensionType::Unknown(Self::IDENTITY_BUNDLE_REF_EXTENSION_TYPE)
     }
 
+    fn creator_root_proof_extension_type() -> ExtensionType {
+        ExtensionType::Unknown(Self::CREATOR_ROOT_PROOF_EXTENSION_TYPE)
+    }
+
     fn capabilities_with_reply_lane() -> Capabilities {
         Capabilities::builder()
             .extensions(vec![
                 Self::reply_lane_extension_type(),
                 Self::identity_bundle_ref_extension_type(),
+                Self::creator_root_proof_extension_type(),
             ])
             .credentials(vec![CredentialType::Basic])
             .build()
@@ -897,6 +940,7 @@ impl MlsAdapter {
             peer_devices_with_keypackages,
             None,
             None,
+            None,
         )
     }
 
@@ -906,6 +950,7 @@ impl MlsAdapter {
         peer_devices_with_keypackages: &[PeerDeviceKeyPackage],
         reply_lane: Option<&str>,
         identity_bundle_ref: Option<&str>,
+        creator_root_proof: Option<&CreatorRootProof>,
     ) -> CoreResult<CreateConversationArtifacts> {
         if conversation_id.trim().is_empty() {
             return Err(CoreError::invalid_input(
@@ -926,6 +971,22 @@ impl MlsAdapter {
         // Admit every KeyPackage before anything is written, so a rejected
         // peer leaves the adapter untouched.
         let key_packages = decode_peer_key_packages(peer_devices_with_keypackages)?;
+        // A first contact requires the root-proof extension of every member.
+        // KeyPackages built before it existed lack it; say so here rather
+        // than leave it to an opaque MLS error from `add_members`.
+        if reply_lane.is_some()
+            && key_packages.iter().any(|key_package| {
+                !key_package
+                    .leaf_node()
+                    .capabilities()
+                    .extensions()
+                    .contains(&Self::creator_root_proof_extension_type())
+            })
+        {
+            return Err(CoreError::invalid_state(
+                "peer KeyPackage predates the creator root proof; the peer must publish a new KeyPackage",
+            ));
+        }
         let mut member_device_ids = BTreeSet::from([self.local_device_id.clone()]);
         member_device_ids.extend(
             peer_devices_with_keypackages
@@ -948,7 +1009,10 @@ impl MlsAdapter {
             if reply_lane.is_some() {
                 extensions.push(Extension::RequiredCapabilities(
                     RequiredCapabilitiesExtension::new(
-                        &[Self::reply_lane_extension_type()],
+                        &[
+                            Self::reply_lane_extension_type(),
+                            Self::creator_root_proof_extension_type(),
+                        ],
                         &[],
                         &[CredentialType::Basic],
                     ),
@@ -964,6 +1028,17 @@ impl MlsAdapter {
                 extensions.push(Extension::Unknown(
                     Self::IDENTITY_BUNDLE_REF_EXTENSION_TYPE,
                     UnknownExtension(reference.as_bytes().to_vec()),
+                ));
+            }
+            if let (Some(_), Some(proof)) = (reply_lane, creator_root_proof) {
+                let encoded = serde_json::to_vec(proof).map_err(|error| {
+                    CoreError::invalid_state(format!(
+                        "failed to encode creator root proof: {error}"
+                    ))
+                })?;
+                extensions.push(Extension::Unknown(
+                    Self::CREATOR_ROOT_PROOF_EXTENSION_TYPE,
+                    UnknownExtension(encoded),
                 ));
             }
             let extensions = Extensions::try_from(extensions).map_err(|error| {
@@ -1644,18 +1719,36 @@ impl MlsAdapter {
         if parts.next().is_some() || author_user_id.is_empty() || author_device_id.is_empty() {
             return None;
         }
-        let identity_bundle_ref = staged
-            .group_context()
-            .extensions()
+        let extensions = staged.group_context().extensions();
+        let identity_bundle_ref = extensions
             .unknown(Self::IDENTITY_BUNDLE_REF_EXTENSION_TYPE)
             .and_then(|extension| String::from_utf8(extension.0.clone()).ok())
             .filter(|value| !value.trim().is_empty());
+        // A Welcome with a reply lane is a first contact, and its credential
+        // is self-asserted: it names a sender only if the carried root key
+        // vouches for the key that signed it. A rebuild has no reply lane;
+        // its author is checked against the receiver's own contact state.
+        let first_contact = extensions
+            .unknown(Self::REPLY_LANE_EXTENSION_TYPE)
+            .is_some();
+        let author_user_public_key =
+            match extensions.unknown(Self::CREATOR_ROOT_PROOF_EXTENSION_TYPE) {
+                Some(extension) => Some(verify_creator_root_proof(
+                    &extension.0,
+                    &author_user_id,
+                    &author_device_id,
+                    sender.signature_key().as_slice(),
+                )?),
+                None if first_contact => return None,
+                None => None,
+            };
         Some(WelcomeInspection {
             conversation_id,
             author_user_id,
             author_device_id,
             author_signature_key,
             identity_bundle_ref,
+            author_user_public_key,
         })
     }
 
@@ -2809,6 +2902,33 @@ fn current_unix_time_ms() -> CoreResult<u64> {
         .map_err(|_| CoreError::invalid_state("system clock is before the Unix epoch"))
 }
 
+/// Checks a Welcome's [`CreatorRootProof`] against the credential and the
+/// signature key staging verified the Welcome under, and returns the root
+/// public key. All of: the user id is the fingerprint of the root key; the
+/// root key signed the binding; the binding names the credential's user and
+/// device; and the bound device key is the Welcome's signature key.
+fn verify_creator_root_proof(
+    encoded: &[u8],
+    user_id: &str,
+    device_id: &str,
+    signature_key: &[u8],
+) -> Option<String> {
+    let proof: CreatorRootProof = serde_json::from_slice(encoded).ok()?;
+    if crate::identity::user_id_for_root_key(&proof.user_public_key).ok()? != user_id {
+        return None;
+    }
+    crate::identity::IdentityManager::verify_device_binding(&proof.user_public_key, &proof.binding)
+        .ok()?;
+    if proof.binding.user_id != user_id || proof.binding.device_id != device_id {
+        return None;
+    }
+    let bound = parse_verifying_key(&proof.binding.device_public_key).ok()?;
+    if bound.as_bytes().as_slice() != signature_key {
+        return None;
+    }
+    Some(proof.user_public_key)
+}
+
 /// The MLS leaf signature key *is* the device key.
 ///
 /// This is the link that chains an MLS leaf to an identity: the share link
@@ -3126,8 +3246,8 @@ pub fn validate_published_key_package_lifetime(
 mod tests {
     use super::{
         decode_key_package, key_package_rotation_jitter_ms,
-        validate_published_key_package_lifetime, IngestResult, MlsAdapter, MlsAdapterModule,
-        PeerDeviceKeyPackage, PublishedKeyPackage, RejectReason, WelcomeAuthor,
+        validate_published_key_package_lifetime, CreatorRootProof, IngestResult, MlsAdapter,
+        MlsAdapterModule, PeerDeviceKeyPackage, PublishedKeyPackage, RejectReason, WelcomeAuthor,
         KEY_PACKAGE_CLOCK_SKEW_MS, KEY_PACKAGE_LIFECYCLE_VERSION, KEY_PACKAGE_LIFETIME_MS,
         KEY_PACKAGE_ROTATION_WINDOW_MS, ONE_TIME_KEY_PACKAGE_POOL_TARGET,
     };
@@ -3183,11 +3303,16 @@ mod tests {
                 &[peer(&bob, bob_package.key_package_b64)],
                 Some(&reply_lane),
                 Some("https://example.test/v1/contact-share/alice"),
+                Some(&CreatorRootProof::of(&alice)),
             )
             .expect("create");
         let inspection = bob_adapter
             .inspect_welcome(&artifacts.welcomes[0].payload_b64)
             .expect("inspect");
+        assert_eq!(
+            inspection.author_user_public_key.as_deref(),
+            Some(alice.user_identity.user_public_key.as_str())
+        );
         assert_eq!(inspection.conversation_id, conversation_id);
         assert_eq!(inspection.author_user_id, alice.user_identity.user_id);
         assert_eq!(inspection.author_device_id, alice.device_identity.device_id);
@@ -3203,6 +3328,125 @@ mod tests {
             inspection.identity_bundle_ref.as_deref(),
             Some("https://example.test/v1/contact-share/alice")
         );
+    }
+
+    /// The first-contact Welcome `creator` makes to Bob, carrying `proof`.
+    fn first_contact_welcome(
+        creator: &LocalIdentityState,
+        proof: Option<&CreatorRootProof>,
+    ) -> (MlsAdapter, String) {
+        let bob = identity(BOB_MNEMONIC);
+        let (mut creator_adapter, _) = MlsAdapter::bootstrap(creator).expect("creator adapter");
+        let (bob_adapter, bob_package) = MlsAdapter::bootstrap(&bob).expect("bob adapter");
+        let artifacts = creator_adapter
+            .create_conversation_with_reply_lane(
+                &crate::model::random_opaque_id(),
+                &[peer(&bob, bob_package.key_package_b64)],
+                Some(&crate::model::random_opaque_id()),
+                None,
+                proof,
+            )
+            .expect("create");
+        (bob_adapter, artifacts.welcomes[0].payload_b64.clone())
+    }
+
+    #[test]
+    fn a_first_contact_welcome_with_the_creators_root_proof_is_previewed() {
+        let alice = identity(ALICE_MNEMONIC);
+        let (bob_adapter, welcome) =
+            first_contact_welcome(&alice, Some(&CreatorRootProof::of(&alice)));
+        let inspection = bob_adapter.inspect_welcome(&welcome).expect("inspect");
+        assert_eq!(inspection.author_user_id, alice.user_identity.user_id);
+        assert_eq!(inspection.author_device_id, alice.device_identity.device_id);
+        assert_eq!(
+            inspection.author_user_public_key.as_deref(),
+            Some(alice.user_identity.user_public_key.as_str())
+        );
+    }
+
+    #[test]
+    fn a_first_contact_welcome_naming_a_user_whose_root_key_the_creator_lacks_is_not_previewed() {
+        // Mallory's device key signs the Welcome; its credential names Alice.
+        let alice = identity(ALICE_MNEMONIC);
+        let mut forged = identity(MALLORY_MNEMONIC);
+        forged.user_identity.user_id = alice.user_identity.user_id.clone();
+        forged.device_identity.user_id = alice.user_identity.user_id.clone();
+        forged.device_identity.device_id = alice.device_identity.device_id.clone();
+        let mallory = identity(MALLORY_MNEMONIC);
+        let attempts = [
+            // No proof at all.
+            None,
+            // Mallory's own root key: its fingerprint is not Alice's user id.
+            Some(CreatorRootProof::of(&mallory)),
+            // Alice's public root key and binding: they bind Alice's device
+            // key, not the key that signed this Welcome.
+            Some(CreatorRootProof::of(&alice)),
+        ];
+        for proof in attempts {
+            let (bob_adapter, welcome) = first_contact_welcome(&forged, proof.as_ref());
+            assert!(
+                bob_adapter.inspect_welcome(&welcome).is_none(),
+                "a Welcome Alice's root key does not vouch for must yield no preview ({proof:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn a_key_package_without_the_root_proof_capability_is_refused_for_a_first_contact() {
+        let alice = identity(ALICE_MNEMONIC);
+        let bob = identity(BOB_MNEMONIC);
+        let (mut alice_adapter, _) = MlsAdapter::bootstrap(&alice).expect("alice adapter");
+        // A KeyPackage built the way they were before the root proof existed.
+        let provider = openmls_rust_crypto::OpenMlsRustCrypto::default();
+        let signer = super::device_signer(&bob);
+        let old_capabilities = openmls::prelude::Capabilities::builder()
+            .extensions(vec![
+                MlsAdapter::reply_lane_extension_type(),
+                MlsAdapter::identity_bundle_ref_extension_type(),
+            ])
+            .credentials(vec![openmls::prelude::CredentialType::Basic])
+            .build();
+        let credential = openmls::prelude::BasicCredential::new(
+            super::build_credential_identity(&bob).into_bytes(),
+        );
+        let bundle = openmls::prelude::KeyPackage::builder()
+            .leaf_node_capabilities(old_capabilities)
+            .build(
+                super::DEFAULT_CIPHERSUITE,
+                &provider,
+                &signer,
+                openmls::prelude::CredentialWithKey {
+                    credential: credential.into(),
+                    signature_key: signer.to_public_vec().into(),
+                },
+            )
+            .expect("old key package");
+        let old_b64 = BASE64.encode(
+            openmls::prelude::MlsMessageOut::from(bundle.key_package().clone())
+                .to_bytes()
+                .expect("encode"),
+        );
+        let error = alice_adapter
+            .create_conversation_with_reply_lane(
+                &crate::model::random_opaque_id(),
+                &[peer(&bob, old_b64.clone())],
+                Some(&crate::model::random_opaque_id()),
+                None,
+                Some(&CreatorRootProof::of(&alice)),
+            )
+            .expect_err("an old KeyPackage cannot take a first contact");
+        assert!(
+            error
+                .to_string()
+                .contains("predates the creator root proof"),
+            "{error}"
+        );
+        let published = PublishedKeyPackage {
+            key_package_ref: old_b64.clone(),
+            key_package_b64: old_b64,
+            ..MlsAdapter::generate_key_package(&bob, test_now_ms()).expect("package")
+        };
+        assert!(published.should_rotate_at(test_now_ms(), &bob.device_identity.device_id));
     }
 
     #[test]

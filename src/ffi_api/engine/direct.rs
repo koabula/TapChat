@@ -1208,6 +1208,7 @@ impl CoreEngine {
                     .local_bundle
                     .as_ref()
                     .and_then(|bundle| bundle.identity_bundle_ref.as_deref()),
+                Some(&crate::mls_adapter::CreatorRootProof::of(&local_identity)),
             )?;
         let summary = self
             .state

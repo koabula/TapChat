@@ -95,6 +95,14 @@ pub fn ensure_welcome_signed_by_bundle(
             "fetched identity bundle user_id does not match the Welcome author",
         ));
     }
+    // The root key the Welcome carried, which the preview already checked
+    // against the user id and the signing key, must be the bundle's own.
+    let carried_root = parse_verifying_key(&preview.author_user_public_key)?;
+    if parse_verifying_key(&bundle.user_public_key)?.as_bytes() != carried_root.as_bytes() {
+        return Err(CoreError::invalid_input(
+            "fetched identity bundle root key does not match the root key the Welcome carried",
+        ));
+    }
     let device = bundle
         .devices
         .iter()
@@ -190,7 +198,7 @@ mod tests {
     use crate::contact_share::encode_contact_share_url;
     use crate::ffi_api::WelcomePreview;
     use crate::identity::{IdentityManager, LocalIdentityState};
-    use crate::mls_adapter::{MlsAdapter, PeerDeviceKeyPackage};
+    use crate::mls_adapter::{CreatorRootProof, MlsAdapter, PeerDeviceKeyPackage};
     use crate::model::IdentityBundle;
 
     const NAMED_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
@@ -324,7 +332,7 @@ mod tests {
         let (receiver_adapter, receiver_package) =
             MlsAdapter::bootstrap(&receiver).expect("receiver adapter");
         let artifacts = author_adapter
-            .create_conversation(
+            .create_conversation_with_reply_lane(
                 &crate::model::random_opaque_id(),
                 &[PeerDeviceKeyPackage {
                     user_id: receiver.user_identity.user_id.clone(),
@@ -332,6 +340,9 @@ mod tests {
                     device_public_key: receiver.device_identity.device_public_key.clone(),
                     key_package_b64: receiver_package.key_package_b64,
                 }],
+                Some(&crate::model::random_opaque_id()),
+                None,
+                Some(&CreatorRootProof::of(author)),
             )
             .expect("welcome");
         let inspection = receiver_adapter
@@ -342,6 +353,9 @@ mod tests {
             author_user_id: inspection.author_user_id,
             author_device_id: inspection.author_device_id,
             author_device_public_key: inspection.author_signature_key,
+            author_user_public_key: inspection
+                .author_user_public_key
+                .expect("a first-contact Welcome carries a verified root key"),
             identity_bundle_ref: inspection.identity_bundle_ref,
         }
     }
@@ -362,6 +376,7 @@ mod tests {
         let mut preview = preview_of_welcome_from(&identity(IMPOSTOR_MNEMONIC));
         preview.author_user_id = named.user_identity.user_id.clone();
         preview.author_device_id = named.device_identity.device_id.clone();
+        preview.author_user_public_key = named.user_identity.user_public_key.clone();
         let error = ensure_welcome_signed_by_bundle(&preview, &signed_bundle_of(&named))
             .expect_err("a Welcome the named device did not sign must be refused");
         assert!(
