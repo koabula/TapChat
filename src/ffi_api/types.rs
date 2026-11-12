@@ -1113,6 +1113,11 @@ pub struct WelcomePreview {
     /// [`crate::contact_workflows::ensure_welcome_signed_by_bundle`].
     #[serde(default)]
     pub author_device_public_key: String,
+    /// Hex. The creator's root key the Welcome carried; the core returns a
+    /// preview only once it has checked that `author_user_id` is this key's
+    /// fingerprint and that this key bound `author_device_public_key`.
+    #[serde(default)]
+    pub author_user_public_key: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity_bundle_ref: Option<String>,
 }

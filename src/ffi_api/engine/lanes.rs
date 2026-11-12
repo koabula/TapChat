@@ -836,6 +836,11 @@ impl CoreEngine {
         let inspection = adapter
             .inspect_welcome(&welcome_bytes)
             .ok_or_else(|| CoreError::invalid_input("welcome could not be inspected"))?;
+        // A request names its sender only if the Welcome carried the
+        // creator's root key and that key bound the key that signed it.
+        let author_user_public_key = inspection
+            .author_user_public_key
+            .ok_or_else(|| CoreError::invalid_input("welcome does not prove who made it"))?;
         Ok(CoreOutput {
             state_update: CoreStateUpdate::default(),
             effects: Vec::new(),
@@ -845,6 +850,7 @@ impl CoreEngine {
                     author_user_id: inspection.author_user_id,
                     author_device_id: inspection.author_device_id,
                     author_device_public_key: inspection.author_signature_key,
+                    author_user_public_key,
                     identity_bundle_ref: inspection.identity_bundle_ref,
                 }),
                 ..CoreViewModel::default()

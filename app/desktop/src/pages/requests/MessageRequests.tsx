@@ -14,10 +14,14 @@ import type {
   MessageRequestItem,
 } from "@/lib/types";
 
+// The core returns a preview only after checking that the Welcome's signing
+// key is bound by the root key whose fingerprint is `author_user_id`. A
+// request without one names no sender.
 interface WelcomePreview {
   conversation_id: string;
   author_user_id: string;
   author_device_id: string;
+  author_user_public_key: string;
   identity_bundle_ref?: string;
 }
 
@@ -232,7 +236,7 @@ export default function MessageRequests() {
                     </div>
                     <div>
                       <span className="text-primary-color">
-                        {author ? `From ${author}` : "Unknown"}
+                        {author ? `From ${author}` : "Unverified sender"}
                       </span>
                       {author && (
                         <span className="text-muted-color text-xs block truncate">

@@ -3963,6 +3963,59 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn preview_welcome_names_no_sender_whose_root_key_did_not_bind_the_signer() {
+        // Carol signs a first-contact Welcome whose credential names Alice and
+        // which carries Alice's public root key and device binding.
+        let mut chat = unjoined_direct_chat();
+        let alice = chat
+            .alice
+            .state
+            .local_identity
+            .clone()
+            .expect("alice identity");
+        let attacker = local_engine(CAROL_MNEMONIC, "attacker");
+        let mut forged = attacker
+            .state
+            .local_identity
+            .clone()
+            .expect("carol identity");
+        forged.user_identity.user_id = alice.user_identity.user_id.clone();
+        forged.device_identity.user_id = alice.user_identity.user_id.clone();
+        forged.device_identity.device_id = alice.device_identity.device_id.clone();
+        let (mut attacker_mls, _) = MlsAdapter::bootstrap(&forged).expect("attacker adapter");
+        let key_package = chat
+            .bob
+            .state
+            .mls_adapter
+            .as_mut()
+            .expect("bob adapter")
+            .rotate_key_package(test_now_ms())
+            .expect("bob key package");
+        let bob = chat.bob.state.local_identity.clone().expect("bob identity");
+        let artifacts = attacker_mls
+            .create_conversation_with_reply_lane(
+                &crate::model::random_opaque_id(),
+                &[crate::mls_adapter::PeerDeviceKeyPackage {
+                    user_id: bob.user_identity.user_id.clone(),
+                    device_id: bob.device_identity.device_id.clone(),
+                    device_public_key: bob.device_identity.device_public_key.clone(),
+                    key_package_b64: key_package.key_package_b64,
+                }],
+                Some(&crate::model::random_opaque_id()),
+                None,
+                Some(&crate::mls_adapter::CreatorRootProof::of(&alice)),
+            )
+            .expect("forged welcome");
+        let result = chat.bob.handle_command(CoreCommand::PreviewWelcome {
+            welcome_bytes: artifacts.welcomes[0].payload_b64.clone(),
+        });
+        assert!(
+            result.is_err(),
+            "a Welcome Alice's root key does not vouch for must not be previewed"
+        );
+    }
+
+    #[test]
     fn preview_welcome_reads_identity_bundle_ref_without_adopting() {
         let mut chat = unjoined_direct_chat();
         let expected_ref = chat
@@ -4011,6 +4064,16 @@ pub(crate) mod tests {
                 .user_id
         );
         assert_eq!(preview.identity_bundle_ref, expected_ref);
+        assert_eq!(
+            preview.author_user_public_key,
+            chat.alice
+                .state
+                .local_identity
+                .as_ref()
+                .expect("alice identity")
+                .user_identity
+                .user_public_key
+        );
         assert_eq!(
             chat.bob
                 .state
@@ -17880,6 +17943,7 @@ pub(crate) mod tests {
                 }],
                 Some(&crate::model::random_opaque_id()),
                 None,
+                Some(&crate::mls_adapter::CreatorRootProof::of(&fake_identity)),
             )
             .unwrap();
         let envelope = Envelope::with_bytes(
