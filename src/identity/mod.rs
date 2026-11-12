@@ -508,6 +508,16 @@ fn user_identity_fingerprint(pubkey_bytes: &[u8]) -> String {
     encode_hex(&digest)[..32].to_string()
 }
 
+/// The user id a root public key (hex) names: `user:` and its fingerprint.
+/// The same rule [`IdentityManager::verify_identity_bundle`] checks.
+pub fn user_id_for_root_key(user_public_key: &str) -> CoreResult<String> {
+    let verifying_key = parse_verifying_key(user_public_key)?;
+    Ok(format!(
+        "user:{}",
+        user_identity_fingerprint(verifying_key.as_bytes())
+    ))
+}
+
 pub fn encode_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
