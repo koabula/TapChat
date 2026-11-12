@@ -1728,7 +1728,9 @@ impl MlsAdapter {
         // is self-asserted: it names a sender only if the carried root key
         // vouches for the key that signed it. A rebuild has no reply lane;
         // its author is checked against the receiver's own contact state.
-        let first_contact = extensions.unknown(Self::REPLY_LANE_EXTENSION_TYPE).is_some();
+        let first_contact = extensions
+            .unknown(Self::REPLY_LANE_EXTENSION_TYPE)
+            .is_some();
         let author_user_public_key =
             match extensions.unknown(Self::CREATOR_ROOT_PROOF_EXTENSION_TYPE) {
                 Some(extension) => Some(verify_creator_root_proof(
@@ -3433,7 +3435,12 @@ mod tests {
                 Some(&CreatorRootProof::of(&alice)),
             )
             .expect_err("an old KeyPackage cannot take a first contact");
-        assert!(error.to_string().contains("predates the creator root proof"), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("predates the creator root proof"),
+            "{error}"
+        );
         let published = PublishedKeyPackage {
             key_package_ref: old_b64.clone(),
             key_package_b64: old_b64,

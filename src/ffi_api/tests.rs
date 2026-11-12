@@ -3967,9 +3967,18 @@ pub(crate) mod tests {
         // Carol signs a first-contact Welcome whose credential names Alice and
         // which carries Alice's public root key and device binding.
         let mut chat = unjoined_direct_chat();
-        let alice = chat.alice.state.local_identity.clone().expect("alice identity");
+        let alice = chat
+            .alice
+            .state
+            .local_identity
+            .clone()
+            .expect("alice identity");
         let attacker = local_engine(CAROL_MNEMONIC, "attacker");
-        let mut forged = attacker.state.local_identity.clone().expect("carol identity");
+        let mut forged = attacker
+            .state
+            .local_identity
+            .clone()
+            .expect("carol identity");
         forged.user_identity.user_id = alice.user_identity.user_id.clone();
         forged.device_identity.user_id = alice.user_identity.user_id.clone();
         forged.device_identity.device_id = alice.device_identity.device_id.clone();
